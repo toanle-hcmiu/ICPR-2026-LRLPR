@@ -49,6 +49,10 @@ class EMA:
         self.model.eval()
         self.decay = decay
         
+        # Ensure EMA model is on the same device as the original model
+        device = next(model.parameters()).device
+        self.model = self.model.to(device)
+        
         for param in self.model.parameters():
             param.requires_grad = False
     

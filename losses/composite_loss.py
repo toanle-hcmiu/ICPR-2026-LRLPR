@@ -302,7 +302,17 @@ class CompositeLoss(nn.Module):
                 loss = self.corner_loss(pred_corners, gt_corners)
                 return loss, {'geometry': loss.item()}
             else:
-                return torch.tensor(0.0), {}
+                # Create a zero loss that maintains gradient flow through model outputs
+                # This allows backward() to work even when corner annotations are missing
+                if 'corners' in outputs:
+                    loss = outputs['corners'].sum() * 0.0
+                elif 'hr_image' in outputs:
+                    loss = outputs['hr_image'].sum() * 0.0
+                else:
+                    # Fallback: use any available output tensor
+                    any_output = next(iter(outputs.values()))
+                    loss = any_output.sum() * 0.0
+                return loss, {'geometry': 0.0}
         
         elif stage == 'restoration':
             # Pixel + GAN + Layout losses

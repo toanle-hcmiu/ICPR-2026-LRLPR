@@ -196,7 +196,8 @@ class PretrainedPARSeq(nn.Module):
             if self._fallback_model is not None:
                 if next(self._fallback_model.parameters()).device != x.device:
                     self._fallback_model = self._fallback_model.to(x.device)
-                return self._fallback_model(x)
+                # Use forward_parallel to get PLATE_LENGTH outputs
+                return self._fallback_model.forward_parallel(x)
             else:
                 raise RuntimeError("Neither pretrained nor fallback model available.")
         
