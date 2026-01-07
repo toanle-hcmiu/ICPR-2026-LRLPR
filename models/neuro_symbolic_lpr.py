@@ -18,7 +18,7 @@ from typing import Dict, Tuple, Optional, Any
 
 from .encoder import SharedCNNEncoder
 from .stn import SpatialTransformerNetwork, MultiFrameSTN
-from .layout_classifier import LayoutClassifier
+from .layout_classifier import LayoutClassifier, LayoutClassifierWithAttention
 from .feature_fusion import QualityScorerFusion
 from .swinir import SwinIRGenerator
 from .discriminator import PatchDiscriminator
@@ -57,6 +57,7 @@ class NeuroSymbolicLPR(nn.Module):
         
         # Layout classifier configuration
         layout_hidden_dim: int = 256,
+        use_attention_layout: bool = False,  # Use attention-enhanced layout classifier
         
         # Feature fusion configuration
         fusion_type: str = 'weighted_avg',
@@ -76,7 +77,9 @@ class NeuroSymbolicLPR(nn.Module):
         parseq_depth: int = 12,
         
         # Syntax mask configuration
-        soft_mask_value: float = -100.0
+        soft_mask_value: float = -100.0,
+        soft_inference: bool = False,  # Use soft constraints during inference
+        soft_inference_value: float = -50.0
     ):
         """
         Initialize the Neuro-Symbolic LPR system.
@@ -89,6 +92,7 @@ class NeuroSymbolicLPR(nn.Module):
             encoder_base_channels: Base channels for CNN encoder.
             use_corner_predictor: Whether to use corner prediction in STN.
             layout_hidden_dim: Hidden dimension for layout classifier.
+            use_attention_layout: Whether to use attention-enhanced layout classifier.
             fusion_type: Type of feature fusion.
             swinir_embed_dim: Embedding dimension for SwinIR (default: 180 for full model).
             swinir_depths: Depths for SwinIR transformer blocks (default: [6]*6).
@@ -101,6 +105,8 @@ class NeuroSymbolicLPR(nn.Module):
             parseq_num_heads: Number of heads for custom PARSeq.
             parseq_depth: Depth of custom PARSeq encoder.
             soft_mask_value: Soft mask value for training.
+            soft_inference: Whether to use soft constraints during inference.
+            soft_inference_value: Penalty value for soft inference mode.
         """
         super().__init__()
         
@@ -142,10 +148,17 @@ class NeuroSymbolicLPR(nn.Module):
         # Phase 2: Layout Classifier and Fusion
         # ==========================================
         
-        self.layout_classifier = LayoutClassifier(
-            in_channels=encoder_out_channels,
-            fc_dim=layout_hidden_dim
-        )
+        # Use attention-enhanced classifier if requested
+        if use_attention_layout:
+            self.layout_classifier = LayoutClassifierWithAttention(
+                in_channels=encoder_out_channels,
+                hidden_dim=layout_hidden_dim
+            )
+        else:
+            self.layout_classifier = LayoutClassifier(
+                in_channels=encoder_out_channels,
+                fc_dim=layout_hidden_dim
+            )
         
         self.quality_fusion = QualityScorerFusion(
             in_channels=encoder_out_channels,
@@ -192,7 +205,8 @@ class NeuroSymbolicLPR(nn.Module):
             self.recognizer = PretrainedPARSeq(
                 pretrained=True,
                 model_name=parseq_model_name,
-                freeze_backbone=parseq_freeze_backbone
+                freeze_backbone=parseq_freeze_backbone,
+                img_size=hr_size  # For fallback custom implementation
             )
         else:
             self.recognizer = PARSeqRecognizer(
@@ -203,7 +217,9 @@ class NeuroSymbolicLPR(nn.Module):
             )
         
         self.syntax_mask = SyntaxMaskLayer(
-            soft_mask_value=soft_mask_value
+            soft_mask_value=soft_mask_value,
+            soft_inference=soft_inference,
+            soft_inference_value=soft_inference_value
         )
     
     def forward(
@@ -229,8 +245,28 @@ class NeuroSymbolicLPR(nn.Module):
                 - (optional) 'corners': Predicted corner coordinates
                 - (optional) 'quality_scores': Quality scores per frame
                 - (optional) 'rectified_features': Rectified feature maps
+        
+        Raises:
+            ValueError: If input shape is incorrect.
         """
+        # Input validation
+        if x.dim() != 5:
+            raise ValueError(
+                f"Expected 5D input (B, T, C, H, W), got {x.dim()}D tensor with shape {x.shape}"
+            )
+        
         B, T, C, H, W = x.shape
+        
+        if T != self.num_frames:
+            raise ValueError(
+                f"Expected {self.num_frames} frames, got {T}"
+            )
+        
+        if (H, W) != self.lr_size:
+            raise ValueError(
+                f"Expected LR size {self.lr_size}, got ({H}, {W})"
+            )
+        
         outputs = {}
         
         # ==========================================

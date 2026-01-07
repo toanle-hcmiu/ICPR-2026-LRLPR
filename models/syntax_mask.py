@@ -73,6 +73,11 @@ class SyntaxMaskLayer(nn.Module):
     The mask is applied by adding it to the raw logits:
         - 0 for allowed characters (no effect)
         - -inf (or large negative) for forbidden characters (probability → 0)
+    
+    Soft inference mode:
+        For robustness to damaged/non-standard plates, soft_inference mode
+        uses a less aggressive penalty during inference, allowing the model
+        to predict "invalid" characters if visual evidence is overwhelming.
     """
     
     def __init__(
@@ -80,7 +85,9 @@ class SyntaxMaskLayer(nn.Module):
         vocab_size: int = VOCAB_SIZE,
         plate_length: int = PLATE_LENGTH,
         char_start_idx: int = CHAR_START_IDX,
-        soft_mask_value: float = -100.0
+        soft_mask_value: float = -100.0,
+        soft_inference: bool = False,
+        soft_inference_value: float = -50.0
     ):
         """
         Initialize the syntax mask layer.
@@ -90,6 +97,8 @@ class SyntaxMaskLayer(nn.Module):
             plate_length: Number of characters in the license plate.
             char_start_idx: Index where regular characters start.
             soft_mask_value: Value for soft masking during training.
+            soft_inference: Whether to use soft constraints during inference.
+            soft_inference_value: Penalty value for soft inference mode.
         """
         super().__init__()
         
@@ -97,6 +106,8 @@ class SyntaxMaskLayer(nn.Module):
         self.plate_length = plate_length
         self.char_start_idx = char_start_idx
         self.soft_mask_value = soft_mask_value
+        self.soft_inference = soft_inference
+        self.soft_inference_value = soft_inference_value
         
         # Pre-compute masks for letters and digits
         letter_mask = create_letter_mask(vocab_size, char_start_idx)
@@ -190,7 +201,19 @@ class SyntaxMaskLayer(nn.Module):
         Returns:
             Masked logits of shape (B, plate_length, vocab_size).
         """
-        mask = self.get_mask(is_mercosul, use_soft_mask=training)
+        # Use soft mask if:
+        # 1. Training (always soft for gradient flow)
+        # 2. Inference with soft_inference=True (for robustness to anomalies)
+        use_soft = training or self.soft_inference
+        mask = self.get_mask(is_mercosul, use_soft_mask=use_soft)
+        
+        # Use different soft values for training vs soft inference
+        if use_soft and not training:
+            # In soft inference mode, use less aggressive penalty
+            mask = mask.masked_fill(
+                mask == self.soft_mask_value,
+                self.soft_inference_value
+            )
         
         # Add mask to logits
         masked_logits = logits + mask
@@ -290,10 +313,12 @@ class DifferentiableSyntaxMask(nn.Module):
         letter_mask = create_letter_mask(self.vocab_size, self.char_start_idx)
         digit_mask = create_digit_mask(self.vocab_size, self.char_start_idx)
         
-        # Brazilian constraints: LLLNNNN
-        brazilian_constraints = [0, 0, 0, 1, 1, 1, 1]  # 0=letter, 1=digit
+        # HARDCODED: Brazilian format constraints LLLNNNN
+        # 0=letter, 1=digit → [L, L, L, N, N, N, N]
+        brazilian_constraints = [0, 0, 0, 1, 1, 1, 1]
         
-        # Mercosul constraints: LLLNLNN
+        # HARDCODED: Mercosul format constraints LLLNLNN
+        # 0=letter, 1=digit → [L, L, L, N, L, N, N]
         mercosul_constraints = [0, 0, 0, 1, 0, 1, 1]
         
         for pos, mask_layer in enumerate(self.position_masks):
@@ -322,10 +347,12 @@ class DifferentiableSyntaxMask(nn.Module):
         # Get layout probabilities
         layout_prob = torch.sigmoid(layout_logits)  # P(mercosul)
         
-        # Brazilian constraints: LLLNNNN (0=letter, 1=digit)
+        # HARDCODED: Brazilian format constraints LLLNNNN
+        # 0=letter, 1=digit → [L, L, L, N, N, N, N]
         brazilian_constraints = torch.tensor([0, 0, 0, 1, 1, 1, 1], device=logits.device)
         
-        # Mercosul constraints: LLLNLNN
+        # HARDCODED: Mercosul format constraints LLLNLNN
+        # 0=letter, 1=digit → [L, L, L, N, L, N, N]
         mercosul_constraints = torch.tensor([0, 0, 0, 1, 0, 1, 1], device=logits.device)
         
         # Interpolate constraints based on layout probability

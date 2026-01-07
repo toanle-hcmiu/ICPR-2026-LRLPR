@@ -44,7 +44,8 @@ class PretrainedPARSeq(nn.Module):
         pretrained: bool = True,
         model_name: str = 'parseq',  # Options: 'parseq', 'parseq_tiny'
         freeze_backbone: bool = False,
-        output_raw_logits: bool = True
+        output_raw_logits: bool = True,
+        img_size: tuple = (64, 192)  # For fallback custom implementation
     ):
         """
         Initialize pretrained PARSeq wrapper.
@@ -54,18 +55,22 @@ class PretrainedPARSeq(nn.Module):
             model_name: Model variant ('parseq' or 'parseq_tiny').
             freeze_backbone: Whether to freeze the backbone encoder.
             output_raw_logits: Whether to output raw logits for syntax masking.
+            img_size: Image size for fallback custom implementation.
         """
         super().__init__()
         
         self.output_raw_logits = output_raw_logits
         self.model_name = model_name
         self._model = None
+        self._fallback_model = None  # Custom implementation fallback
         self._charset_adapter = None
+        self._img_size = img_size
         
         # Lazy loading to avoid import errors if torch.hub fails
         self._pretrained = pretrained
         self._freeze_backbone = freeze_backbone
         self._loaded = False
+        self._use_fallback = False
     
     def _load_model(self):
         """Lazy load the pretrained model."""
@@ -91,15 +96,29 @@ class PretrainedPARSeq(nn.Module):
             self._create_charset_adapter()
             
             self._loaded = True
+            self._use_fallback = False
             print(f"✓ Loaded pretrained PARSeq ({self.model_name})")
             
         except Exception as e:
             warnings.warn(
                 f"Failed to load pretrained PARSeq: {e}. "
-                f"Falling back to custom implementation."
+                f"Using custom implementation instead."
             )
+            # Create fallback custom implementation
+            self._fallback_model = PARSeqRecognizer(
+                img_size=self._img_size,
+                embed_dim=384,
+                num_heads=6,
+                encoder_depth=12
+            )
+            # Move to same device as self
+            if hasattr(self, '_device'):
+                self._fallback_model = self._fallback_model.to(self._device)
+            
             self._model = None
+            self._use_fallback = True
             self._loaded = True
+            print(f"✓ Initialized custom PARSeq fallback implementation")
     
     def _create_charset_adapter(self):
         """
@@ -158,7 +177,7 @@ class PretrainedPARSeq(nn.Module):
         tgt: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
-        Forward pass using pretrained model.
+        Forward pass using pretrained model or fallback.
         
         Args:
             x: Input image (B, C, H, W).
@@ -167,7 +186,19 @@ class PretrainedPARSeq(nn.Module):
         Returns:
             Logits of shape (B, PLATE_LENGTH, VOCAB_SIZE).
         """
+        # Store device for fallback model creation
+        self._device = x.device
         self._load_model()
+        
+        # Use fallback custom implementation if pretrained failed
+        if self._use_fallback:
+            # Move fallback model to correct device if needed
+            if self._fallback_model is not None:
+                if next(self._fallback_model.parameters()).device != x.device:
+                    self._fallback_model = self._fallback_model.to(x.device)
+                return self._fallback_model(x)
+            else:
+                raise RuntimeError("Neither pretrained nor fallback model available.")
         
         if self._model is None:
             raise RuntimeError("PARSeq model not loaded. Check your internet connection.")
@@ -188,6 +219,29 @@ class PretrainedPARSeq(nn.Module):
     def forward_parallel(self, x: torch.Tensor) -> torch.Tensor:
         """Parallel forward pass (same as forward for pretrained)."""
         return self.forward(x)
+    
+    def parameters(self, recurse: bool = True):
+        """Return parameters from the active model."""
+        self._load_model()
+        if self._use_fallback and self._fallback_model is not None:
+            return self._fallback_model.parameters(recurse)
+        elif self._model is not None:
+            return self._model.parameters(recurse)
+        else:
+            return iter([])  # Empty iterator
+    
+    def train(self, mode: bool = True):
+        """Set training mode."""
+        super().train(mode)
+        if self._use_fallback and self._fallback_model is not None:
+            self._fallback_model.train(mode)
+        elif self._model is not None:
+            self._model.train(mode)
+        return self
+    
+    def eval(self):
+        """Set evaluation mode."""
+        return self.train(False)
 
 
 def load_pretrained_parseq(

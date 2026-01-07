@@ -164,63 +164,128 @@ class RodoSolDataset(LPRDataset):
     """
     Dataset class for RodoSol-ALPR dataset.
     
-    The RodoSol-ALPR dataset contains 20,000 images of Brazilian
+    The RodoSol-ALPR dataset contains multi-frame sequences of Brazilian
     license plates captured from real-world toll cameras.
     
     Expected directory structure:
         data_dir/
-            images/
-                img_0001.jpg
-                img_0002.jpg
+            Scenario-A/
+                Brazilian/
+                    track_00001/
+                        annotations.json
+                        lr-001.jpg, lr-002.jpg, ...
+                        hr-001.jpg, hr-002.jpg, ...
+                    track_00002/
+                        ...
+                Mercosur/
+                    track_00001/
+                        ...
+            Scenario-B/
                 ...
-            annotations.json
     
     Annotations format:
         {
-            "img_0001.jpg": {
-                "text": "ABC1234",
-                "corners": [[x1,y1], [x2,y2], [x3,y3], [x4,y4]],
-                "layout": "brazilian"  # or "mercosul"
-            },
-            ...
+            "plate_layout": "Brazilian" or "Mercosur",
+            "plate_text": "ABC1234",
+            "corners": {} or [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
         }
     """
     
     def _load_annotations(self) -> List[Dict]:
-        """Load RodoSol annotations."""
+        """Load RodoSol annotations from track directories."""
         samples = []
         
-        # Try to load annotations file
-        ann_file = self.data_dir / 'annotations.json'
-        if ann_file.exists():
-            with open(ann_file, 'r') as f:
-                annotations = json.load(f)
-            
-            for img_name, ann in annotations.items():
-                samples.append({
-                    'image_path': str(self.data_dir / 'images' / img_name),
-                    'text': ann['text'],
-                    'corners': ann.get('corners', None),
-                    'layout': ann.get('layout', None)
-                })
+        # Check if this is a track-based structure (Scenario-A/B, Brazilian/Mercosur)
+        scenario_dirs = list(self.data_dir.glob('Scenario-*'))
+        if scenario_dirs:
+            # Track-based structure: scan all tracks
+            for scenario_dir in scenario_dirs:
+                for layout_dir in scenario_dir.iterdir():
+                    if not layout_dir.is_dir():
+                        continue
+                    
+                    # Find all track directories
+                    for track_dir in layout_dir.iterdir():
+                        if not track_dir.is_dir() or not track_dir.name.startswith('track_'):
+                            continue
+                        
+                        ann_file = track_dir / 'annotations.json'
+                        if not ann_file.exists():
+                            continue
+                        
+                        try:
+                            with open(ann_file, 'r') as f:
+                                ann = json.load(f)
+                            
+                            # Get layout type
+                            layout_str = ann.get('plate_layout', '').lower()
+                            if 'mercosur' in layout_str or 'mercosul' in layout_str:
+                                layout = 'mercosul'
+                            else:
+                                layout = 'brazilian'
+                            
+                            # Get plate text
+                            text = ann.get('plate_text', '')
+                            if not text:
+                                continue
+                            
+                            # Get corners if available
+                            corners = ann.get('corners', None)
+                            if isinstance(corners, dict) and len(corners) == 0:
+                                corners = None
+                            
+                            # Check for LR and HR frames
+                            lr_files = sorted(track_dir.glob('lr-*.jpg')) + sorted(track_dir.glob('lr-*.png'))
+                            hr_files = sorted(track_dir.glob('hr-*.jpg')) + sorted(track_dir.glob('hr-*.png'))
+                            
+                            if len(lr_files) > 0 and len(hr_files) > 0:
+                                samples.append({
+                                    'track_dir': str(track_dir),
+                                    'lr_files': [str(f) for f in lr_files],
+                                    'hr_files': [str(f) for f in hr_files],
+                                    'text': text,
+                                    'corners': corners,
+                                    'layout': layout
+                                })
+                        except Exception as e:
+                            # Skip tracks with invalid annotations
+                            continue
         else:
-            # Fallback: scan directory for images
-            images_dir = self.data_dir / 'images'
-            if not images_dir.exists():
-                images_dir = self.data_dir
-            
-            for img_path in images_dir.glob('*.jpg'):
-                # Try to extract text from filename
-                # Assume format: plate_ABC1234.jpg or ABC1234.jpg
-                name = img_path.stem
-                text = name.split('_')[-1] if '_' in name else name
+            # Try to load single annotations file (old format)
+            ann_file = self.data_dir / 'annotations.json'
+            if ann_file.exists():
+                with open(ann_file, 'r') as f:
+                    annotations = json.load(f)
                 
-                samples.append({
-                    'image_path': str(img_path),
-                    'text': text,
-                    'corners': None,
-                    'layout': None
-                })
+                for img_name, ann in annotations.items():
+                    # Handle corners - convert empty dict to None
+                    corners = ann.get('corners', None)
+                    if isinstance(corners, dict) and len(corners) == 0:
+                        corners = None
+                    
+                    samples.append({
+                        'image_path': str(self.data_dir / 'images' / img_name),
+                        'text': ann.get('text', ann.get('plate_text', '')),
+                        'corners': corners,
+                        'layout': ann.get('layout', None)
+                    })
+            else:
+                # Fallback: scan directory for images
+                images_dir = self.data_dir / 'images'
+                if not images_dir.exists():
+                    images_dir = self.data_dir
+                
+                for img_path in list(images_dir.glob('*.jpg')) + list(images_dir.glob('*.png')):
+                    # Try to extract text from filename
+                    name = img_path.stem
+                    text = name.split('_')[-1] if '_' in name else name
+                    
+                    samples.append({
+                        'image_path': str(img_path),
+                        'text': text,
+                        'corners': None,
+                        'layout': None
+                    })
         
         return samples
     
@@ -239,68 +304,140 @@ class RodoSolDataset(LPRDataset):
                 - 'text': Original text string
                 - 'layout': Layout label (0=Brazilian, 1=Mercosul)
                 - 'corners': Corner coordinates (4, 2) if available
+                - 'plate_style': Plate style string ('brazilian' or 'mercosul') for style-aware processing
         """
         sample = self.samples[idx]
         
-        # Load image
-        image = self._load_image(sample['image_path'])
+        # Determine layout early for style-aware processing
+        if sample['layout'] is not None:
+            layout = 1 if sample['layout'] == 'mercosul' else 0
+            plate_style = sample['layout']  # 'brazilian' or 'mercosul'
+        else:
+            text = sample['text']
+            layout = infer_layout_from_text(text)
+            layout = max(0, layout)  # Handle invalid texts
+            plate_style = 'mercosul' if layout == 1 else 'brazilian'
         
-        # Apply transforms if provided
-        if self.transform is not None:
-            image = self.transform(image)
-        
-        # Create HR image
-        hr_image = self._preprocess_image(image, self.hr_size)
-        
-        # Create LR frames (simulate multiple frames from single image)
-        lr_frames = []
-        for _ in range(self.num_frames):
-            # Add slight variations for multi-frame simulation
-            if self.num_frames > 1:
-                # Small random shift
-                h, w = image.shape[:2]
-                shift_x = random.randint(-2, 2)
-                shift_y = random.randint(-2, 2)
-                
-                shifted = np.roll(np.roll(image, shift_x, axis=1), shift_y, axis=0)
-                lr_frame = self._preprocess_image(shifted, self.lr_size)
-            else:
-                lr_frame = self._preprocess_image(image, self.lr_size)
+        # Check if this is a track-based sample
+        if 'track_dir' in sample:
+            # Load multi-frame sequence from track
+            lr_files = sample['lr_files']
+            hr_files = sample['hr_files']
             
-            lr_frames.append(lr_frame)
-        
-        lr_frames = torch.stack(lr_frames, dim=0)  # (T, C, H, W)
+            # Select frames (use all available or sample if more than needed)
+            num_available = min(len(lr_files), len(hr_files))
+            if num_available >= self.num_frames:
+                # Sample evenly spaced frames
+                indices = np.linspace(0, num_available - 1, self.num_frames, dtype=int)
+            else:
+                # Repeat frames if not enough available
+                indices = list(range(num_available)) * (self.num_frames // num_available + 1)
+                indices = indices[:self.num_frames]
+            
+            # Load LR frames
+            lr_frames = []
+            for i in indices:
+                lr_path = lr_files[min(i, len(lr_files) - 1)]
+                lr_image = self._load_image(lr_path)
+                if self.transform is not None:
+                    # Pass plate style to transform for style-aware augmentation
+                    if hasattr(self.transform, 'set_plate_style'):
+                        self.transform.set_plate_style(plate_style)
+                    lr_image = self.transform(lr_image)
+                lr_frame = self._preprocess_image(lr_image, self.lr_size)
+                lr_frames.append(lr_frame)
+            
+            lr_frames = torch.stack(lr_frames, dim=0)  # (T, C, H, W)
+            
+            # Load HR image (use middle frame or first available)
+            hr_idx = len(hr_files) // 2 if hr_files else 0
+            hr_path = hr_files[min(hr_idx, len(hr_files) - 1)]
+            hr_image_raw = self._load_image(hr_path)
+            if self.transform is not None:
+                # Pass plate style to transform for style-aware augmentation
+                if hasattr(self.transform, 'set_plate_style'):
+                    self.transform.set_plate_style(plate_style)
+                hr_image_raw = self.transform(hr_image_raw)
+            hr_image = self._preprocess_image(hr_image_raw, self.hr_size)
+            
+            # Store original HR image dimensions for corner normalization
+            hr_image_shape = hr_image_raw.shape[:2]  # (H, W)
+        else:
+            # Single image sample (old format)
+            image = self._load_image(sample['image_path'])
+            
+            # Apply transforms if provided
+            if self.transform is not None:
+                # Pass plate style to transform for style-aware augmentation
+                if hasattr(self.transform, 'set_plate_style'):
+                    self.transform.set_plate_style(plate_style)
+                image = self.transform(image)
+            
+            # Create HR image
+            hr_image = self._preprocess_image(image, self.hr_size)
+            hr_image_shape = image.shape[:2]  # (H, W)
+            
+            # Create LR frames (simulate multiple frames from single image)
+            lr_frames = []
+            for _ in range(self.num_frames):
+                # Add slight variations for multi-frame simulation
+                if self.num_frames > 1:
+                    # Small random shift
+                    h, w = image.shape[:2]
+                    shift_x = random.randint(-2, 2)
+                    shift_y = random.randint(-2, 2)
+                    
+                    shifted = np.roll(np.roll(image, shift_x, axis=1), shift_y, axis=0)
+                    lr_frame = self._preprocess_image(shifted, self.lr_size)
+                else:
+                    lr_frame = self._preprocess_image(image, self.lr_size)
+                
+                lr_frames.append(lr_frame)
+            
+            lr_frames = torch.stack(lr_frames, dim=0)  # (T, C, H, W)
         
         # Process text
         text = sample['text']
         text_indices = text_to_indices(text)
-        
-        # Determine layout
-        if sample['layout'] is not None:
-            layout = 1 if sample['layout'] == 'mercosul' else 0
-        else:
-            layout = infer_layout_from_text(text)
-            layout = max(0, layout)  # Handle invalid texts
         
         result = {
             'lr_frames': lr_frames,
             'hr_image': hr_image,
             'text_indices': text_indices,
             'text': text,
-            'layout': torch.tensor(layout, dtype=torch.long)
+            'layout': torch.tensor(layout, dtype=torch.long),
+            'plate_style': plate_style  # Add plate style for potential style-aware processing
         }
         
         # Add corners if available
-        if sample['corners'] is not None:
-            corners = torch.tensor(sample['corners'], dtype=torch.float32)
-            # Normalize corners to [-1, 1]
-            h, w = image.shape[:2]
-            corners[:, 0] = corners[:, 0] / w * 2 - 1
-            corners[:, 1] = corners[:, 1] / h * 2 - 1
-            result['corners'] = corners
+        corners_data = sample.get('corners', None)
+        if corners_data is not None:
+            # Handle different corner formats
+            if isinstance(corners_data, dict):
+                # Empty dict or dict format - skip
+                if len(corners_data) == 0:
+                    corners_data = None
+                else:
+                    # Try to convert dict to list format if possible
+                    # For now, skip dict format corners
+                    corners_data = None
+            elif isinstance(corners_data, (list, tuple, np.ndarray)):
+                # Convert to numpy array first, then to tensor
+                if len(corners_data) > 0:
+                    corners_array = np.array(corners_data, dtype=np.float32)
+                    if corners_array.shape == (4, 2):  # Valid corner format
+                        corners = torch.from_numpy(corners_array)
+                        # Normalize corners to [-1, 1] using original image dimensions
+                        h, w = hr_image_shape
+                        corners[:, 0] = corners[:, 0] / w * 2 - 1
+                        corners[:, 1] = corners[:, 1] / h * 2 - 1
+                        result['corners'] = corners
         
         if self.return_path:
-            result['path'] = sample['image_path']
+            if 'track_dir' in sample:
+                result['path'] = sample['track_dir']
+            else:
+                result['path'] = sample.get('image_path', '')
         
         return result
 

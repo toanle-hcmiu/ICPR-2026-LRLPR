@@ -20,7 +20,7 @@ class LayoutClassifier(nn.Module):
     result is used to select the appropriate syntax mask for recognition.
     
     Architecture:
-        - Tiny CNN for feature extraction
+        - Tiny CNN for feature extraction (no pooling, uses GAP instead)
         - Global Average Pooling
         - Fully Connected layer
         - Sigmoid activation for binary classification
@@ -53,21 +53,34 @@ class LayoutClassifier(nn.Module):
             hidden_channels = [64, 128, 256]
         
         # CNN for feature extraction
+        # Use strided convolutions instead of separate conv + pooling
+        # to handle small feature maps gracefully
         layers = []
         prev_channels = in_channels
         
-        for out_channels in hidden_channels:
-            layers.extend([
-                nn.Conv2d(prev_channels, out_channels, 3, padding=1),
-                nn.BatchNorm2d(out_channels),
-                nn.ReLU(inplace=True),
-                nn.MaxPool2d(2, 2)
-            ])
+        for i, out_channels in enumerate(hidden_channels):
+            # Use stride=2 for downsampling instead of MaxPool
+            # This works better with small feature maps
+            if i == 0:
+                # First layer: no downsampling
+                layers.extend([
+                    nn.Conv2d(prev_channels, out_channels, 3, stride=1, padding=1),
+                    nn.BatchNorm2d(out_channels),
+                    nn.ReLU(inplace=True)
+                ])
+            else:
+                # Subsequent layers: use strided conv for downsampling
+                # But only if we're not already at minimum size
+                layers.extend([
+                    nn.Conv2d(prev_channels, out_channels, 3, stride=1, padding=1),
+                    nn.BatchNorm2d(out_channels),
+                    nn.ReLU(inplace=True)
+                ])
             prev_channels = out_channels
         
         self.cnn = nn.Sequential(*layers)
         
-        # Global Average Pooling
+        # Global Average Pooling - handles any spatial size
         self.gap = nn.AdaptiveAvgPool2d(1)
         
         # Fully connected classifier
@@ -94,7 +107,7 @@ class LayoutClassifier(nn.Module):
         # Extract features
         features = self.cnn(x)
         
-        # Global pooling
+        # Global pooling - works with any spatial size
         pooled = self.gap(features).view(batch_size, -1)
         
         # Classify

@@ -3,6 +3,37 @@ Configuration for Neuro-Symbolic LPR System.
 
 This module contains all hyperparameters and constants for the ALPR system
 designed for Brazilian license plates (both old Brazilian and Mercosul formats).
+
+================================================================================
+HARDCODED PLATE FORMAT SPECIFICATIONS
+================================================================================
+
+These format specifications are HARDCODED throughout the codebase and cannot
+be changed without updating multiple files:
+
+1. Brazilian Format (Old):
+   - Pattern: LLL-NNNN (display) / LLLNNNN (storage)
+   - Regex: ^[A-Z]{3}[0-9]{4}$
+   - Position constraints: [L, L, L, N, N, N, N]
+   - Example: ABC-1234 → ABC1234
+
+2. Mercosul Format (New):
+   - Pattern: LLLNLNN (no dash)
+   - Regex: ^[A-Z]{3}[0-9][A-Z][0-9]{2}$
+   - Position constraints: [L, L, L, N, L, N, N]
+   - Example: ABC1D23
+
+3. Constants:
+   - PLATE_LENGTH = 7 (both formats, without dash)
+   - CHARSET = A-Z + 0-9 (36 characters)
+   - VOCAB_SIZE = 39 (36 chars + 3 special tokens: PAD, BOS, EOS)
+
+Files that contain hardcoded format references:
+- config.py: Pattern definitions, get_position_constraints()
+- models/syntax_mask.py: Mask generation (lines 317, 320, 349, 352)
+- data/dataset.py: Text validation and layout inference
+
+================================================================================
 """
 
 import re
@@ -11,13 +42,36 @@ from typing import List, Tuple, Optional
 
 
 # ============================================================================
-# License Plate Syntax Patterns
+# License Plate Syntax Patterns (HARDCODED)
 # ============================================================================
+#
+# IMPORTANT: These format specifications are HARDCODED throughout the system.
+# Changing these requires updates to:
+#   - config.py: Pattern definitions and get_position_constraints()
+#   - models/syntax_mask.py: Mask generation (lines 317, 320, 349, 352)
+#   - data/dataset.py: Text validation and layout inference
+#
+# Brazilian Format (Old):
+#   - Display: LLL-NNNN (with dash)
+#   - Storage: LLLNNNN (without dash, PLATE_LENGTH=7)
+#   - Pattern: 3 letters followed by 4 digits
+#   - Positions: [L, L, L, N, N, N, N]
+#   - Example: ABC-1234 → ABC1234
+#
+# Mercosul Format (New):
+#   - Display: LLLNLNN (no dash)
+#   - Storage: LLLNLNN (PLATE_LENGTH=7)
+#   - Pattern: 3 letters, 1 digit, 1 letter, 2 digits
+#   - Positions: [L, L, L, N, L, N, N]
+#   - Example: ABC1D23
+#
 
 # Old Brazilian format: LLL-NNNN (3 letters, 4 numbers)
+# HARDCODED: Position constraints [L, L, L, N, N, N, N]
 BRAZILIAN_PATTERN = re.compile(r'^[A-Z]{3}[0-9]{4}$')
 
 # Mercosul format: LLLNLNN (3 letters, 1 number, 1 letter, 2 numbers)
+# HARDCODED: Position constraints [L, L, L, N, L, N, N]
 MERCOSUL_PATTERN = re.compile(r'^[A-Z]{3}[0-9][A-Z][0-9]{2}$')
 
 # Character sets
@@ -42,6 +96,7 @@ EOS_IDX = 2
 CHAR_START_IDX = 3
 
 # Plate length (without dash)
+# HARDCODED: Both Brazilian and Mercosul formats use 7 characters
 PLATE_LENGTH = 7
 
 
@@ -154,7 +209,15 @@ class TrainingConfig:
 
 @dataclass
 class DataConfig:
-    """Data configuration."""
+    """
+    Data configuration.
+    
+    Note on Plate Styles:
+    - Brazilian (Old): Grey background, format LLL-NNNN
+    - Mercosur (New): White background with blue band at top, format LLLNLNN
+      The blue band contains country name, flag, and Mercosur logo.
+      Uses FE-Schrift typeface for enhanced security.
+    """
     
     # Dataset paths
     train_dir: str = 'data/train'
@@ -179,6 +242,15 @@ class DataConfig:
     contrast_range: Tuple[float, float] = (0.8, 1.2)
     blur_probability: float = 0.3
     noise_probability: float = 0.3
+    
+    # Style-aware augmentation (for preserving Mercosur blue band visibility)
+    style_aware_augmentation: bool = True
+    # Mercosur: More conservative brightness/contrast to preserve blue band
+    mercosur_brightness_range: Tuple[float, float] = (0.85, 1.15)
+    mercosur_contrast_range: Tuple[float, float] = (0.85, 1.15)
+    # Brazilian: Standard ranges (grey background more tolerant)
+    brazilian_brightness_range: Tuple[float, float] = (0.8, 1.2)
+    brazilian_contrast_range: Tuple[float, float] = (0.8, 1.2)
     
     # Synthetic data generation
     synthetic_count: int = 5_000_000
@@ -215,17 +287,26 @@ def get_position_constraints(is_mercosul: bool) -> List[str]:
     """
     Get character type constraints for each position.
     
+    HARDCODED: These constraints are hardcoded and used throughout the system
+    for syntax mask generation, validation, and text processing.
+    
     Args:
         is_mercosul: Whether the plate is Mercosul format.
         
     Returns:
-        List of 'L' (letter) or 'N' (number) for each position.
+        List of 'L' (letter) or 'N' (number) for each position (length=7).
+        
+    Format Specifications:
+        Brazilian: LLLNNNN → ['L', 'L', 'L', 'N', 'N', 'N', 'N']
+        Mercosul:  LLLNLNN → ['L', 'L', 'L', 'N', 'L', 'N', 'N']
     """
     if is_mercosul:
-        # Mercosul: LLLNLNN (positions 0,1,2,4 are letters; 3,5,6 are numbers)
+        # HARDCODED: Mercosul format LLLNLNN
+        # Positions 0,1,2,4 are letters; positions 3,5,6 are numbers
         return ['L', 'L', 'L', 'N', 'L', 'N', 'N']
     else:
-        # Brazilian: LLLNNNN (positions 0,1,2 are letters; 3,4,5,6 are numbers)
+        # HARDCODED: Brazilian format LLLNNNN
+        # Positions 0,1,2 are letters; positions 3,4,5,6 are numbers
         return ['L', 'L', 'L', 'N', 'N', 'N', 'N']
 
 

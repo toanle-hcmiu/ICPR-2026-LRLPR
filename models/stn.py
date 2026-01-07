@@ -18,7 +18,8 @@ class LocalizationNetwork(nn.Module):
     Localization network that predicts affine transformation parameters.
     
     Architecture:
-        - Small CNN for feature extraction
+        - Small CNN for feature extraction (adaptive to input size)
+        - Global average pooling (handles any spatial size)
         - Fully connected layers for parameter regression
         - Outputs 6 parameters (2x3 affine matrix)
     """
@@ -48,26 +49,35 @@ class LocalizationNetwork(nn.Module):
         if fc_dims is None:
             fc_dims = [256, 128]
         
-        # Convolutional layers
+        # Determine number of pooling layers based on input size
+        # Each pool halves the spatial dimensions, ensure we don't go below 1x1
+        min_dim = min(feature_height, feature_width)
+        max_pools = max(0, int(math.log2(max(1, min_dim))))
+        num_pools = min(len(hidden_channels), max_pools)
+        
+        # Convolutional layers with conditional pooling
         conv_layers = []
         prev_channels = in_channels
         
-        for out_channels in hidden_channels:
+        for i, out_channels in enumerate(hidden_channels):
             conv_layers.extend([
                 nn.Conv2d(prev_channels, out_channels, 3, padding=1),
                 nn.BatchNorm2d(out_channels),
-                nn.ReLU(inplace=True),
-                nn.MaxPool2d(2, 2)
+                nn.ReLU(inplace=True)
             ])
+            # Only add pooling if we haven't exceeded the safe number of pools
+            if i < num_pools:
+                conv_layers.append(nn.MaxPool2d(2, 2))
             prev_channels = out_channels
         
         self.conv = nn.Sequential(*conv_layers)
         
-        # Calculate flattened size after convolutions
-        num_pools = len(hidden_channels)
-        final_h = feature_height // (2 ** num_pools)
-        final_w = feature_width // (2 ** num_pools)
-        flatten_size = hidden_channels[-1] * max(1, final_h) * max(1, final_w)
+        # Use adaptive average pooling to handle any input size
+        # This ensures consistent output regardless of input spatial dimensions
+        self.adaptive_pool = nn.AdaptiveAvgPool2d((1, 1))
+        
+        # Flatten size is just the last channel count (after adaptive pooling to 1x1)
+        flatten_size = hidden_channels[-1]
         
         # Fully connected layers
         fc_layers = []
@@ -108,6 +118,9 @@ class LocalizationNetwork(nn.Module):
         
         # Apply convolutions
         x = self.conv(x)
+        
+        # Apply adaptive pooling to get fixed 1x1 spatial output
+        x = self.adaptive_pool(x)
         
         # Flatten and apply FC layers
         x = x.view(batch_size, -1)
@@ -389,10 +402,8 @@ class MultiFrameSTN(nn.Module):
         reshaped_outputs = [rectified]
         for output in other_outputs:
             if len(output.shape) == 3:
-                # Affine parameters (B*T, 2, 3) -> (B, T, 2, 3)
-                output = output.view(B, T, output.size(1), output.size(2))
-            elif len(output.shape) == 3:
-                # Corners (B*T, 4, 2) -> (B, T, 4, 2)
+                # Both affine params (B*T, 2, 3) and corners (B*T, 4, 2) are 3D
+                # Reshape to include time dimension: (B*T, D1, D2) -> (B, T, D1, D2)
                 output = output.view(B, T, output.size(1), output.size(2))
             reshaped_outputs.append(output)
         

@@ -12,9 +12,12 @@ This system recognizes Brazilian license plates in two formats:
 
 - **Multi-frame Processing**: Processes 5 LR frames for robust recognition
 - **Spatial Transformer Network**: Corrects geometric distortions with corner-supervised alignment
-- **Layout Classification**: Automatically detects Brazilian vs Mercosul format
-- **GAN Super-Resolution**: SwinIR-based image restoration
+- **Layout Classification**: Automatically detects Brazilian vs Mercosul format (with optional attention mechanism)
+- **GAN Super-Resolution**: SwinIR-based image restoration with OCR-aware perceptual loss
 - **Syntax-Masked Recognition**: Enforces valid plate formats using symbolic constraints
+- **Mixed Precision Training**: 2x faster training with automatic mixed precision (AMP)
+- **EMA Model Averaging**: Exponential moving average for more stable final models
+- **Soft Inference Mode**: Robust handling of damaged/non-standard plates
 
 ## Architecture
 
@@ -85,10 +88,10 @@ pip install -r requirements.txt
 
 ### Training
 
-The system uses a staged training schedule:
+The system uses a staged training schedule with advanced training features:
 
 ```bash
-# Train all stages
+# Train all stages (with defaults: AMP enabled, EMA enabled)
 python train.py --data-dir data/ --output-dir outputs/
 
 # Train specific stage
@@ -101,6 +104,40 @@ python train.py --stage 3 --resume checkpoints/step2.pth  # Fine-tune
 # 2: Restoration + Layout (SwinIR, Classifier)
 # 3: End-to-end fine-tuning (All)
 ```
+
+#### Advanced Training Options
+
+```bash
+# Full training with all options
+python train.py --data-dir data/ --output-dir outputs/ \
+    --stage all \
+    --early-stopping 15      # Stop if no improvement for 15 epochs
+
+# Disable mixed precision (for debugging or CPU training)
+python train.py --no-amp --data-dir data/
+
+# Disable EMA model averaging
+python train.py --no-ema --data-dir data/
+
+# Resume from checkpoint
+python train.py --stage 3 --resume checkpoints/restoration_best.pth
+```
+
+#### Training Features
+
+| Feature | Default | Description |
+|---------|---------|-------------|
+| **Mixed Precision (AMP)** | Enabled | 2x faster training, lower memory usage |
+| **EMA** | Enabled | Exponential moving average of weights for stable models |
+| **Early Stopping** | Disabled | Stop training if validation accuracy plateaus |
+| **LR Warmup** | 5 epochs | Linear warmup before main scheduler |
+| **Gradient Clipping** | 1.0 | Prevents gradient explosion |
+
+#### Metrics Tracked
+
+- **Plate Accuracy**: Exact match (all 7 characters correct)
+- **Character Accuracy**: Per-character accuracy
+- **Layout Accuracy**: Brazilian vs Mercosul classification accuracy
 
 ### Inference
 
@@ -124,7 +161,7 @@ import torch
 from PIL import Image
 import numpy as np
 
-# Load model
+# Load model with default settings
 device = torch.device('cuda')
 model = load_model('checkpoints/best.pth', device)
 
@@ -136,6 +173,38 @@ print(f"Plate: {text}")
 print(f"Format: {'Mercosul' if is_mercosul else 'Brazilian'}")
 print(f"Confidence: {confidence:.2%}")
 ```
+
+### Model Configuration Options
+
+```python
+from models import NeuroSymbolicLPR
+
+# Create model with all options
+model = NeuroSymbolicLPR(
+    num_frames=5,
+    lr_size=(16, 48),
+    hr_size=(64, 192),
+    
+    # Use attention-enhanced layout classifier (recommended for difficult cases)
+    use_attention_layout=True,
+    
+    # Soft inference for robustness to damaged/non-standard plates
+    soft_inference=True,
+    soft_inference_value=-50.0,
+    
+    # Use pretrained PARSeq (recommended)
+    use_pretrained_parseq=True,
+    parseq_model_name='parseq',  # or 'parseq_tiny' for faster inference
+)
+```
+
+#### Soft Inference Mode
+
+By default, the syntax mask uses hard constraints (`-inf`) during inference, guaranteeing syntactically valid outputs. Enable `soft_inference=True` to use softer penalties (`-50.0`), allowing the model to predict "invalid" characters if visual evidence is overwhelming. This improves robustness to:
+
+- Damaged or worn plates
+- Non-standard custom plates
+- Manufacturing defects
 
 ## Project Structure
 
@@ -162,7 +231,8 @@ ICPR-2026-LRLPR/
 │   ├── __init__.py
 │   ├── corner_loss.py        # STN corner supervision
 │   ├── gan_loss.py           # Adversarial losses
-│   └── composite_loss.py     # Combined training loss
+│   ├── composite_loss.py     # Combined training loss
+│   └── ocr_perceptual_loss.py # OCR-aware perceptual losses
 │
 ├── data/
 │   ├── __init__.py
@@ -171,10 +241,14 @@ ICPR-2026-LRLPR/
 │
 └── utils/
     ├── __init__.py
+    ├── ema.py                # Exponential Moving Average
+    ├── early_stopping.py     # Early stopping utility
     └── visualization.py      # Visualization tools
 ```
 
-## Loss Function
+## Loss Functions
+
+### Composite Training Loss
 
 The total loss for end-to-end training:
 
@@ -189,12 +263,92 @@ L_total = L_pixel + 0.1 × L_GAN + 0.5 × L_OCR + 0.1 × L_geo
 | L_OCR | 0.5 | Character recognition loss |
 | L_geo | 0.1 | Corner loss for STN |
 
-## Syntax Mask
+### OCR-Aware Perceptual Losses
 
-The key neuro-symbolic innovation. The mask enforces valid formats:
+Additional losses for enhanced super-resolution (in `losses/ocr_perceptual_loss.py`):
+
+| Loss Class | Description |
+|------------|-------------|
+| `OCRAwarePerceptualLoss` | Uses downstream OCR model to guide restoration. The generator learns to produce images optimized for OCR accuracy, not just visual similarity. |
+| `CharacterFocusLoss` | Edge-aware loss using Sobel operators. Emphasizes character boundaries and high-frequency details critical for recognition. |
+| `MultiScaleOCRLoss` | Evaluates OCR at multiple scales (1.0×, 0.5×, 0.25×) for robust recognition across different viewing distances. |
+
+#### Using OCR-Aware Loss
 
 ```python
-# Brazilian: LLL-NNNN
+from losses import OCRAwarePerceptualLoss
+
+# Wrap your OCR model for perceptual loss
+ocr_loss = OCRAwarePerceptualLoss(
+    ocr_model=recognizer,
+    loss_type='cross_entropy',
+    weight=1.0,
+    freeze_ocr=True  # Freeze OCR weights
+)
+
+# In training loop
+loss = ocr_loss(generated_hr, target_text)
+```
+
+## Plate Format Specifications (Hardcoded)
+
+The system recognizes two Brazilian license plate formats with **hardcoded syntax rules**:
+
+### Brazilian Format (Old)
+- **Pattern**: `LLL-NNNN` (displayed with dash) or `LLLNNNN` (stored without dash)
+- **Regex**: `^[A-Z]{3}[0-9]{4}$`
+- **Position Constraints** (hardcoded in `config.py`):
+  ```
+  Position:  0  1  2  3  4  5  6
+  Type:      L  L  L  N  N  N  N
+  ```
+  - Positions 0-2: **Letters** (A-Z)
+  - Positions 3-6: **Digits** (0-9)
+- **Example**: `ABC1234` → `ABC-1234`
+
+### Mercosul Format (New)
+- **Pattern**: `LLLNLNN` (no dash)
+- **Regex**: `^[A-Z]{3}[0-9][A-Z][0-9]{2}$`
+- **Position Constraints** (hardcoded in `config.py`):
+  ```
+  Position:  0  1  2  3  4  5  6
+  Type:      L  L  L  N  L  N  N
+  ```
+  - Positions 0, 1, 2, 4: **Letters** (A-Z)
+  - Positions 3, 5, 6: **Digits** (0-9)
+- **Example**: `ABC1D23` → `ABC1D23`
+
+### Hardcoded Constants
+
+All format specifications are **hardcoded** in `config.py`:
+
+```python
+# Plate length (without dash)
+PLATE_LENGTH = 7
+
+# Regex patterns
+BRAZILIAN_PATTERN = re.compile(r'^[A-Z]{3}[0-9]{4}$')
+MERCOSUL_PATTERN = re.compile(r'^[A-Z]{3}[0-9][A-Z][0-9]{2}$')
+
+# Position constraints function
+def get_position_constraints(is_mercosul: bool) -> List[str]:
+    if is_mercosul:
+        return ['L', 'L', 'L', 'N', 'L', 'N', 'N']  # Mercosul
+    else:
+        return ['L', 'L', 'L', 'N', 'N', 'N', 'N']  # Brazilian
+```
+
+**Important**: These formats are **hardcoded** and cannot be changed without modifying:
+- `config.py`: Pattern definitions and position constraints
+- `models/syntax_mask.py`: Mask generation logic (lines 317, 320, 349, 352)
+- `data/dataset.py`: Text validation and layout inference
+
+## Syntax Mask
+
+The key neuro-symbolic innovation. The mask enforces valid formats using the **hardcoded constraints** above:
+
+```python
+# Brazilian: LLL-NNNN (without dash: LLLNNNN)
 # Position: 0  1  2  3  4  5  6
 # Type:     L  L  L  N  N  N  N
 
@@ -203,7 +357,25 @@ The key neuro-symbolic innovation. The mask enforces valid formats:
 # Type:     L  L  L  N  L  N  N
 ```
 
-Invalid characters at each position are masked with `-inf` (or `-100` during training for gradient stability).
+### Masking Modes
+
+| Mode | Mask Value | Use Case |
+|------|------------|----------|
+| **Training** | `-100` | Soft mask for gradient stability |
+| **Hard Inference** | `-inf` | Guarantees valid output (default) |
+| **Soft Inference** | `-50` | Allows invalid chars if evidence is strong |
+
+### Enabling Soft Inference
+
+```python
+from models import NeuroSymbolicLPR
+
+# For robustness to damaged/non-standard plates
+model = NeuroSymbolicLPR(
+    soft_inference=True,
+    soft_inference_value=-50.0
+)
+```
 
 ## Dataset
 
@@ -231,6 +403,39 @@ Annotations format:
   }
 }
 ```
+
+## Changelog
+
+### v1.1.0 (Latest)
+
+**Training Improvements:**
+- ✅ Mixed precision training (AMP) for 2x faster training
+- ✅ EMA (Exponential Moving Average) for stable model weights
+- ✅ Early stopping with configurable patience
+- ✅ Learning rate warmup (linear warmup before main scheduler)
+- ✅ Character-level and plate-level accuracy metrics
+- ✅ Comprehensive model parameter logging
+
+**Model Enhancements:**
+- ✅ Attention-enhanced layout classifier (`use_attention_layout=True`)
+- ✅ Soft inference constraints for damaged plates (`soft_inference=True`)
+- ✅ Input validation with clear error messages
+
+**New Loss Functions:**
+- ✅ `OCRAwarePerceptualLoss` - Optimizes SR for OCR performance
+- ✅ `CharacterFocusLoss` - Edge-aware loss for character boundaries
+- ✅ `MultiScaleOCRLoss` - Multi-scale OCR evaluation
+
+**Bug Fixes:**
+- 🐛 Fixed duplicate condition in `MultiFrameSTN`
+- 🐛 Fixed invalid parameter in model initialization
+
+### v1.0.0
+
+- Initial implementation of the Neuro-Symbolic LPR system
+- 4-phase pipeline: STN → Layout/Fusion → SwinIR → PARSeq
+- Syntax-masked recognition for valid plate outputs
+- Staged training schedule
 
 ## Citation
 

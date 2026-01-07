@@ -1,0 +1,5 @@
+data/train/
+data/val/
+checkpoints/
+logs/
+results/

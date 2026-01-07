@@ -18,6 +18,11 @@ class LPRAugmentation:
     
     Applies geometric and photometric augmentations to simulate
     real-world conditions and improve model robustness.
+    
+    Supports plate-style-aware augmentation for Brazilian vs Mercosur plates:
+    - Mercosur plates have white background with blue band, may need different
+      brightness/contrast ranges to preserve blue band visibility
+    - Brazilian plates have grey background, may tolerate different augmentations
     """
     
     def __init__(
@@ -33,6 +38,14 @@ class LPRAugmentation:
         contrast_range: Tuple[float, float] = (0.8, 1.2),
         saturation_range: Tuple[float, float] = (0.8, 1.2),
         hue_range: Tuple[float, float] = (-0.1, 0.1),
+        
+        # Style-specific photometric adjustments
+        # Mercosur: white background, preserve blue band visibility
+        mercosur_brightness_range: Optional[Tuple[float, float]] = None,
+        mercosur_contrast_range: Optional[Tuple[float, float]] = None,
+        # Brazilian: grey background, more tolerance
+        brazilian_brightness_range: Optional[Tuple[float, float]] = None,
+        brazilian_contrast_range: Optional[Tuple[float, float]] = None,
         
         # Degradation augmentations
         blur_probability: float = 0.3,
@@ -52,7 +65,8 @@ class LPRAugmentation:
         # Enable/disable
         enable_geometric: bool = True,
         enable_photometric: bool = True,
-        enable_degradation: bool = True
+        enable_degradation: bool = True,
+        style_aware: bool = True  # Enable plate-style-aware augmentation
     ):
         """
         Initialize augmentation pipeline.
@@ -89,6 +103,12 @@ class LPRAugmentation:
         self.saturation_range = saturation_range
         self.hue_range = hue_range
         
+        # Style-specific ranges (use defaults if not specified)
+        self.mercosur_brightness_range = mercosur_brightness_range or brightness_range
+        self.mercosur_contrast_range = mercosur_contrast_range or contrast_range
+        self.brazilian_brightness_range = brazilian_brightness_range or brightness_range
+        self.brazilian_contrast_range = brazilian_contrast_range or contrast_range
+        
         self.blur_probability = blur_probability
         self.blur_kernel_range = blur_kernel_range
         self.noise_probability = noise_probability
@@ -104,6 +124,19 @@ class LPRAugmentation:
         self.enable_geometric = enable_geometric
         self.enable_photometric = enable_photometric
         self.enable_degradation = enable_degradation
+        self.style_aware = style_aware
+        
+        # Current plate style (set dynamically)
+        self.current_plate_style = None  # 'brazilian' or 'mercosul'
+    
+    def set_plate_style(self, style: str):
+        """
+        Set the current plate style for style-aware augmentation.
+        
+        Args:
+            style: 'brazilian' or 'mercosul'
+        """
+        self.current_plate_style = style.lower()
     
     def __call__(self, image: np.ndarray) -> np.ndarray:
         """
@@ -122,7 +155,7 @@ class LPRAugmentation:
         if self.enable_geometric:
             img = self._apply_geometric(img)
         
-        # Apply photometric augmentations
+        # Apply photometric augmentations (style-aware if enabled)
         if self.enable_photometric:
             img = self._apply_photometric(img)
         
@@ -166,19 +199,37 @@ class LPRAugmentation:
         return img
     
     def _apply_photometric(self, img: Image.Image) -> Image.Image:
-        """Apply photometric augmentations."""
+        """Apply photometric augmentations with optional style-aware adjustments."""
+        # Select brightness and contrast ranges based on plate style
+        if self.style_aware and self.current_plate_style:
+            if self.current_plate_style == 'mercosul':
+                brightness_range = self.mercosur_brightness_range
+                contrast_range = self.mercosur_contrast_range
+            else:  # brazilian
+                brightness_range = self.brazilian_brightness_range
+                contrast_range = self.brazilian_contrast_range
+        else:
+            brightness_range = self.brightness_range
+            contrast_range = self.contrast_range
+        
         # Brightness
-        factor = random.uniform(*self.brightness_range)
+        factor = random.uniform(*brightness_range)
         enhancer = ImageEnhance.Brightness(img)
         img = enhancer.enhance(factor)
         
         # Contrast
-        factor = random.uniform(*self.contrast_range)
+        factor = random.uniform(*contrast_range)
         enhancer = ImageEnhance.Contrast(img)
         img = enhancer.enhance(factor)
         
-        # Saturation
-        factor = random.uniform(*self.saturation_range)
+        # Saturation (less aggressive for Mercosur to preserve blue band colors)
+        if self.style_aware and self.current_plate_style == 'mercosul':
+            # More conservative saturation changes for Mercosur
+            sat_range = (0.9, 1.1)  # Preserve blue band colors
+        else:
+            sat_range = self.saturation_range
+        
+        factor = random.uniform(*sat_range)
         enhancer = ImageEnhance.Color(img)
         img = enhancer.enhance(factor)
         

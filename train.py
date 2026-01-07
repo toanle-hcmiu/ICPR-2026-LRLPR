@@ -19,12 +19,14 @@ import logging
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Optional, Tuple
+from copy import deepcopy
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
+from torch.amp import autocast, GradScaler
 from tqdm import tqdm
 import yaml
 
@@ -33,6 +35,76 @@ from models import NeuroSymbolicLPR, PatchDiscriminator
 from losses import CompositeLoss, CornerLoss, GANLoss
 from losses.composite_loss import StagedTrainingManager
 from data import RodoSolDataset, SyntheticLPRDataset, LPRAugmentation
+
+
+# =============================================================================
+# Utility Classes
+# =============================================================================
+
+class EMA:
+    """Exponential Moving Average of model weights for more stable final model."""
+    
+    def __init__(self, model: nn.Module, decay: float = 0.999):
+        self.model = deepcopy(model)
+        self.model.eval()
+        self.decay = decay
+        
+        for param in self.model.parameters():
+            param.requires_grad = False
+    
+    @torch.no_grad()
+    def update(self, model: nn.Module):
+        for ema_param, model_param in zip(
+            self.model.parameters(), model.parameters()
+        ):
+            ema_param.data.mul_(self.decay).add_(
+                model_param.data, alpha=1 - self.decay
+            )
+    
+    def state_dict(self):
+        return self.model.state_dict()
+    
+    def load_state_dict(self, state_dict):
+        self.model.load_state_dict(state_dict)
+
+
+class EarlyStopping:
+    """Early stopping to prevent overfitting."""
+    
+    def __init__(self, patience: int = 10, min_delta: float = 0.001):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.counter = 0
+        self.best_score = None
+        self.should_stop = False
+    
+    def __call__(self, score: float) -> bool:
+        if self.best_score is None:
+            self.best_score = score
+        elif score < self.best_score + self.min_delta:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.should_stop = True
+        else:
+            self.best_score = score
+            self.counter = 0
+        
+        return self.should_stop
+
+
+def log_model_info(model: nn.Module, logger: logging.Logger):
+    """Log model architecture and parameter counts."""
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    
+    logger.info(f"Model: {model.__class__.__name__}")
+    logger.info(f"Total parameters: {total_params:,}")
+    logger.info(f"Trainable parameters: {trainable_params:,}")
+    
+    # Per-module breakdown
+    for name, module in model.named_children():
+        params = sum(p.numel() for p in module.parameters())
+        logger.info(f"  {name}: {params:,} params")
 
 
 def setup_logging(log_dir: str) -> logging.Logger:
@@ -106,19 +178,52 @@ def create_scheduler(
     num_epochs: int,
     config: Config
 ) -> optim.lr_scheduler._LRScheduler:
-    """Create learning rate scheduler."""
+    """Create learning rate scheduler with optional warmup."""
+    warmup_epochs = getattr(config.training, 'warmup_epochs', 0)
+    
     if config.training.scheduler == 'cosine':
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        main_scheduler = optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
-            T_max=num_epochs,
+            T_max=max(1, num_epochs - warmup_epochs),
             eta_min=config.training.min_lr
         )
+        
+        if warmup_epochs > 0:
+            warmup_scheduler = optim.lr_scheduler.LinearLR(
+                optimizer,
+                start_factor=0.1,
+                end_factor=1.0,
+                total_iters=warmup_epochs
+            )
+            scheduler = optim.lr_scheduler.SequentialLR(
+                optimizer,
+                schedulers=[warmup_scheduler, main_scheduler],
+                milestones=[warmup_epochs]
+            )
+        else:
+            scheduler = main_scheduler
+            
     elif config.training.scheduler == 'step':
-        scheduler = optim.lr_scheduler.StepLR(
+        main_scheduler = optim.lr_scheduler.StepLR(
             optimizer,
-            step_size=num_epochs // 3,
+            step_size=max(1, (num_epochs - warmup_epochs) // 3),
             gamma=0.1
         )
+        
+        if warmup_epochs > 0:
+            warmup_scheduler = optim.lr_scheduler.LinearLR(
+                optimizer,
+                start_factor=0.1,
+                end_factor=1.0,
+                total_iters=warmup_epochs
+            )
+            scheduler = optim.lr_scheduler.SequentialLR(
+                optimizer,
+                schedulers=[warmup_scheduler, main_scheduler],
+                milestones=[warmup_epochs]
+            )
+        else:
+            scheduler = main_scheduler
     else:
         scheduler = optim.lr_scheduler.ConstantLR(optimizer, factor=1.0)
     
@@ -136,10 +241,12 @@ def train_epoch(
     epoch: int,
     stage: str,
     writer: Optional[SummaryWriter] = None,
-    logger: Optional[logging.Logger] = None
+    logger: Optional[logging.Logger] = None,
+    scaler: Optional[GradScaler] = None,
+    ema: Optional[EMA] = None
 ) -> Dict[str, float]:
     """
-    Train for one epoch.
+    Train for one epoch with optional mixed precision.
     
     Args:
         model: Generator model.
@@ -153,6 +260,8 @@ def train_epoch(
         stage: Training stage.
         writer: TensorBoard writer.
         logger: Logger instance.
+        scaler: GradScaler for mixed precision training.
+        ema: EMA model for weight averaging.
         
     Returns:
         Dictionary of average losses.
@@ -163,6 +272,7 @@ def train_epoch(
     
     epoch_losses = {}
     num_batches = len(dataloader)
+    use_amp = scaler is not None
     
     pbar = tqdm(dataloader, desc=f'Epoch {epoch}')
     
@@ -185,25 +295,35 @@ def train_epoch(
         if corners is not None:
             targets['corners'] = corners
         
-        # Forward pass
-        outputs = model(lr_frames, return_intermediates=True)
+        # Forward pass with optional autocast for mixed precision
+        with autocast('cuda', enabled=use_amp):
+            outputs = model(lr_frames, return_intermediates=True)
+            
+            # Compute generator loss
+            if stage == 'stn':
+                loss_g, loss_dict = criterion.get_stage_loss('stn', outputs, targets)
+            elif stage == 'restoration':
+                loss_g, loss_dict = criterion.get_stage_loss('restoration', outputs, targets, discriminator)
+            else:
+                loss_g, loss_dict = criterion(outputs, targets, discriminator)
         
-        # Compute generator loss
-        if stage == 'stn':
-            loss_g, loss_dict = criterion.get_stage_loss('stn', outputs, targets)
-        elif stage == 'restoration':
-            loss_g, loss_dict = criterion.get_stage_loss('restoration', outputs, targets, discriminator)
-        else:
-            loss_g, loss_dict = criterion(outputs, targets, discriminator)
-        
-        # Update generator
+        # Update generator with gradient scaling for mixed precision
         optimizer_g.zero_grad()
-        loss_g.backward()
         
-        # Gradient clipping
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        if use_amp:
+            scaler.scale(loss_g).backward()
+            scaler.unscale_(optimizer_g)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer_g)
+            scaler.update()
+        else:
+            loss_g.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer_g.step()
         
-        optimizer_g.step()
+        # Update EMA model
+        if ema is not None:
+            ema.update(model)
         
         # Update discriminator if available and in appropriate stage
         if discriminator is not None and optimizer_d is not None and stage in ['restoration', 'full']:
@@ -211,20 +331,26 @@ def train_epoch(
             real_hr = targets['hr_image']
             fake_hr = outputs['hr_image'].detach()
             
-            # Discriminator forward
-            pred_real = discriminator(real_hr)
-            pred_fake = discriminator(fake_hr)
-            
-            # Discriminator loss
-            gan_loss = GANLoss('vanilla')
-            loss_d = (
-                gan_loss(pred_real, target_is_real=True) +
-                gan_loss(pred_fake, target_is_real=False)
-            ) / 2
+            with autocast('cuda', enabled=use_amp):
+                # Discriminator forward
+                pred_real = discriminator(real_hr)
+                pred_fake = discriminator(fake_hr)
+                
+                # Discriminator loss
+                gan_loss = GANLoss('vanilla')
+                loss_d = (
+                    gan_loss(pred_real, target_is_real=True) +
+                    gan_loss(pred_fake, target_is_real=False)
+                ) / 2
             
             optimizer_d.zero_grad()
-            loss_d.backward()
-            optimizer_d.step()
+            if use_amp:
+                scaler.scale(loss_d).backward()
+                scaler.step(optimizer_d)
+                scaler.update()
+            else:
+                loss_d.backward()
+                optimizer_d.step()
             
             loss_dict['loss_d'] = loss_d.item()
         
@@ -255,9 +381,9 @@ def validate(
     device: torch.device,
     epoch: int,
     stage: str
-) -> Tuple[Dict[str, float], float]:
+) -> Tuple[Dict[str, float], Dict[str, float]]:
     """
-    Validate the model.
+    Validate the model with comprehensive metrics.
     
     Args:
         model: The model to validate.
@@ -268,13 +394,17 @@ def validate(
         stage: Training stage.
         
     Returns:
-        Tuple of (loss_dict, accuracy).
+        Tuple of (loss_dict, metrics_dict).
+        metrics_dict includes plate_accuracy, char_accuracy, layout_accuracy.
     """
     model.eval()
     
     total_losses = {}
-    correct = 0
-    total = 0
+    correct_plates = 0
+    correct_chars = 0
+    correct_layout = 0
+    total_plates = 0
+    total_chars = 0
     
     with torch.no_grad():
         for batch in tqdm(dataloader, desc='Validating'):
@@ -302,19 +432,33 @@ def validate(
             for key, value in loss_dict.items():
                 total_losses[key] = total_losses.get(key, 0) + value
             
-            # Compute accuracy
+            # Compute plate-level accuracy (all characters correct)
             predictions = outputs['masked_logits'].argmax(dim=-1)
-            correct += (predictions == text_indices).all(dim=-1).sum().item()
-            total += text_indices.size(0)
+            correct_plates += (predictions == text_indices).all(dim=-1).sum().item()
+            total_plates += text_indices.size(0)
+            
+            # Compute character-level accuracy
+            correct_chars += (predictions == text_indices).sum().item()
+            total_chars += text_indices.numel()
+            
+            # Compute layout classification accuracy
+            if 'layout_logits' in outputs:
+                layout_preds = (torch.sigmoid(outputs['layout_logits']) > 0.5).long().squeeze(-1)
+                correct_layout += (layout_preds == layout).sum().item()
     
     # Average losses
     num_batches = len(dataloader)
     for key in total_losses:
         total_losses[key] /= num_batches
     
-    accuracy = correct / total if total > 0 else 0.0
+    # Compute metrics
+    metrics = {
+        'plate_accuracy': correct_plates / total_plates if total_plates > 0 else 0.0,
+        'char_accuracy': correct_chars / total_chars if total_chars > 0 else 0.0,
+        'layout_accuracy': correct_layout / total_plates if total_plates > 0 else 0.0,
+    }
     
-    return total_losses, accuracy
+    return total_losses, metrics
 
 
 def save_checkpoint(
@@ -381,10 +525,35 @@ def train_stage(
     checkpoint_dir: str,
     writer: SummaryWriter,
     logger: logging.Logger,
-    start_epoch: int = 0
+    start_epoch: int = 0,
+    use_amp: bool = True,
+    use_ema: bool = True,
+    early_stopping_patience: int = 0
 ):
-    """Train for a specific stage."""
+    """
+    Train for a specific stage with full feature support.
+    
+    Args:
+        model: Generator model.
+        discriminator: Discriminator model.
+        train_loader: Training data loader.
+        val_loader: Validation data loader.
+        config: Training configuration.
+        stage: Training stage name.
+        num_epochs: Number of epochs to train.
+        device: Training device.
+        checkpoint_dir: Directory for checkpoints.
+        writer: TensorBoard writer.
+        logger: Logger instance.
+        start_epoch: Starting epoch (for resume).
+        use_amp: Whether to use mixed precision training.
+        use_ema: Whether to use EMA for model weights.
+        early_stopping_patience: Patience for early stopping (0 to disable).
+    """
     logger.info(f"Starting training stage: {stage}")
+    logger.info(f"  Mixed precision: {use_amp}")
+    logger.info(f"  EMA: {use_ema}")
+    logger.info(f"  Early stopping patience: {early_stopping_patience}")
     
     # Create criterion
     criterion = CompositeLoss(
@@ -408,13 +577,23 @@ def train_stage(
     # Create scheduler
     scheduler = create_scheduler(optimizer_g, num_epochs, config)
     
+    # Create GradScaler for mixed precision
+    scaler = GradScaler('cuda') if use_amp and device.type == 'cuda' else None
+    
+    # Create EMA model
+    ema = EMA(model) if use_ema else None
+    
+    # Create early stopping
+    early_stopper = EarlyStopping(patience=early_stopping_patience) if early_stopping_patience > 0 else None
+    
     best_acc = 0.0
     
     for epoch in range(start_epoch, num_epochs):
         # Train
         train_losses = train_epoch(
             model, discriminator, train_loader, criterion,
-            optimizer_g, optimizer_d, device, epoch, stage, writer, logger
+            optimizer_g, optimizer_d, device, epoch, stage, writer, logger,
+            scaler=scaler, ema=ema
         )
         
         # Log training losses
@@ -422,26 +601,48 @@ def train_stage(
         
         # Validate
         if (epoch + 1) % config.training.eval_every == 0:
-            val_losses, val_acc = validate(
+            val_losses, val_metrics = validate(
                 model, val_loader, criterion, device, epoch, stage
             )
             
-            logger.info(f"Epoch {epoch} - Val losses: {val_losses}, Acc: {val_acc:.4f}")
+            plate_acc = val_metrics['plate_accuracy']
+            char_acc = val_metrics['char_accuracy']
+            layout_acc = val_metrics['layout_accuracy']
+            
+            logger.info(
+                f"Epoch {epoch} - Val losses: {val_losses}, "
+                f"Plate Acc: {plate_acc:.4f}, Char Acc: {char_acc:.4f}, Layout Acc: {layout_acc:.4f}"
+            )
             
             # Log to tensorboard
-            writer.add_scalar('val/accuracy', val_acc, epoch)
+            writer.add_scalar('val/plate_accuracy', plate_acc, epoch)
+            writer.add_scalar('val/char_accuracy', char_acc, epoch)
+            writer.add_scalar('val/layout_accuracy', layout_acc, epoch)
             for key, value in val_losses.items():
                 writer.add_scalar(f'val/{key}', value, epoch)
             
             # Save best model
-            if val_acc > best_acc:
-                best_acc = val_acc
+            if plate_acc > best_acc:
+                best_acc = plate_acc
                 save_checkpoint(
                     model, discriminator, optimizer_g, optimizer_d,
                     epoch, stage,
                     os.path.join(checkpoint_dir, f'{stage}_best.pth'),
                     best_acc
                 )
+                
+                # Also save EMA model if available
+                if ema is not None:
+                    torch.save(
+                        {'model_state_dict': ema.state_dict()},
+                        os.path.join(checkpoint_dir, f'{stage}_best_ema.pth')
+                    )
+            
+            # Check early stopping
+            if early_stopper is not None:
+                if early_stopper(plate_acc):
+                    logger.info(f"Early stopping triggered at epoch {epoch}")
+                    break
         
         # Save regular checkpoint
         if (epoch + 1) % config.training.save_every == 0:
@@ -463,6 +664,12 @@ def train_stage(
         best_acc
     )
     
+    if ema is not None:
+        torch.save(
+            {'model_state_dict': ema.state_dict()},
+            os.path.join(checkpoint_dir, f'{stage}_final_ema.pth')
+        )
+    
     return best_acc
 
 
@@ -475,6 +682,10 @@ def main():
     parser.add_argument('--resume', type=str, default=None, help='Resume from checkpoint')
     parser.add_argument('--data-dir', type=str, default='data', help='Data directory')
     parser.add_argument('--output-dir', type=str, default='outputs', help='Output directory')
+    parser.add_argument('--no-amp', action='store_true', help='Disable mixed precision training')
+    parser.add_argument('--no-ema', action='store_true', help='Disable EMA model averaging')
+    parser.add_argument('--early-stopping', type=int, default=0, 
+                        help='Early stopping patience (0 to disable)')
     args = parser.parse_args()
     
     # Load config
@@ -508,7 +719,6 @@ def main():
         num_frames=config.model.num_frames,
         lr_size=(config.data.lr_height, config.data.lr_width),
         hr_size=(config.data.hr_height, config.data.hr_width),
-        use_lightweight_sr=True  # Use lightweight SR for faster training
     ).to(device)
     
     # Create discriminator
@@ -518,8 +728,17 @@ def main():
         use_spectral_norm=True
     ).to(device)
     
-    # Create datasets
-    augmentation = LPRAugmentation() if config.data.use_augmentation else None
+    # Create datasets with style-aware augmentation
+    if config.data.use_augmentation:
+        augmentation = LPRAugmentation(
+            style_aware=config.data.style_aware_augmentation,
+            mercosur_brightness_range=config.data.mercosur_brightness_range,
+            mercosur_contrast_range=config.data.mercosur_contrast_range,
+            brazilian_brightness_range=config.data.brazilian_brightness_range,
+            brazilian_contrast_range=config.data.brazilian_contrast_range
+        )
+    else:
+        augmentation = None
     
     # Check if data directory exists, use synthetic data if not
     train_dir = os.path.join(args.data_dir, 'train')
@@ -554,26 +773,14 @@ def main():
             num_frames=config.model.num_frames
         )
     
-    # Create data loaders
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=config.training.batch_size_finetune,
-        shuffle=True,
-        num_workers=config.training.num_workers,
-        pin_memory=True,
-        drop_last=True
-    )
-    
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=config.training.batch_size_finetune,
-        shuffle=False,
-        num_workers=config.training.num_workers,
-        pin_memory=True
-    )
+    # Note: Data loaders will be created per stage with appropriate batch sizes
+    # We'll create them in the training loop
     
     logger.info(f"Train dataset size: {len(train_dataset)}")
     logger.info(f"Val dataset size: {len(val_dataset)}")
+    
+    # Log model info
+    log_model_info(model, logger)
     
     # Resume from checkpoint if specified
     start_epoch = 0
@@ -610,10 +817,42 @@ def main():
             model.unfreeze_stn()
             model.unfreeze_recognizer()
         
+        # Get appropriate batch size for this stage
+        batch_size_map = {
+            'pretrain': config.training.batch_size_pretrain,
+            'stn': config.training.batch_size_stn,
+            'restoration': config.training.batch_size_restoration,
+            'full': config.training.batch_size_finetune
+        }
+        batch_size = batch_size_map.get(stage_name, config.training.batch_size_finetune)
+        
+        # Create data loaders with stage-specific batch size
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=config.training.num_workers,
+            pin_memory=True,
+            drop_last=True
+        )
+        
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=config.training.num_workers,
+            pin_memory=True
+        )
+        
+        logger.info(f"Stage {stage_name}: Using batch size {batch_size}")
+        
         best_acc = train_stage(
             model, discriminator, train_loader, val_loader,
             config, stage_name, num_epochs, device,
-            checkpoint_dir, writer, logger, start_epoch
+            checkpoint_dir, writer, logger, start_epoch,
+            use_amp=not args.no_amp,
+            use_ema=not args.no_ema,
+            early_stopping_patience=args.early_stopping
         )
         
         logger.info(f"Stage {stage_name} completed with best accuracy: {best_acc:.4f}")
