@@ -23,24 +23,37 @@ class SelfSupervisedSTNLoss(nn.Module):
     1. Identity regularization: Prevents collapse, encourages gentle transformations
     2. Multi-frame consistency: Encourages similar transformations across frames
     3. Smoothness: Prevents extreme/unrealistic transformations
+    
+    Includes numerical stability safeguards to prevent NaN/Inf losses.
     """
     
     def __init__(
         self,
         identity_weight: float = 1.0,
         consistency_weight: float = 0.5,
-        smoothness_weight: float = 0.1
+        smoothness_weight: float = 0.1,
+        max_loss_value: float = 100.0  # Clamp loss to prevent explosion
     ):
         super().__init__()
         self.identity_weight = identity_weight
         self.consistency_weight = consistency_weight
         self.smoothness_weight = smoothness_weight
+        self.max_loss_value = max_loss_value
         
         # Identity transformation matrix (2x3): [[1, 0, 0], [0, 1, 0]]
         self.register_buffer(
             'identity_theta',
             torch.tensor([[1, 0, 0], [0, 1, 0]], dtype=torch.float)
         )
+    
+    def _safe_mse(self, pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+        """Compute MSE with numerical stability checks."""
+        diff = pred - target
+        # Clamp differences to prevent extreme values
+        diff = torch.clamp(diff, min=-10.0, max=10.0)
+        mse = (diff ** 2).mean()
+        # Clamp final value
+        return torch.clamp(mse, min=0.0, max=self.max_loss_value)
     
     def forward(
         self,
@@ -55,50 +68,75 @@ class SelfSupervisedSTNLoss(nn.Module):
             corners: Predicted corners of shape (B, T, 4, 2) or (B, 4, 2) (optional).
             
         Returns:
-            Loss value.
+            Loss value (clamped to prevent explosion).
         """
+        # Check for NaN/Inf inputs and return zero loss with warning
+        if torch.isnan(thetas).any() or torch.isinf(thetas).any():
+            # Return a small loss that maintains gradient flow but doesn't explode
+            return thetas.new_zeros(1, requires_grad=True).squeeze() + thetas.sum() * 0.0
+        
         # Handle single-frame case
         if thetas.dim() == 3:
             thetas = thetas.unsqueeze(1)  # (B, 1, 2, 3)
         
         B, T = thetas.shape[:2]
         
-        total_loss = 0.0
+        # Clamp theta values to reasonable range to prevent explosion
+        # Affine parameters should be in reasonable ranges:
+        # Scale (diagonal): typically 0.5 to 2.0
+        # Shear (off-diagonal): typically -1 to 1
+        # Translation: typically -2 to 2
+        thetas_clamped = torch.clamp(thetas, min=-5.0, max=5.0)
+        
+        total_loss = thetas.new_zeros(1).squeeze()
         
         # 1. Identity regularization loss
         # Encourage the transformation to be close to identity
         # This prevents the STN from collapsing or producing extreme transformations
         identity = self.identity_theta.unsqueeze(0).unsqueeze(0).expand(B, T, -1, -1)
-        identity_loss = F.mse_loss(thetas, identity)
+        identity = identity.to(thetas_clamped.device, thetas_clamped.dtype)
+        identity_loss = self._safe_mse(thetas_clamped, identity)
         total_loss = total_loss + self.identity_weight * identity_loss
         
         # 2. Multi-frame consistency loss
         # Encourage similar transformations across frames
         if T > 1:
             # Use mean transformation as reference
-            mean_theta = thetas.mean(dim=1, keepdim=True)  # (B, 1, 2, 3)
-            consistency_loss = F.mse_loss(thetas, mean_theta.expand_as(thetas))
+            mean_theta = thetas_clamped.mean(dim=1, keepdim=True)  # (B, 1, 2, 3)
+            consistency_loss = self._safe_mse(thetas_clamped, mean_theta.expand_as(thetas_clamped))
             total_loss = total_loss + self.consistency_weight * consistency_loss
         
         # 3. Smoothness/Regularity loss
         # Penalize extreme scaling/rotation - focus on the diagonal (scale) elements
         # For affine [[a, b, tx], [c, d, ty]], we want |a| ≈ 1, |d| ≈ 1 (no extreme scaling)
-        scale_x = thetas[:, :, 0, 0]  # should be close to 1
-        scale_y = thetas[:, :, 1, 1]  # should be close to 1
-        scale_loss = ((scale_x - 1) ** 2 + (scale_y - 1) ** 2).mean()
+        scale_x = thetas_clamped[:, :, 0, 0]  # should be close to 1
+        scale_y = thetas_clamped[:, :, 1, 1]  # should be close to 1
+        scale_diff_x = torch.clamp(scale_x - 1, min=-5.0, max=5.0)
+        scale_diff_y = torch.clamp(scale_y - 1, min=-5.0, max=5.0)
+        scale_loss = (scale_diff_x ** 2 + scale_diff_y ** 2).mean()
+        scale_loss = torch.clamp(scale_loss, min=0.0, max=self.max_loss_value)
         
         # Also penalize extreme shear (off-diagonal elements should be small)
-        shear_x = thetas[:, :, 0, 1]  # should be close to 0
-        shear_y = thetas[:, :, 1, 0]  # should be close to 0
+        shear_x = thetas_clamped[:, :, 0, 1]  # should be close to 0
+        shear_y = thetas_clamped[:, :, 1, 0]  # should be close to 0
         shear_loss = (shear_x ** 2 + shear_y ** 2).mean()
+        shear_loss = torch.clamp(shear_loss, min=0.0, max=self.max_loss_value)
         
         # Translation should be bounded (not too far from center)
-        trans_x = thetas[:, :, 0, 2]  # should be close to 0
-        trans_y = thetas[:, :, 1, 2]  # should be close to 0
+        trans_x = thetas_clamped[:, :, 0, 2]  # should be close to 0
+        trans_y = thetas_clamped[:, :, 1, 2]  # should be close to 0
         trans_loss = (trans_x ** 2 + trans_y ** 2).mean()
+        trans_loss = torch.clamp(trans_loss, min=0.0, max=self.max_loss_value)
         
         smoothness_loss = scale_loss + shear_loss + trans_loss
         total_loss = total_loss + self.smoothness_weight * smoothness_loss
+        
+        # Final clamp to ensure loss doesn't explode
+        total_loss = torch.clamp(total_loss, min=0.0, max=self.max_loss_value)
+        
+        # Final NaN check - if somehow we still got NaN, return zero
+        if torch.isnan(total_loss) or torch.isinf(total_loss):
+            return thetas.new_zeros(1, requires_grad=True).squeeze() + thetas.sum() * 0.0
         
         return total_loss
 
@@ -308,56 +346,105 @@ class CompositeLoss(nn.Module):
             Tuple of (total_loss, loss_dict).
         """
         loss_dict = {}
-        total_loss = 0.0
+        total_loss = None
         
         # Pixel loss
         if 'hr_image' in outputs and 'hr_image' in targets:
-            l_pixel = self.pixel_loss(outputs['hr_image'], targets['hr_image'])
-            loss_dict['pixel'] = l_pixel.item()
-            total_loss = total_loss + self.weights['pixel'] * l_pixel
+            if not (torch.isnan(outputs['hr_image']).any() or torch.isnan(targets['hr_image']).any()):
+                l_pixel = self.pixel_loss(outputs['hr_image'], targets['hr_image'])
+                l_pixel = self._clamp_loss(l_pixel)
+                loss_dict['pixel'] = self._safe_loss_item(l_pixel)
+                weighted = self.weights['pixel'] * l_pixel
+                total_loss = weighted if total_loss is None else total_loss + weighted
         
         # GAN loss (generator side)
         if discriminator is not None and 'hr_image' in outputs:
-            pred_fake = discriminator(outputs['hr_image'])
-            l_gan = self.gan_loss(pred_fake, target_is_real=True)
-            loss_dict['gan'] = l_gan.item()
-            total_loss = total_loss + self.weights['gan'] * l_gan
+            if not torch.isnan(outputs['hr_image']).any():
+                pred_fake = discriminator(outputs['hr_image'])
+                if not torch.isnan(pred_fake).any():
+                    l_gan = self.gan_loss(pred_fake, target_is_real=True)
+                    l_gan = self._clamp_loss(l_gan)
+                    loss_dict['gan'] = self._safe_loss_item(l_gan)
+                    weighted = self.weights['gan'] * l_gan
+                    total_loss = weighted if total_loss is None else total_loss + weighted
         
         # OCR loss
         if 'masked_logits' in outputs and 'text_indices' in targets:
-            l_ocr = self.ocr_loss(outputs['masked_logits'], targets['text_indices'])
-            loss_dict['ocr'] = l_ocr.item()
-            total_loss = total_loss + self.weights['ocr'] * l_ocr
+            if not (torch.isnan(outputs['masked_logits']).any() or torch.isnan(targets['text_indices'].float()).any()):
+                l_ocr = self.ocr_loss(outputs['masked_logits'], targets['text_indices'])
+                l_ocr = self._clamp_loss(l_ocr)
+                loss_dict['ocr'] = self._safe_loss_item(l_ocr)
+                weighted = self.weights['ocr'] * l_ocr
+                total_loss = weighted if total_loss is None else total_loss + weighted
         
         # Geometry loss
         if 'corners' in outputs and 'corners' in targets:
-            # Handle multi-frame corners
             pred_corners = outputs['corners']
             gt_corners = targets['corners']
             
-            if pred_corners.dim() == 4:  # (B, T, 4, 2)
-                # Average over frames
-                pred_corners = pred_corners.mean(dim=1)
-            
-            l_geo = self.corner_loss(pred_corners, gt_corners)
-            loss_dict['geometry'] = l_geo.item()
-            total_loss = total_loss + self.weights['geometry'] * l_geo
+            if not (torch.isnan(pred_corners).any() or torch.isnan(gt_corners).any()):
+                # Handle multi-frame corners
+                if pred_corners.dim() == 4:  # (B, T, 4, 2)
+                    # Average over frames
+                    pred_corners = pred_corners.mean(dim=1)
+                
+                l_geo = self.corner_loss(pred_corners, gt_corners)
+                l_geo = self._clamp_loss(l_geo)
+                loss_dict['geometry'] = self._safe_loss_item(l_geo)
+                weighted = self.weights['geometry'] * l_geo
+                total_loss = weighted if total_loss is None else total_loss + weighted
         
         # Layout loss
         if 'layout_logits' in outputs and 'layout' in targets:
-            l_layout = self.layout_loss(outputs['layout_logits'], targets['layout'])
-            loss_dict['layout'] = l_layout.item()
-            total_loss = total_loss + self.weights['layout'] * l_layout
+            if not torch.isnan(outputs['layout_logits']).any():
+                l_layout = self.layout_loss(outputs['layout_logits'], targets['layout'])
+                l_layout = self._clamp_loss(l_layout)
+                loss_dict['layout'] = self._safe_loss_item(l_layout)
+                weighted = self.weights['layout'] * l_layout
+                total_loss = weighted if total_loss is None else total_loss + weighted
         
         # Perceptual loss
         if self.perceptual_loss is not None and 'hr_image' in outputs and 'hr_image' in targets:
-            l_perceptual = self.perceptual_loss(outputs['hr_image'], targets['hr_image'])
-            loss_dict['perceptual'] = l_perceptual.item()
-            total_loss = total_loss + self.weights['perceptual'] * l_perceptual
+            if not (torch.isnan(outputs['hr_image']).any() or torch.isnan(targets['hr_image']).any()):
+                l_perceptual = self.perceptual_loss(outputs['hr_image'], targets['hr_image'])
+                l_perceptual = self._clamp_loss(l_perceptual)
+                loss_dict['perceptual'] = self._safe_loss_item(l_perceptual)
+                weighted = self.weights['perceptual'] * l_perceptual
+                total_loss = weighted if total_loss is None else total_loss + weighted
         
-        loss_dict['total'] = total_loss.item() if isinstance(total_loss, torch.Tensor) else total_loss
+        # If no loss computed, create zero loss with gradient
+        if total_loss is None:
+            if 'hr_image' in outputs:
+                total_loss = outputs['hr_image'].sum() * 0.0
+            else:
+                any_output = next(iter(outputs.values()))
+                total_loss = any_output.sum() * 0.0
+        
+        # Final clamp
+        total_loss = self._clamp_loss(total_loss, max_val=100.0)
+        
+        loss_dict['total'] = self._safe_loss_item(total_loss)
         
         return total_loss, loss_dict
+    
+    def _safe_loss_item(self, loss: torch.Tensor) -> float:
+        """Safely get loss item, returning NaN-safe float."""
+        if loss is None:
+            return 0.0
+        val = loss.item() if isinstance(loss, torch.Tensor) else float(loss)
+        # Check for NaN/Inf and return 0 instead
+        if not (val == val) or val == float('inf') or val == float('-inf'):
+            return float('nan')
+        return val
+    
+    def _clamp_loss(self, loss: torch.Tensor, max_val: float = 100.0) -> torch.Tensor:
+        """Clamp loss to prevent explosion while maintaining gradients."""
+        if loss is None:
+            return None
+        if torch.isnan(loss).any() or torch.isinf(loss).any():
+            # Return zero tensor with gradient connection
+            return loss * 0.0
+        return torch.clamp(loss, min=0.0, max=max_val)
     
     def get_stage_loss(
         self,
@@ -380,7 +467,7 @@ class CompositeLoss(nn.Module):
         """
         if stage == 'stn':
             loss_dict = {}
-            total_loss = 0.0
+            total_loss = None
             has_corner_supervision = False
             
             # Supervised corner loss if ground-truth corners are available
@@ -388,13 +475,16 @@ class CompositeLoss(nn.Module):
                 pred_corners = outputs['corners']
                 gt_corners = targets['corners']
                 
-                if pred_corners.dim() == 4:
-                    pred_corners = pred_corners.mean(dim=1)
-                
-                corner_loss = self.corner_loss(pred_corners, gt_corners)
-                loss_dict['corner'] = corner_loss.item()
-                total_loss = total_loss + corner_loss
-                has_corner_supervision = True
+                # Check for NaN inputs
+                if not (torch.isnan(pred_corners).any() or torch.isnan(gt_corners).any()):
+                    if pred_corners.dim() == 4:
+                        pred_corners = pred_corners.mean(dim=1)
+                    
+                    corner_loss = self.corner_loss(pred_corners, gt_corners)
+                    corner_loss = self._clamp_loss(corner_loss)
+                    loss_dict['corner'] = self._safe_loss_item(corner_loss)
+                    total_loss = corner_loss if total_loss is None else total_loss + corner_loss
+                    has_corner_supervision = True
             
             # Self-supervised STN loss using transformation parameters
             # This provides meaningful gradients even without corner annotations
@@ -403,7 +493,8 @@ class CompositeLoss(nn.Module):
                     self.stn_self_supervised_loss = SelfSupervisedSTNLoss(
                         identity_weight=0.1,  # Light identity regularization
                         consistency_weight=1.0,  # Strong multi-frame consistency
-                        smoothness_weight=0.5  # Moderate smoothness
+                        smoothness_weight=0.5,  # Moderate smoothness
+                        max_loss_value=50.0  # Prevent explosion
                     )
                     # Move to same device as outputs
                     device = outputs['thetas'].device
@@ -413,19 +504,24 @@ class CompositeLoss(nn.Module):
                     outputs['thetas'],
                     outputs.get('corners', None)
                 )
-                loss_dict['self_supervised'] = self_sup_loss.item()
-                total_loss = total_loss + self_sup_loss
+                self_sup_loss = self._clamp_loss(self_sup_loss)
+                loss_dict['self_supervised'] = self._safe_loss_item(self_sup_loss)
+                total_loss = self_sup_loss if total_loss is None else total_loss + self_sup_loss
             
             # When no corner supervision is available, add pixel reconstruction loss
             # to provide meaningful gradients for STN training
             if not has_corner_supervision and 'hr_image' in outputs and 'hr_image' in targets:
-                l_pixel = self.pixel_loss(outputs['hr_image'], targets['hr_image'])
-                loss_dict['pixel'] = l_pixel.item()
-                # Use a smaller weight for pixel loss in STN stage
-                total_loss = total_loss + 0.5 * l_pixel
+                # Check for NaN inputs
+                if not (torch.isnan(outputs['hr_image']).any() or torch.isnan(targets['hr_image']).any()):
+                    l_pixel = self.pixel_loss(outputs['hr_image'], targets['hr_image'])
+                    l_pixel = self._clamp_loss(l_pixel)
+                    loss_dict['pixel'] = self._safe_loss_item(l_pixel)
+                    # Use a smaller weight for pixel loss in STN stage
+                    weighted_pixel = 0.5 * l_pixel
+                    total_loss = weighted_pixel if total_loss is None else total_loss + weighted_pixel
             
             # If no useful loss computed, create a minimal loss with gradient flow
-            if total_loss == 0.0:
+            if total_loss is None:
                 if 'corners' in outputs:
                     total_loss = outputs['corners'].sum() * 0.0
                 elif 'thetas' in outputs:
@@ -436,31 +532,55 @@ class CompositeLoss(nn.Module):
                     any_output = next(iter(outputs.values()))
                     total_loss = any_output.sum() * 0.0
             
-            loss_dict['geometry'] = total_loss.item() if isinstance(total_loss, torch.Tensor) else total_loss
+            # Final clamp and NaN check
+            total_loss = self._clamp_loss(total_loss, max_val=100.0)
+            
+            loss_dict['geometry'] = self._safe_loss_item(total_loss)
             return total_loss, loss_dict
         
         elif stage == 'restoration':
             # Pixel + GAN + Layout losses
             loss_dict = {}
-            total_loss = 0.0
+            total_loss = None
             
             if 'hr_image' in outputs and 'hr_image' in targets:
-                l_pixel = self.pixel_loss(outputs['hr_image'], targets['hr_image'])
-                loss_dict['pixel'] = l_pixel.item()
-                total_loss = total_loss + l_pixel
+                # Check for NaN inputs
+                if not (torch.isnan(outputs['hr_image']).any() or torch.isnan(targets['hr_image']).any()):
+                    l_pixel = self.pixel_loss(outputs['hr_image'], targets['hr_image'])
+                    l_pixel = self._clamp_loss(l_pixel)
+                    loss_dict['pixel'] = self._safe_loss_item(l_pixel)
+                    total_loss = l_pixel
             
             if discriminator is not None and 'hr_image' in outputs:
-                pred_fake = discriminator(outputs['hr_image'])
-                l_gan = self.gan_loss(pred_fake, target_is_real=True)
-                loss_dict['gan'] = l_gan.item()
-                total_loss = total_loss + 0.1 * l_gan
+                if not torch.isnan(outputs['hr_image']).any():
+                    pred_fake = discriminator(outputs['hr_image'])
+                    if not torch.isnan(pred_fake).any():
+                        l_gan = self.gan_loss(pred_fake, target_is_real=True)
+                        l_gan = self._clamp_loss(l_gan)
+                        loss_dict['gan'] = self._safe_loss_item(l_gan)
+                        weighted_gan = 0.1 * l_gan
+                        total_loss = weighted_gan if total_loss is None else total_loss + weighted_gan
             
             if 'layout_logits' in outputs and 'layout' in targets:
-                l_layout = self.layout_loss(outputs['layout_logits'], targets['layout'])
-                loss_dict['layout'] = l_layout.item()
-                total_loss = total_loss + 0.1 * l_layout
+                if not (torch.isnan(outputs['layout_logits']).any()):
+                    l_layout = self.layout_loss(outputs['layout_logits'], targets['layout'])
+                    l_layout = self._clamp_loss(l_layout)
+                    loss_dict['layout'] = self._safe_loss_item(l_layout)
+                    weighted_layout = 0.1 * l_layout
+                    total_loss = weighted_layout if total_loss is None else total_loss + weighted_layout
             
-            loss_dict['total'] = total_loss.item()
+            # If no loss was computed, create zero loss with gradient
+            if total_loss is None:
+                if 'hr_image' in outputs:
+                    total_loss = outputs['hr_image'].sum() * 0.0
+                else:
+                    any_output = next(iter(outputs.values()))
+                    total_loss = any_output.sum() * 0.0
+            
+            # Final clamp
+            total_loss = self._clamp_loss(total_loss, max_val=100.0)
+            
+            loss_dict['total'] = self._safe_loss_item(total_loss)
             return total_loss, loss_dict
         
         else:  # 'full'

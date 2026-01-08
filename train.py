@@ -20,6 +20,7 @@ from pathlib import Path
 from datetime import datetime
 from typing import Dict, Optional, Tuple
 from copy import deepcopy
+import math
 
 import torch
 import torch.nn as nn
@@ -234,6 +235,15 @@ def create_scheduler(
     return scheduler
 
 
+def check_for_nan(tensor: torch.Tensor, name: str = "tensor") -> bool:
+    """Check if tensor contains NaN or Inf values."""
+    if tensor is None:
+        return False
+    if isinstance(tensor, (int, float)):
+        return math.isnan(tensor) or math.isinf(tensor)
+    return torch.isnan(tensor).any().item() or torch.isinf(tensor).any().item()
+
+
 def train_epoch(
     model: nn.Module,
     discriminator: Optional[nn.Module],
@@ -247,7 +257,8 @@ def train_epoch(
     writer: Optional[SummaryWriter] = None,
     logger: Optional[logging.Logger] = None,
     scaler: Optional[GradScaler] = None,
-    ema: Optional[EMA] = None
+    ema: Optional[EMA] = None,
+    grad_clip_norm: float = 1.0
 ) -> Dict[str, float]:
     """
     Train for one epoch with optional mixed precision.
@@ -266,6 +277,7 @@ def train_epoch(
         logger: Logger instance.
         scaler: GradScaler for mixed precision training.
         ema: EMA model for weight averaging.
+        grad_clip_norm: Maximum norm for gradient clipping.
         
     Returns:
         Dictionary of average losses.
@@ -277,6 +289,8 @@ def train_epoch(
     epoch_losses = {}
     num_batches = len(dataloader)
     use_amp = scaler is not None
+    nan_batch_count = 0
+    max_nan_batches = 10  # Stop epoch if too many NaN batches
     
     pbar = tqdm(dataloader, desc=f'Epoch {epoch}')
     
@@ -311,18 +325,62 @@ def train_epoch(
             else:
                 loss_g, loss_dict = criterion(outputs, targets, discriminator)
         
+        # Check for NaN loss and skip batch if detected
+        if check_for_nan(loss_g, "loss_g"):
+            nan_batch_count += 1
+            if logger is not None:
+                logger.warning(f"Epoch {epoch}, Batch {batch_idx}: NaN loss detected, skipping batch ({nan_batch_count}/{max_nan_batches})")
+            
+            # Clear gradients and skip this batch
+            optimizer_g.zero_grad()
+            if optimizer_d is not None:
+                optimizer_d.zero_grad()
+            
+            if nan_batch_count >= max_nan_batches:
+                if logger is not None:
+                    logger.error(f"Epoch {epoch}: Too many NaN batches ({nan_batch_count}), stopping epoch early")
+                break
+            continue
+        
         # Update generator with gradient scaling for mixed precision
         optimizer_g.zero_grad()
         
         if use_amp:
             scaler.scale(loss_g).backward()
             scaler.unscale_(optimizer_g)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
+            # Check for NaN/Inf gradients after unscaling
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
+            
+            # Skip optimizer step if gradients are invalid
+            if check_for_nan(grad_norm, "grad_norm"):
+                if logger is not None:
+                    logger.warning(f"Epoch {epoch}, Batch {batch_idx}: NaN/Inf gradients detected, skipping optimizer step")
+                scaler.update()  # Still update scaler to adjust scale factor
+                nan_batch_count += 1
+                if nan_batch_count >= max_nan_batches:
+                    if logger is not None:
+                        logger.error(f"Epoch {epoch}: Too many NaN batches ({nan_batch_count}), stopping epoch early")
+                    break
+                continue
+            
             scaler.step(optimizer_g)
             scaler.update()
         else:
             loss_g.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
+            
+            # Check for NaN/Inf gradients
+            if check_for_nan(grad_norm, "grad_norm"):
+                if logger is not None:
+                    logger.warning(f"Epoch {epoch}, Batch {batch_idx}: NaN/Inf gradients detected, skipping optimizer step")
+                nan_batch_count += 1
+                if nan_batch_count >= max_nan_batches:
+                    if logger is not None:
+                        logger.error(f"Epoch {epoch}: Too many NaN batches ({nan_batch_count}), stopping epoch early")
+                    break
+                continue
+            
             optimizer_g.step()
         
         # Update EMA model
@@ -347,20 +405,29 @@ def train_epoch(
                     gan_loss(pred_fake, target_is_real=False)
                 ) / 2
             
-            optimizer_d.zero_grad()
-            if use_amp:
-                scaler.scale(loss_d).backward()
-                scaler.step(optimizer_d)
-                scaler.update()
+            # Check for NaN discriminator loss
+            if not check_for_nan(loss_d, "loss_d"):
+                optimizer_d.zero_grad()
+                if use_amp:
+                    scaler.scale(loss_d).backward()
+                    scaler.unscale_(optimizer_d)
+                    torch.nn.utils.clip_grad_norm_(discriminator.parameters(), max_norm=grad_clip_norm)
+                    scaler.step(optimizer_d)
+                    scaler.update()
+                else:
+                    loss_d.backward()
+                    torch.nn.utils.clip_grad_norm_(discriminator.parameters(), max_norm=grad_clip_norm)
+                    optimizer_d.step()
+                
+                loss_dict['loss_d'] = loss_d.item()
             else:
-                loss_d.backward()
-                optimizer_d.step()
-            
-            loss_dict['loss_d'] = loss_d.item()
+                if logger is not None:
+                    logger.warning(f"Epoch {epoch}, Batch {batch_idx}: NaN discriminator loss, skipping D update")
         
-        # Accumulate losses
+        # Accumulate losses (only for valid batches)
         for key, value in loss_dict.items():
-            epoch_losses[key] = epoch_losses.get(key, 0) + value
+            if not (isinstance(value, float) and (math.isnan(value) or math.isinf(value))):
+                epoch_losses[key] = epoch_losses.get(key, 0) + value
         
         # Update progress bar
         pbar.set_postfix({k: f'{v:.4f}' for k, v in loss_dict.items()})
@@ -369,11 +436,14 @@ def train_epoch(
         if writer is not None:
             global_step = epoch * num_batches + batch_idx
             for key, value in loss_dict.items():
-                writer.add_scalar(f'train/{key}', value, global_step)
+                if not (isinstance(value, float) and (math.isnan(value) or math.isinf(value))):
+                    writer.add_scalar(f'train/{key}', value, global_step)
     
-    # Average losses
-    for key in epoch_losses:
-        epoch_losses[key] /= num_batches
+    # Average losses (accounting for skipped batches)
+    valid_batches = num_batches - nan_batch_count
+    if valid_batches > 0:
+        for key in epoch_losses:
+            epoch_losses[key] /= valid_batches
     
     return epoch_losses
 
@@ -554,10 +624,16 @@ def train_stage(
         use_ema: Whether to use EMA for model weights.
         early_stopping_patience: Patience for early stopping (0 to disable).
     """
+    # Get stage-specific gradient clipping norm
+    grad_clip_norm = config.training.grad_clip_norm
+    if stage == 'stn' and hasattr(config.training, 'grad_clip_norm_stn'):
+        grad_clip_norm = config.training.grad_clip_norm_stn
+    
     logger.info(f"Starting training stage: {stage}")
     logger.info(f"  Mixed precision: {use_amp}")
     logger.info(f"  EMA: {use_ema}")
     logger.info(f"  Early stopping patience: {early_stopping_patience}")
+    logger.info(f"  Gradient clip norm: {grad_clip_norm}")
     
     # Create criterion
     criterion = CompositeLoss(
@@ -597,7 +673,7 @@ def train_stage(
         train_losses = train_epoch(
             model, discriminator, train_loader, criterion,
             optimizer_g, optimizer_d, device, epoch, stage, writer, logger,
-            scaler=scaler, ema=ema
+            scaler=scaler, ema=ema, grad_clip_norm=grad_clip_norm
         )
         
         # Log training losses

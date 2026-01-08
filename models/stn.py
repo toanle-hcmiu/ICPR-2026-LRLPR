@@ -112,7 +112,7 @@ class LocalizationNetwork(nn.Module):
             x: Input feature map of shape (B, C, H, W).
             
         Returns:
-            Affine parameters of shape (B, 2, 3).
+            Affine parameters of shape (B, 2, 3), clamped for numerical stability.
         """
         batch_size = x.size(0)
         
@@ -128,6 +128,12 @@ class LocalizationNetwork(nn.Module):
         
         # Reshape to 2x3 matrix
         theta = theta.view(batch_size, 2, 3)
+        
+        # Clamp affine parameters to reasonable ranges to prevent numerical instability
+        # Scale (theta[:, 0, 0] and theta[:, 1, 1]): typically 0.5 to 2.0
+        # Shear (theta[:, 0, 1] and theta[:, 1, 0]): typically -0.5 to 0.5
+        # Translation (theta[:, 0, 2] and theta[:, 1, 2]): typically -1.0 to 1.0
+        theta = torch.clamp(theta, min=-3.0, max=3.0)
         
         return theta
 
@@ -170,9 +176,13 @@ class CornerPredictor(nn.Module):
         
         x = self.gap(features).view(batch_size, -1)
         corners = self.fc(x)
+        
+        # Clamp before reshape to prevent extreme values
+        corners = torch.clamp(corners, min=-10.0, max=10.0)
         corners = corners.view(batch_size, 4, 2)
         
         # Apply tanh to constrain to [-1, 1]
+        # Tanh is smooth and saturates, providing stable gradients
         corners = torch.tanh(corners)
         
         return corners

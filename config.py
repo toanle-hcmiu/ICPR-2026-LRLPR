@@ -166,8 +166,10 @@ class TrainingConfig:
     batch_size_finetune: int = 8
     
     # Learning rates
+    # Note: STN learning rate reduced from 1e-4 to 5e-5 to prevent gradient explosion
+    # during geometry warm-up phase (see issue with NaN at epoch 16)
     lr_pretrain: float = 1e-4
-    lr_stn: float = 1e-4
+    lr_stn: float = 5e-5  # Reduced for stability - STN is sensitive to large LR
     lr_restoration: float = 2e-4
     lr_finetune: float = 1e-5
     lr_parseq_finetune: float = 1e-6  # Lower LR for pre-trained OCR
@@ -196,6 +198,7 @@ class TrainingConfig:
     
     # Gradient clipping
     grad_clip_norm: float = 1.0
+    grad_clip_norm_stn: float = 0.5  # Tighter clipping for STN stage to prevent explosion
     
     # Checkpointing
     save_every: int = 5
