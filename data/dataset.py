@@ -187,9 +187,52 @@ class RodoSolDataset(LPRDataset):
         {
             "plate_layout": "Brazilian" or "Mercosur",
             "plate_text": "ABC1234",
-            "corners": {} or [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
+            "corners": {
+                "lr-001.png": {
+                    "top-left": [x, y],
+                    "top-right": [x, y],
+                    "bottom-right": [x, y],
+                    "bottom-left": [x, y]
+                },
+                ...
+            }
         }
     """
+    
+    @staticmethod
+    def _parse_frame_corners(corner_dict: Dict) -> Optional[np.ndarray]:
+        """
+        Parse corners from per-frame dictionary format.
+        
+        Args:
+            corner_dict: Dictionary with 'top-left', 'top-right', 
+                        'bottom-right', 'bottom-left' keys.
+                        
+        Returns:
+            Corners as numpy array of shape (4, 2) in order:
+            [top-left, top-right, bottom-right, bottom-left]
+            or None if invalid.
+        """
+        if not isinstance(corner_dict, dict):
+            return None
+        
+        required_keys = ['top-left', 'top-right', 'bottom-right', 'bottom-left']
+        if not all(k in corner_dict for k in required_keys):
+            return None
+        
+        try:
+            corners = np.array([
+                corner_dict['top-left'],
+                corner_dict['top-right'],
+                corner_dict['bottom-right'],
+                corner_dict['bottom-left']
+            ], dtype=np.float32)
+            
+            if corners.shape != (4, 2):
+                return None
+            return corners
+        except (ValueError, TypeError):
+            return None
     
     def _load_annotations(self) -> List[Dict]:
         """Load RodoSol annotations from track directories."""
@@ -414,24 +457,59 @@ class RodoSolDataset(LPRDataset):
         if corners_data is not None:
             # Handle different corner formats
             if isinstance(corners_data, dict):
-                # Empty dict or dict format - skip
+                # Empty dict - skip
                 if len(corners_data) == 0:
                     corners_data = None
                 else:
-                    # Try to convert dict to list format if possible
-                    # For now, skip dict format corners
-                    corners_data = None
-            elif isinstance(corners_data, (list, tuple, np.ndarray)):
+                    # Per-frame corner format: {"lr-001.png": {"top-left": [x, y], ...}, ...}
+                    # Try to extract corners from the HR image we're using
+                    if 'track_dir' in sample:
+                        # Get the HR filename we used
+                        hr_filename = Path(hr_path).name
+                        if hr_filename in corners_data:
+                            parsed = self._parse_frame_corners(corners_data[hr_filename])
+                            if parsed is not None:
+                                corners_data = parsed
+                            else:
+                                corners_data = None
+                        else:
+                            # Try to find any HR corner data
+                            for key in corners_data:
+                                if key.startswith('hr-'):
+                                    parsed = self._parse_frame_corners(corners_data[key])
+                                    if parsed is not None:
+                                        corners_data = parsed
+                                        break
+                            else:
+                                # No HR corners found, try LR corners as fallback
+                                for key in corners_data:
+                                    parsed = self._parse_frame_corners(corners_data[key])
+                                    if parsed is not None:
+                                        corners_data = parsed
+                                        break
+                                else:
+                                    corners_data = None
+                    else:
+                        # Single image format - try any available corners
+                        for key in corners_data:
+                            parsed = self._parse_frame_corners(corners_data[key])
+                            if parsed is not None:
+                                corners_data = parsed
+                                break
+                        else:
+                            corners_data = None
+            
+            # Now process corners_data if it's a valid array
+            if isinstance(corners_data, (list, tuple, np.ndarray)):
                 # Convert to numpy array first, then to tensor
-                if len(corners_data) > 0:
-                    corners_array = np.array(corners_data, dtype=np.float32)
-                    if corners_array.shape == (4, 2):  # Valid corner format
-                        corners = torch.from_numpy(corners_array)
-                        # Normalize corners to [-1, 1] using original image dimensions
-                        h, w = hr_image_shape
-                        corners[:, 0] = corners[:, 0] / w * 2 - 1
-                        corners[:, 1] = corners[:, 1] / h * 2 - 1
-                        result['corners'] = corners
+                corners_array = np.array(corners_data, dtype=np.float32)
+                if corners_array.shape == (4, 2):  # Valid corner format
+                    corners = torch.from_numpy(corners_array)
+                    # Normalize corners to [-1, 1] using original image dimensions
+                    h, w = hr_image_shape
+                    corners[:, 0] = corners[:, 0] / w * 2 - 1
+                    corners[:, 1] = corners[:, 1] / h * 2 - 1
+                    result['corners'] = corners
         
         if self.return_path:
             if 'track_dir' in sample:
@@ -648,6 +726,42 @@ class SyntheticLPRDataset(Dataset):
         }
 
 
+def lpr_collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
+    """
+    Custom collate function for LPR dataset that handles optional fields.
+    
+    Args:
+        batch: List of sample dictionaries from dataset.
+        
+    Returns:
+        Batched dictionary with stacked tensors.
+    """
+    # Required fields that are always present
+    result = {
+        'lr_frames': torch.stack([s['lr_frames'] for s in batch]),
+        'hr_image': torch.stack([s['hr_image'] for s in batch]),
+        'text_indices': torch.stack([s['text_indices'] for s in batch]),
+        'layout': torch.stack([s['layout'] for s in batch]),
+    }
+    
+    # Text (list of strings)
+    result['text'] = [s['text'] for s in batch]
+    
+    # Plate style (list of strings)
+    if 'plate_style' in batch[0]:
+        result['plate_style'] = [s['plate_style'] for s in batch]
+    
+    # Optional corners - only include if ALL samples have corners
+    if all('corners' in s for s in batch):
+        result['corners'] = torch.stack([s['corners'] for s in batch])
+    
+    # Optional path
+    if 'path' in batch[0]:
+        result['path'] = [s['path'] for s in batch]
+    
+    return result
+
+
 def create_dataloaders(
     train_dir: str,
     val_dir: str,
@@ -677,7 +791,8 @@ def create_dataloaders(
         shuffle=True,
         num_workers=num_workers,
         pin_memory=True,
-        drop_last=True
+        drop_last=True,
+        collate_fn=lpr_collate_fn
     )
     
     val_loader = DataLoader(
@@ -685,7 +800,8 @@ def create_dataloaders(
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=True
+        pin_memory=True,
+        collate_fn=lpr_collate_fn
     )
     
     return train_loader, val_loader

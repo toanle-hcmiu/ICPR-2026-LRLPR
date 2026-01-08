@@ -15,6 +15,94 @@ from .corner_loss import CornerLoss
 from .gan_loss import GANLoss, PixelLoss, PerceptualLoss
 
 
+class SelfSupervisedSTNLoss(nn.Module):
+    """
+    Self-supervised loss for STN training when corner annotations are not available.
+    
+    Combines multiple regularization terms:
+    1. Identity regularization: Prevents collapse, encourages gentle transformations
+    2. Multi-frame consistency: Encourages similar transformations across frames
+    3. Smoothness: Prevents extreme/unrealistic transformations
+    """
+    
+    def __init__(
+        self,
+        identity_weight: float = 1.0,
+        consistency_weight: float = 0.5,
+        smoothness_weight: float = 0.1
+    ):
+        super().__init__()
+        self.identity_weight = identity_weight
+        self.consistency_weight = consistency_weight
+        self.smoothness_weight = smoothness_weight
+        
+        # Identity transformation matrix (2x3): [[1, 0, 0], [0, 1, 0]]
+        self.register_buffer(
+            'identity_theta',
+            torch.tensor([[1, 0, 0], [0, 1, 0]], dtype=torch.float)
+        )
+    
+    def forward(
+        self,
+        thetas: torch.Tensor,
+        corners: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        Compute self-supervised STN loss.
+        
+        Args:
+            thetas: Affine transformation parameters of shape (B, T, 2, 3) or (B, 2, 3).
+            corners: Predicted corners of shape (B, T, 4, 2) or (B, 4, 2) (optional).
+            
+        Returns:
+            Loss value.
+        """
+        # Handle single-frame case
+        if thetas.dim() == 3:
+            thetas = thetas.unsqueeze(1)  # (B, 1, 2, 3)
+        
+        B, T = thetas.shape[:2]
+        
+        total_loss = 0.0
+        
+        # 1. Identity regularization loss
+        # Encourage the transformation to be close to identity
+        # This prevents the STN from collapsing or producing extreme transformations
+        identity = self.identity_theta.unsqueeze(0).unsqueeze(0).expand(B, T, -1, -1)
+        identity_loss = F.mse_loss(thetas, identity)
+        total_loss = total_loss + self.identity_weight * identity_loss
+        
+        # 2. Multi-frame consistency loss
+        # Encourage similar transformations across frames
+        if T > 1:
+            # Use mean transformation as reference
+            mean_theta = thetas.mean(dim=1, keepdim=True)  # (B, 1, 2, 3)
+            consistency_loss = F.mse_loss(thetas, mean_theta.expand_as(thetas))
+            total_loss = total_loss + self.consistency_weight * consistency_loss
+        
+        # 3. Smoothness/Regularity loss
+        # Penalize extreme scaling/rotation - focus on the diagonal (scale) elements
+        # For affine [[a, b, tx], [c, d, ty]], we want |a| ≈ 1, |d| ≈ 1 (no extreme scaling)
+        scale_x = thetas[:, :, 0, 0]  # should be close to 1
+        scale_y = thetas[:, :, 1, 1]  # should be close to 1
+        scale_loss = ((scale_x - 1) ** 2 + (scale_y - 1) ** 2).mean()
+        
+        # Also penalize extreme shear (off-diagonal elements should be small)
+        shear_x = thetas[:, :, 0, 1]  # should be close to 0
+        shear_y = thetas[:, :, 1, 0]  # should be close to 0
+        shear_loss = (shear_x ** 2 + shear_y ** 2).mean()
+        
+        # Translation should be bounded (not too far from center)
+        trans_x = thetas[:, :, 0, 2]  # should be close to 0
+        trans_y = thetas[:, :, 1, 2]  # should be close to 0
+        trans_loss = (trans_x ** 2 + trans_y ** 2).mean()
+        
+        smoothness_loss = scale_loss + shear_loss + trans_loss
+        total_loss = total_loss + self.smoothness_weight * smoothness_loss
+        
+        return total_loss
+
+
 class OCRLoss(nn.Module):
     """
     OCR loss for character recognition.
@@ -291,7 +379,11 @@ class CompositeLoss(nn.Module):
             Tuple of (loss, loss_dict).
         """
         if stage == 'stn':
-            # Only corner loss for STN training
+            loss_dict = {}
+            total_loss = 0.0
+            has_corner_supervision = False
+            
+            # Supervised corner loss if ground-truth corners are available
             if 'corners' in outputs and 'corners' in targets:
                 pred_corners = outputs['corners']
                 gt_corners = targets['corners']
@@ -299,20 +391,53 @@ class CompositeLoss(nn.Module):
                 if pred_corners.dim() == 4:
                     pred_corners = pred_corners.mean(dim=1)
                 
-                loss = self.corner_loss(pred_corners, gt_corners)
-                return loss, {'geometry': loss.item()}
-            else:
-                # Create a zero loss that maintains gradient flow through model outputs
-                # This allows backward() to work even when corner annotations are missing
+                corner_loss = self.corner_loss(pred_corners, gt_corners)
+                loss_dict['corner'] = corner_loss.item()
+                total_loss = total_loss + corner_loss
+                has_corner_supervision = True
+            
+            # Self-supervised STN loss using transformation parameters
+            # This provides meaningful gradients even without corner annotations
+            if 'thetas' in outputs:
+                if not hasattr(self, 'stn_self_supervised_loss'):
+                    self.stn_self_supervised_loss = SelfSupervisedSTNLoss(
+                        identity_weight=0.1,  # Light identity regularization
+                        consistency_weight=1.0,  # Strong multi-frame consistency
+                        smoothness_weight=0.5  # Moderate smoothness
+                    )
+                    # Move to same device as outputs
+                    device = outputs['thetas'].device
+                    self.stn_self_supervised_loss = self.stn_self_supervised_loss.to(device)
+                
+                self_sup_loss = self.stn_self_supervised_loss(
+                    outputs['thetas'],
+                    outputs.get('corners', None)
+                )
+                loss_dict['self_supervised'] = self_sup_loss.item()
+                total_loss = total_loss + self_sup_loss
+            
+            # When no corner supervision is available, add pixel reconstruction loss
+            # to provide meaningful gradients for STN training
+            if not has_corner_supervision and 'hr_image' in outputs and 'hr_image' in targets:
+                l_pixel = self.pixel_loss(outputs['hr_image'], targets['hr_image'])
+                loss_dict['pixel'] = l_pixel.item()
+                # Use a smaller weight for pixel loss in STN stage
+                total_loss = total_loss + 0.5 * l_pixel
+            
+            # If no useful loss computed, create a minimal loss with gradient flow
+            if total_loss == 0.0:
                 if 'corners' in outputs:
-                    loss = outputs['corners'].sum() * 0.0
+                    total_loss = outputs['corners'].sum() * 0.0
+                elif 'thetas' in outputs:
+                    total_loss = outputs['thetas'].sum() * 0.0
                 elif 'hr_image' in outputs:
-                    loss = outputs['hr_image'].sum() * 0.0
+                    total_loss = outputs['hr_image'].sum() * 0.0
                 else:
-                    # Fallback: use any available output tensor
                     any_output = next(iter(outputs.values()))
-                    loss = any_output.sum() * 0.0
-                return loss, {'geometry': 0.0}
+                    total_loss = any_output.sum() * 0.0
+            
+            loss_dict['geometry'] = total_loss.item() if isinstance(total_loss, torch.Tensor) else total_loss
+            return total_loss, loss_dict
         
         elif stage == 'restoration':
             # Pixel + GAN + Layout losses

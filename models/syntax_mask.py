@@ -166,17 +166,18 @@ class SyntaxMaskLayer(nn.Module):
         device = is_mercosul.device
         
         # Convert probabilities to hard decisions for mask selection
-        is_mercosul_hard = (is_mercosul > 0.5).float()
+        is_mercosul_hard = (is_mercosul > 0.5).bool()
         
-        # Get masks for each sample
-        # Use broadcasting: (B, 1, 1) * (plate_length, vocab_size)
-        mercosul_weight = is_mercosul_hard.view(batch_size, 1, 1)
-        brazilian_weight = 1.0 - mercosul_weight
+        # Use indexing instead of weighted sum to avoid 0 * (-inf) = nan
+        # Create output mask tensor
+        mask = torch.zeros(batch_size, self.plate_length, self.vocab_size, device=device)
         
-        mask = (
-            brazilian_weight * self.brazilian_mask.unsqueeze(0) +
-            mercosul_weight * self.mercosul_mask.unsqueeze(0)
-        )
+        # Assign masks based on hard decisions
+        for i in range(batch_size):
+            if is_mercosul_hard[i]:
+                mask[i] = self.mercosul_mask
+            else:
+                mask[i] = self.brazilian_mask
         
         # Use soft mask value during training
         if use_soft_mask:

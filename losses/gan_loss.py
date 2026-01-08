@@ -72,6 +72,8 @@ class GANLoss(nn.Module):
         else:
             target_tensor = self.fake_label
         
+        # Ensure target tensor is on the same device as prediction
+        target_tensor = target_tensor.to(prediction.device)
         return target_tensor.expand_as(prediction)
     
     def forward(

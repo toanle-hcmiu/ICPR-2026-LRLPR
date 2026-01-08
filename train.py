@@ -34,7 +34,7 @@ from config import Config, get_default_config
 from models import NeuroSymbolicLPR, PatchDiscriminator
 from losses import CompositeLoss, CornerLoss, GANLoss
 from losses.composite_loss import StagedTrainingManager
-from data import RodoSolDataset, SyntheticLPRDataset, LPRAugmentation
+from data import RodoSolDataset, SyntheticLPRDataset, LPRAugmentation, lpr_collate_fn
 
 
 # =============================================================================
@@ -830,14 +830,15 @@ def main():
         }
         batch_size = batch_size_map.get(stage_name, config.training.batch_size_finetune)
         
-        # Create data loaders with stage-specific batch size
+        # Create data loaders with stage-specific batch size and custom collate
         train_loader = DataLoader(
             train_dataset,
             batch_size=batch_size,
             shuffle=True,
             num_workers=config.training.num_workers,
             pin_memory=True,
-            drop_last=True
+            drop_last=True,
+            collate_fn=lpr_collate_fn
         )
         
         val_loader = DataLoader(
@@ -845,7 +846,8 @@ def main():
             batch_size=batch_size,
             shuffle=False,
             num_workers=config.training.num_workers,
-            pin_memory=True
+            pin_memory=True,
+            collate_fn=lpr_collate_fn
         )
         
         logger.info(f"Stage {stage_name}: Using batch size {batch_size}")
