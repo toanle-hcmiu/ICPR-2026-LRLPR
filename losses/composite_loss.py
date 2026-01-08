@@ -220,6 +220,8 @@ class OCRLoss(nn.Module):
 class LayoutLoss(nn.Module):
     """
     Binary cross-entropy loss for layout classification.
+    
+    Handles invalid layout labels (layout=-1) by excluding them from loss computation.
     """
     
     def __init__(self, label_smoothing: float = 0.0):
@@ -237,20 +239,32 @@ class LayoutLoss(nn.Module):
         Args:
             logits: Layout logits of shape (B, 1).
             targets: Layout labels of shape (B,) or (B, 1).
+                     Values should be 0 (Brazilian), 1 (Mercosul), or -1 (invalid).
             
         Returns:
-            Layout loss value.
+            Layout loss value. Returns 0 if no valid samples.
         """
         if targets.dim() == 1:
-            targets = targets.unsqueeze(-1)
+            targets_expanded = targets.unsqueeze(-1)
+        else:
+            targets_expanded = targets
         
-        targets = targets.float()
+        # Create mask for valid layout labels (0 or 1, not -1)
+        valid_mask = (targets >= 0).view(-1)
+        
+        if not valid_mask.any():
+            # No valid samples - return zero loss with gradient connection
+            return logits.sum() * 0.0
+        
+        # Filter to valid samples only
+        valid_logits = logits.view(-1, 1)[valid_mask]
+        valid_targets = targets_expanded.view(-1, 1)[valid_mask].float()
         
         # Apply label smoothing
         if self.label_smoothing > 0:
-            targets = targets * (1 - self.label_smoothing) + 0.5 * self.label_smoothing
+            valid_targets = valid_targets * (1 - self.label_smoothing) + 0.5 * self.label_smoothing
         
-        return F.binary_cross_entropy_with_logits(logits, targets)
+        return F.binary_cross_entropy_with_logits(valid_logits, valid_targets)
 
 
 class CompositeLoss(nn.Module):

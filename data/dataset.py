@@ -25,51 +25,96 @@ from config import (
 )
 
 
-def text_to_indices(text: str, max_length: int = PLATE_LENGTH) -> torch.Tensor:
+def text_to_indices(
+    text: str, 
+    max_length: int = PLATE_LENGTH,
+    add_bos: bool = True,
+    add_eos: bool = True
+) -> torch.Tensor:
     """
-    Convert plate text to token indices.
+    Convert plate text to token indices with BOS/EOS tokens.
+    
+    The output sequence format is: [BOS, char1, char2, ..., charN, EOS, PAD, PAD, ...]
     
     Args:
         text: License plate text (without dash).
-        max_length: Maximum sequence length.
+        max_length: Maximum number of characters (not including BOS/EOS).
+        add_bos: Whether to prepend BOS token.
+        add_eos: Whether to append EOS token.
         
     Returns:
-        Tensor of token indices.
+        Tensor of token indices with shape (max_length + 2,) if both BOS/EOS added.
     """
     text = text.upper().replace('-', '').replace(' ', '')
     
     indices = []
+    
+    # Add BOS token
+    if add_bos:
+        indices.append(BOS_IDX)
+    
+    # Add character tokens
     for char in text[:max_length]:
         if char in CHARSET:
             idx = CHAR_START_IDX + CHARSET.index(char)
             indices.append(idx)
         else:
-            indices.append(PAD_IDX)  # Unknown character
+            # Unknown character - skip or use special handling
+            # For robustness, we skip unknown characters
+            pass
     
-    # Pad if necessary
-    while len(indices) < max_length:
+    # Add EOS token
+    if add_eos:
+        indices.append(EOS_IDX)
+    
+    # Calculate total sequence length
+    total_length = max_length
+    if add_bos:
+        total_length += 1
+    if add_eos:
+        total_length += 1
+    
+    # Pad to total length
+    while len(indices) < total_length:
         indices.append(PAD_IDX)
+    
+    # Truncate if somehow longer (shouldn't happen with proper max_length)
+    indices = indices[:total_length]
     
     return torch.tensor(indices, dtype=torch.long)
 
 
-def indices_to_text(indices: torch.Tensor) -> str:
+def indices_to_text(indices: torch.Tensor, skip_special_tokens: bool = True) -> str:
     """
     Convert token indices back to text.
     
     Args:
-        indices: Tensor of token indices.
+        indices: Tensor of token indices (may include BOS, EOS, PAD tokens).
+        skip_special_tokens: Whether to skip BOS/EOS/PAD tokens in output.
         
     Returns:
         Decoded text string.
     """
     chars = []
     for idx in indices:
-        idx = idx.item()
+        idx = idx.item() if hasattr(idx, 'item') else idx
+        
         if idx >= CHAR_START_IDX and idx < CHAR_START_IDX + len(CHARSET):
             chars.append(CHARSET[idx - CHAR_START_IDX])
         elif idx == EOS_IDX:
-            break
+            if skip_special_tokens:
+                break  # Stop at EOS
+            else:
+                chars.append('<EOS>')
+        elif idx == BOS_IDX:
+            if not skip_special_tokens:
+                chars.append('<BOS>')
+            # Otherwise skip BOS
+        elif idx == PAD_IDX:
+            if not skip_special_tokens:
+                chars.append('<PAD>')
+            # Otherwise skip PAD
+    
     return ''.join(chars)
 
 
@@ -343,23 +388,39 @@ class RodoSolDataset(LPRDataset):
             Dictionary containing:
                 - 'lr_frames': LR frames tensor (num_frames, C, H, W)
                 - 'hr_image': HR image tensor (C, H, W)
-                - 'text_indices': Character indices (PLATE_LENGTH,)
+                - 'text_indices': Character indices (PLATE_LENGTH + 2,) with BOS/EOS
                 - 'text': Original text string
-                - 'layout': Layout label (0=Brazilian, 1=Mercosul)
-                - 'corners': Corner coordinates (4, 2) if available
+                - 'layout': Layout label (0=Brazilian, 1=Mercosul), -1 for invalid
+                - 'corners': Corner coordinates (4, 2) if available, transformed to match augmented image
                 - 'plate_style': Plate style string ('brazilian' or 'mercosul') for style-aware processing
         """
         sample = self.samples[idx]
         
         # Determine layout early for style-aware processing
+        # Note: layout = -1 indicates invalid plate format (neither Brazilian nor Mercosul)
+        # This is preserved to allow filtering during collation or training
         if sample['layout'] is not None:
             layout = 1 if sample['layout'] == 'mercosul' else 0
             plate_style = sample['layout']  # 'brazilian' or 'mercosul'
         else:
             text = sample['text']
             layout = infer_layout_from_text(text)
-            layout = max(0, layout)  # Handle invalid texts
-            plate_style = 'mercosul' if layout == 1 else 'brazilian'
+            # IMPORTANT: Do NOT force invalid layout to 0
+            # Invalid plates (layout=-1) should be:
+            # 1. Filtered out during collation, OR
+            # 2. Excluded from layout loss computation
+            if layout == 1:
+                plate_style = 'mercosul'
+            elif layout == 0:
+                plate_style = 'brazilian'
+            else:
+                # Invalid layout - default to brazilian for augmentation purposes
+                # but preserve layout=-1 for proper handling
+                plate_style = 'brazilian'
+        
+        # Store original image dimensions for corner transformation
+        original_hr_size = None  # (width, height)
+        hr_transform_matrix = None  # Transform matrix applied to HR image
         
         # Check if this is a track-based sample
         if 'track_dir' in sample:
@@ -396,18 +457,30 @@ class RodoSolDataset(LPRDataset):
             hr_idx = len(hr_files) // 2 if hr_files else 0
             hr_path = hr_files[min(hr_idx, len(hr_files) - 1)]
             hr_image_raw = self._load_image(hr_path)
+            
+            # Store original HR image size before transform
+            original_hr_size = (hr_image_raw.shape[1], hr_image_raw.shape[0])  # (width, height)
+            
             if self.transform is not None:
                 # Pass plate style to transform for style-aware augmentation
                 if hasattr(self.transform, 'set_plate_style'):
                     self.transform.set_plate_style(plate_style)
                 hr_image_raw = self.transform(hr_image_raw)
+                
+                # Get the transform matrix for corner transformation
+                if hasattr(self.transform, 'get_last_transform_matrix'):
+                    hr_transform_matrix = self.transform.get_last_transform_matrix()
+            
             hr_image = self._preprocess_image(hr_image_raw, self.hr_size)
             
-            # Store original HR image dimensions for corner normalization
+            # Store transformed HR image dimensions for corner normalization
             hr_image_shape = hr_image_raw.shape[:2]  # (H, W)
         else:
             # Single image sample (old format)
             image = self._load_image(sample['image_path'])
+            
+            # Store original image size before transform
+            original_hr_size = (image.shape[1], image.shape[0])  # (width, height)
             
             # Apply transforms if provided
             if self.transform is not None:
@@ -415,6 +488,10 @@ class RodoSolDataset(LPRDataset):
                 if hasattr(self.transform, 'set_plate_style'):
                     self.transform.set_plate_style(plate_style)
                 image = self.transform(image)
+                
+                # Get the transform matrix for corner transformation
+                if hasattr(self.transform, 'get_last_transform_matrix'):
+                    hr_transform_matrix = self.transform.get_last_transform_matrix()
             
             # Create HR image
             hr_image = self._preprocess_image(image, self.hr_size)
@@ -501,14 +578,24 @@ class RodoSolDataset(LPRDataset):
             
             # Now process corners_data if it's a valid array
             if isinstance(corners_data, (list, tuple, np.ndarray)):
-                # Convert to numpy array first, then to tensor
+                # Convert to numpy array first
                 corners_array = np.array(corners_data, dtype=np.float32)
                 if corners_array.shape == (4, 2):  # Valid corner format
+                    # Apply geometric transform to corners if transform was applied
+                    if hr_transform_matrix is not None and self.transform is not None:
+                        if hasattr(self.transform, 'transform_corners'):
+                            corners_array = self.transform.transform_corners(
+                                corners_array, original_hr_size
+                            )
+                    
                     corners = torch.from_numpy(corners_array)
-                    # Normalize corners to [-1, 1] using original image dimensions
+                    # Normalize corners to [-1, 1] using transformed image dimensions
                     h, w = hr_image_shape
                     corners[:, 0] = corners[:, 0] / w * 2 - 1
                     corners[:, 1] = corners[:, 1] / h * 2 - 1
+                    
+                    # Clamp to valid range (in case transform pushed corners outside)
+                    corners = torch.clamp(corners, -1.0, 1.0)
                     result['corners'] = corners
         
         if self.return_path:
@@ -726,16 +813,36 @@ class SyntheticLPRDataset(Dataset):
         }
 
 
-def lpr_collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
+def lpr_collate_fn(
+    batch: List[Dict], 
+    filter_invalid_layout: bool = True
+) -> Dict[str, torch.Tensor]:
     """
     Custom collate function for LPR dataset that handles optional fields.
     
     Args:
         batch: List of sample dictionaries from dataset.
+        filter_invalid_layout: If True, samples with layout=-1 (invalid format)
+            are excluded from the batch. If False, they are kept but should be
+            handled appropriately in the loss computation.
         
     Returns:
         Batched dictionary with stacked tensors.
+        
+    Note:
+        Samples with invalid layout (layout=-1) represent plates that don't match
+        either Brazilian or Mercosul format. These can contaminate training if
+        included, so by default they are filtered out.
     """
+    # Filter out invalid layout samples if requested
+    if filter_invalid_layout:
+        valid_batch = [s for s in batch if s['layout'].item() >= 0]
+        if len(valid_batch) == 0:
+            # All samples were invalid - fall back to using original batch
+            # but log a warning (caller should handle this case)
+            valid_batch = batch
+        batch = valid_batch
+    
     # Required fields that are always present
     result = {
         'lr_frames': torch.stack([s['lr_frames'] for s in batch]),

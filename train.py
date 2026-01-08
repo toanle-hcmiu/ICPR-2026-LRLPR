@@ -470,7 +470,14 @@ def validate(
     Returns:
         Tuple of (loss_dict, metrics_dict).
         metrics_dict includes plate_accuracy, char_accuracy, layout_accuracy.
+        
+    Note:
+        Character accuracy is computed EXCLUDING padding tokens (PAD_IDX=0),
+        BOS tokens (BOS_IDX=1), and EOS tokens (EOS_IDX=2) to give accurate
+        performance metrics on actual plate characters.
     """
+    from config import PAD_IDX, BOS_IDX, EOS_IDX
+    
     model.eval()
     
     total_losses = {}
@@ -479,6 +486,7 @@ def validate(
     correct_layout = 0
     total_plates = 0
     total_chars = 0
+    valid_layout_samples = 0  # Count samples with valid layout labels
     
     with torch.no_grad():
         for batch in tqdm(dataloader, desc='Validating'):
@@ -506,19 +514,35 @@ def validate(
             for key, value in loss_dict.items():
                 total_losses[key] = total_losses.get(key, 0) + value
             
-            # Compute plate-level accuracy (all characters correct)
+            # Compute predictions
             predictions = outputs['masked_logits'].argmax(dim=-1)
-            correct_plates += (predictions == text_indices).all(dim=-1).sum().item()
-            total_plates += text_indices.size(0)
             
-            # Compute character-level accuracy
-            correct_chars += (predictions == text_indices).sum().item()
-            total_chars += text_indices.numel()
+            # Create mask for non-special tokens (actual characters only)
+            # Exclude PAD (0), BOS (1), EOS (2) from accuracy calculation
+            char_mask = (text_indices != PAD_IDX) & (text_indices != BOS_IDX) & (text_indices != EOS_IDX)
             
-            # Compute layout classification accuracy
+            # Compute plate-level accuracy (all NON-PADDING characters correct)
+            # For each sample, check if all masked positions match
+            batch_size = text_indices.size(0)
+            for i in range(batch_size):
+                sample_mask = char_mask[i]
+                if sample_mask.any():  # Only count if there are actual characters
+                    sample_correct = (predictions[i][sample_mask] == text_indices[i][sample_mask]).all().item()
+                    correct_plates += int(sample_correct)
+                    total_plates += 1
+            
+            # Compute character-level accuracy (excluding special tokens)
+            if char_mask.any():
+                correct_chars += (predictions[char_mask] == text_indices[char_mask]).sum().item()
+                total_chars += char_mask.sum().item()
+            
+            # Compute layout classification accuracy (only for valid layout labels >= 0)
             if 'layout_logits' in outputs:
-                layout_preds = (torch.sigmoid(outputs['layout_logits']) > 0.5).long().squeeze(-1)
-                correct_layout += (layout_preds == layout).sum().item()
+                valid_layout_mask = layout >= 0  # Filter out invalid layout samples (-1)
+                if valid_layout_mask.any():
+                    layout_preds = (torch.sigmoid(outputs['layout_logits']) > 0.5).long().squeeze(-1)
+                    correct_layout += (layout_preds[valid_layout_mask] == layout[valid_layout_mask]).sum().item()
+                    valid_layout_samples += valid_layout_mask.sum().item()
     
     # Average losses
     num_batches = len(dataloader)
@@ -529,7 +553,7 @@ def validate(
     metrics = {
         'plate_accuracy': correct_plates / total_plates if total_plates > 0 else 0.0,
         'char_accuracy': correct_chars / total_chars if total_chars > 0 else 0.0,
-        'layout_accuracy': correct_layout / total_plates if total_plates > 0 else 0.0,
+        'layout_accuracy': correct_layout / valid_layout_samples if valid_layout_samples > 0 else 0.0,
     }
     
     return total_losses, metrics

@@ -23,6 +23,10 @@ class LPRAugmentation:
     - Mercosur plates have white background with blue band, may need different
       brightness/contrast ranges to preserve blue band visibility
     - Brazilian plates have grey background, may tolerate different augmentations
+    
+    IMPORTANT: When geometric augmentations are applied, the transform parameters
+    are stored and can be used to transform corner annotations via 
+    get_last_transform_matrix() and transform_corners().
     """
     
     def __init__(
@@ -128,6 +132,11 @@ class LPRAugmentation:
         
         # Current plate style (set dynamically)
         self.current_plate_style = None  # 'brazilian' or 'mercosul'
+        
+        # Store last geometric transform parameters for corner transformation
+        # This is a 3x3 affine transformation matrix
+        self._last_transform_matrix = None
+        self._last_image_size = None  # (width, height)
     
     def set_plate_style(self, style: str):
         """
@@ -138,6 +147,54 @@ class LPRAugmentation:
         """
         self.current_plate_style = style.lower()
     
+    def get_last_transform_matrix(self) -> Optional[np.ndarray]:
+        """
+        Get the transformation matrix from the last geometric augmentation.
+        
+        Returns:
+            3x3 transformation matrix or None if no geometric transform was applied.
+        """
+        return self._last_transform_matrix
+    
+    def get_last_image_size(self) -> Optional[Tuple[int, int]]:
+        """
+        Get the image size (width, height) from the last augmentation.
+        
+        Returns:
+            (width, height) tuple or None.
+        """
+        return self._last_image_size
+    
+    def transform_corners(
+        self, 
+        corners: np.ndarray, 
+        original_size: Tuple[int, int]
+    ) -> np.ndarray:
+        """
+        Transform corner coordinates using the last geometric augmentation.
+        
+        Args:
+            corners: Corner coordinates of shape (4, 2) in pixel coordinates.
+            original_size: Original image size (width, height) before augmentation.
+            
+        Returns:
+            Transformed corner coordinates of shape (4, 2).
+        """
+        if self._last_transform_matrix is None:
+            return corners
+        
+        # Convert corners to homogeneous coordinates
+        corners_h = np.hstack([corners, np.ones((4, 1))])
+        
+        # Apply transformation
+        transformed = (self._last_transform_matrix @ corners_h.T).T
+        
+        # Convert back from homogeneous (handle perspective if present)
+        if transformed.shape[1] == 3:
+            transformed = transformed[:, :2] / transformed[:, 2:3]
+        
+        return transformed.astype(np.float32)
+    
     def __call__(self, image: np.ndarray) -> np.ndarray:
         """
         Apply augmentation pipeline to image.
@@ -147,7 +204,15 @@ class LPRAugmentation:
             
         Returns:
             Augmented image as numpy array.
+            
+        Note:
+            After calling this method, use get_last_transform_matrix() and 
+            transform_corners() to get the transformed corner coordinates.
         """
+        # Reset transform matrix
+        self._last_transform_matrix = None
+        self._last_image_size = (image.shape[1], image.shape[0])  # (width, height)
+        
         # Convert to PIL Image
         img = Image.fromarray(image)
         
@@ -169,11 +234,29 @@ class LPRAugmentation:
         return image
     
     def _apply_geometric(self, img: Image.Image) -> Image.Image:
-        """Apply geometric augmentations."""
+        """Apply geometric augmentations and track transformation matrix."""
         width, height = img.size
+        
+        # Initialize transformation matrix as identity
+        # Using 3x3 matrix to support affine transforms
+        transform_matrix = np.eye(3)
         
         # Random rotation
         angle = random.uniform(*self.rotation_range)
+        angle_rad = np.deg2rad(angle)
+        
+        # Rotation around image center
+        cx, cy = width / 2, height / 2
+        
+        # Translation to origin, rotate, translate back
+        cos_a, sin_a = np.cos(angle_rad), np.sin(angle_rad)
+        rotation_matrix = np.array([
+            [cos_a, -sin_a, cx - cx * cos_a + cy * sin_a],
+            [sin_a, cos_a, cy - cx * sin_a - cy * cos_a],
+            [0, 0, 1]
+        ])
+        transform_matrix = rotation_matrix @ transform_matrix
+        
         img = img.rotate(angle, resample=Image.BILINEAR, expand=False, fillcolor=(128, 128, 128))
         
         # Random scale
@@ -182,19 +265,46 @@ class LPRAugmentation:
         new_height = int(height * scale)
         img = img.resize((new_width, new_height), Image.BILINEAR)
         
+        # Scale matrix (around origin, then we'll handle crop/pad offset)
+        scale_matrix = np.array([
+            [scale, 0, 0],
+            [0, scale, 0],
+            [0, 0, 1]
+        ])
+        transform_matrix = scale_matrix @ transform_matrix
+        
         # Center crop or pad to original size
         if scale > 1:
-            # Crop
+            # Crop - offset for center crop
             left = (new_width - width) // 2
             top = (new_height - height) // 2
             img = img.crop((left, top, left + width, top + height))
+            
+            # Crop offset (translate coordinates)
+            crop_matrix = np.array([
+                [1, 0, -left],
+                [0, 1, -top],
+                [0, 0, 1]
+            ])
+            transform_matrix = crop_matrix @ transform_matrix
         elif scale < 1:
-            # Pad
+            # Pad - offset for centering
             new_img = Image.new('RGB', (width, height), (128, 128, 128))
             left = (width - new_width) // 2
             top = (height - new_height) // 2
             new_img.paste(img, (left, top))
             img = new_img
+            
+            # Pad offset (translate coordinates)
+            pad_matrix = np.array([
+                [1, 0, left],
+                [0, 1, top],
+                [0, 0, 1]
+            ])
+            transform_matrix = pad_matrix @ transform_matrix
+        
+        # Store the final transformation matrix
+        self._last_transform_matrix = transform_matrix
         
         return img
     
