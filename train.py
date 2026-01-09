@@ -291,6 +291,7 @@ def train_epoch(
     use_amp = scaler is not None
     nan_batch_count = 0
     max_nan_batches = 10  # Stop epoch if too many NaN batches
+    scaler_reset_threshold = 5  # Reset scaler if too many NaN batches in a row
     
     pbar = tqdm(dataloader, desc=f'Epoch {epoch}')
     
@@ -358,6 +359,14 @@ def train_epoch(
                     logger.warning(f"Epoch {epoch}, Batch {batch_idx}: NaN/Inf gradients detected, skipping optimizer step")
                 scaler.update()  # Still update scaler to adjust scale factor
                 nan_batch_count += 1
+                
+                # Reset scaler if we've hit threshold - the scale may have shrunk too much
+                if nan_batch_count == scaler_reset_threshold and use_amp:
+                    if logger is not None:
+                        logger.warning(f"Resetting GradScaler due to {scaler_reset_threshold} consecutive NaN batches")
+                    # Create new scaler with fresh state
+                    scaler = GradScaler('cuda')
+                
                 if nan_batch_count >= max_nan_batches:
                     if logger is not None:
                         logger.error(f"Epoch {epoch}: Too many NaN batches ({nan_batch_count}), stopping epoch early")
@@ -375,6 +384,11 @@ def train_epoch(
                 if logger is not None:
                     logger.warning(f"Epoch {epoch}, Batch {batch_idx}: NaN/Inf gradients detected, skipping optimizer step")
                 nan_batch_count += 1
+                # Zero out any NaN gradients to prevent accumulation
+                for param in model.parameters():
+                    if param.grad is not None:
+                        param.grad.zero_()
+                
                 if nan_batch_count >= max_nan_batches:
                     if logger is not None:
                         logger.error(f"Epoch {epoch}: Too many NaN batches ({nan_batch_count}), stopping epoch early")
@@ -475,6 +489,10 @@ def validate(
         Character accuracy is computed EXCLUDING padding tokens (PAD_IDX=0),
         BOS tokens (BOS_IDX=1), and EOS tokens (EOS_IDX=2) to give accurate
         performance metrics on actual plate characters.
+        
+        Loss computation is stage-aware: during STN stage, only geometry-related
+        losses are computed to avoid NaN from OCR loss (pretrained PARSeq may
+        produce invalid logits for unmapped characters).
     """
     from config import PAD_IDX, BOS_IDX, EOS_IDX
     
@@ -508,32 +526,46 @@ def validate(
             
             outputs = model(lr_frames, return_intermediates=True)
             
-            # Compute loss
-            _, loss_dict = criterion(outputs, targets)
+            # Compute loss - use stage-specific loss to avoid NaN from OCR
+            # during early training stages (STN stage especially)
+            if stage == 'stn':
+                _, loss_dict = criterion.get_stage_loss('stn', outputs, targets)
+            elif stage == 'restoration':
+                _, loss_dict = criterion.get_stage_loss('restoration', outputs, targets)
+            else:
+                _, loss_dict = criterion(outputs, targets)
             
             for key, value in loss_dict.items():
-                total_losses[key] = total_losses.get(key, 0) + value
+                # Skip NaN values when accumulating
+                if not (isinstance(value, float) and (math.isnan(value) or math.isinf(value))):
+                    total_losses[key] = total_losses.get(key, 0) + value
             
             # Compute predictions
-            predictions = outputs['masked_logits'].argmax(dim=-1)
+            predictions = outputs['masked_logits'].argmax(dim=-1)  # (B, PLATE_LENGTH)
+            
+            # Extract target characters (exclude BOS at position 0 and EOS at end)
+            # text_indices shape: (B, PLATE_LENGTH + 2) with [BOS, char1, ..., char7, EOS]
+            # We need positions 1 to PLATE_LENGTH+1 (i.e., indices 1:8 for 7-char plates)
+            plate_length = predictions.size(1)
+            target_chars = text_indices[:, 1:plate_length + 1]  # (B, PLATE_LENGTH)
             
             # Create mask for non-special tokens (actual characters only)
             # Exclude PAD (0), BOS (1), EOS (2) from accuracy calculation
-            char_mask = (text_indices != PAD_IDX) & (text_indices != BOS_IDX) & (text_indices != EOS_IDX)
+            char_mask = (target_chars != PAD_IDX) & (target_chars != BOS_IDX) & (target_chars != EOS_IDX)
             
             # Compute plate-level accuracy (all NON-PADDING characters correct)
             # For each sample, check if all masked positions match
-            batch_size = text_indices.size(0)
+            batch_size = target_chars.size(0)
             for i in range(batch_size):
                 sample_mask = char_mask[i]
                 if sample_mask.any():  # Only count if there are actual characters
-                    sample_correct = (predictions[i][sample_mask] == text_indices[i][sample_mask]).all().item()
+                    sample_correct = (predictions[i][sample_mask] == target_chars[i][sample_mask]).all().item()
                     correct_plates += int(sample_correct)
                     total_plates += 1
             
             # Compute character-level accuracy (excluding special tokens)
             if char_mask.any():
-                correct_chars += (predictions[char_mask] == text_indices[char_mask]).sum().item()
+                correct_chars += (predictions[char_mask] == target_chars[char_mask]).sum().item()
                 total_chars += char_mask.sum().item()
             
             # Compute layout classification accuracy (only for valid layout labels >= 0)
@@ -611,6 +643,44 @@ def load_checkpoint(
     return checkpoint
 
 
+def check_model_for_nan(model: nn.Module, logger: logging.Logger) -> bool:
+    """
+    Check if model has any NaN or Inf parameters.
+    
+    Args:
+        model: The model to check.
+        logger: Logger for warnings.
+        
+    Returns:
+        True if NaN/Inf found, False otherwise.
+    """
+    has_nan = False
+    for name, param in model.named_parameters():
+        if param is not None and param.data is not None:
+            if torch.isnan(param.data).any() or torch.isinf(param.data).any():
+                logger.warning(f"NaN/Inf found in parameter: {name}")
+                has_nan = True
+    return has_nan
+
+
+def reset_nan_parameters(model: nn.Module, logger: logging.Logger):
+    """
+    Reset any NaN/Inf parameters to reasonable values.
+    
+    Args:
+        model: The model to fix.
+        logger: Logger for info messages.
+    """
+    for name, param in model.named_parameters():
+        if param is not None and param.data is not None:
+            nan_mask = torch.isnan(param.data) | torch.isinf(param.data)
+            if nan_mask.any():
+                # Reset NaN values to small random values
+                num_nan = nan_mask.sum().item()
+                logger.warning(f"Resetting {num_nan} NaN/Inf values in {name}")
+                param.data[nan_mask] = torch.randn(num_nan, device=param.device, dtype=param.dtype) * 0.01
+
+
 def train_stage(
     model: nn.Module,
     discriminator: Optional[nn.Module],
@@ -648,6 +718,11 @@ def train_stage(
         use_ema: Whether to use EMA for model weights.
         early_stopping_patience: Patience for early stopping (0 to disable).
     """
+    # Check for NaN in model parameters before starting
+    if check_model_for_nan(model, logger):
+        logger.warning(f"Model has NaN parameters at start of stage {stage}, attempting to reset...")
+        reset_nan_parameters(model, logger)
+    
     # Get stage-specific gradient clipping norm
     grad_clip_norm = config.training.grad_clip_norm
     if stage == 'stn' and hasattr(config.training, 'grad_clip_norm_stn'):
@@ -691,6 +766,8 @@ def train_stage(
     early_stopper = EarlyStopping(patience=early_stopping_patience) if early_stopping_patience > 0 else None
     
     best_acc = 0.0
+    consecutive_nan_epochs = 0
+    max_consecutive_nan_epochs = 3  # Stop stage if too many consecutive NaN epochs
     
     for epoch in range(start_epoch, num_epochs):
         # Train
@@ -702,6 +779,26 @@ def train_stage(
         
         # Log training losses
         logger.info(f"Epoch {epoch} - Train losses: {train_losses}")
+        
+        # Check if this was a NaN epoch (empty losses means all batches had NaN)
+        if not train_losses:
+            consecutive_nan_epochs += 1
+            logger.warning(f"Epoch {epoch} had no valid batches (consecutive NaN epochs: {consecutive_nan_epochs})")
+            
+            if consecutive_nan_epochs >= max_consecutive_nan_epochs:
+                logger.error(f"Stage {stage}: {max_consecutive_nan_epochs} consecutive NaN epochs, stopping stage early")
+                # Check and reset any NaN parameters before next stage
+                if check_model_for_nan(model, logger):
+                    logger.warning("Model has NaN parameters, attempting to load best checkpoint...")
+                    best_checkpoint_path = os.path.join(checkpoint_dir, f'{stage}_best.pth')
+                    if os.path.exists(best_checkpoint_path):
+                        load_checkpoint(model, best_checkpoint_path, discriminator)
+                        logger.info(f"Loaded best checkpoint from {best_checkpoint_path}")
+                    else:
+                        reset_nan_parameters(model, logger)
+                break
+        else:
+            consecutive_nan_epochs = 0  # Reset counter on successful epoch
         
         # Validate
         if (epoch + 1) % config.training.eval_every == 0:
@@ -773,6 +870,21 @@ def train_stage(
             {'model_state_dict': ema.state_dict()},
             os.path.join(checkpoint_dir, f'{stage}_final_ema.pth')
         )
+    
+    # After stage completion, load the best checkpoint to ensure clean state for next stage
+    best_checkpoint_path = os.path.join(checkpoint_dir, f'{stage}_best.pth')
+    if os.path.exists(best_checkpoint_path):
+        logger.info(f"Loading best checkpoint from stage {stage} for next stage...")
+        load_checkpoint(model, best_checkpoint_path, discriminator)
+        # Verify model is clean
+        if check_model_for_nan(model, logger):
+            logger.warning("Best checkpoint has NaN values, resetting...")
+            reset_nan_parameters(model, logger)
+    else:
+        # Check current model for NaN
+        if check_model_for_nan(model, logger):
+            logger.warning("Final model has NaN values, resetting...")
+            reset_nan_parameters(model, logger)
     
     return best_acc
 

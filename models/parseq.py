@@ -72,9 +72,15 @@ class PretrainedPARSeq(nn.Module):
         self._loaded = False
         self._use_fallback = False
     
-    def _load_model(self):
+    def _load_model(self, device: torch.device = None):
         """Lazy load the pretrained model."""
         if self._loaded:
+            # Move to device if needed
+            if device is not None:
+                if self._use_fallback and self._fallback_model is not None:
+                    self._fallback_model = self._fallback_model.to(device)
+                elif self._model is not None:
+                    self._model = self._model.to(device)
             return
         
         try:
@@ -95,6 +101,10 @@ class PretrainedPARSeq(nn.Module):
             # Create charset adapter (pretrained uses different charset)
             self._create_charset_adapter()
             
+            # Move to device if provided
+            if device is not None:
+                self._model = self._model.to(device)
+            
             self._loaded = True
             self._use_fallback = False
             print(f"✓ Loaded pretrained PARSeq ({self.model_name})")
@@ -111,8 +121,10 @@ class PretrainedPARSeq(nn.Module):
                 num_heads=6,
                 encoder_depth=12
             )
-            # Move to same device as self
-            if hasattr(self, '_device'):
+            # Move to device
+            if device is not None:
+                self._fallback_model = self._fallback_model.to(device)
+            elif hasattr(self, '_device') and self._device is not None:
                 self._fallback_model = self._fallback_model.to(self._device)
             
             self._model = None
@@ -130,18 +142,30 @@ class PretrainedPARSeq(nn.Module):
         if self._model is None:
             return
         
-        # Get pretrained model's charset
-        pretrained_charset = self._model.tokenizer.charset
+        # Get pretrained model's charset from hparams
+        # The model uses charset_train which includes all characters
+        # Output indices: [EOS] [PAD] [BOS] + charset characters
+        # So index 0 = EOS, 1 = PAD, 2 = BOS, 3+ = characters
+        if hasattr(self._model, 'hparams') and hasattr(self._model.hparams, 'charset_train'):
+            pretrained_charset = self._model.hparams.charset_train
+        elif hasattr(self._model, 'hparams') and hasattr(self._model.hparams, 'charset_test'):
+            pretrained_charset = self._model.hparams.charset_test
+        else:
+            # Fallback: use standard charset (digits + lowercase + uppercase + special)
+            pretrained_charset = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~"
         
         # Create mapping from pretrained indices to our indices
+        # Pretrained model: index 0=EOS, 1=PAD, 2=BOS, 3+=characters
         pretrained_to_ours = {}
+        char_offset = 3  # Skip EOS, PAD, BOS tokens
         for i, char in enumerate(pretrained_charset):
+            pretrained_idx = i + char_offset
             if char.upper() in CHARSET:
                 our_idx = CHAR_START_IDX + CHARSET.index(char.upper())
-                pretrained_to_ours[i] = our_idx
+                pretrained_to_ours[pretrained_idx] = our_idx
         
         self._pretrained_to_ours = pretrained_to_ours
-        self._pretrained_charset_size = len(pretrained_charset)
+        self._pretrained_charset_size = len(pretrained_charset) + char_offset
     
     def _adapt_logits(self, logits: torch.Tensor) -> torch.Tensor:
         """
@@ -188,7 +212,7 @@ class PretrainedPARSeq(nn.Module):
         """
         # Store device for fallback model creation
         self._device = x.device
-        self._load_model()
+        self._load_model(device=x.device)
         
         # Use fallback custom implementation if pretrained failed
         if self._use_fallback:
@@ -208,8 +232,18 @@ class PretrainedPARSeq(nn.Module):
         # Our images are in [-1, 1] range
         x_normalized = (x + 1) / 2
         
+        # Pretrained PARSeq expects 32x128 images, resize if needed
+        pretrained_size = (32, 128)
+        if x_normalized.shape[2:] != pretrained_size:
+            x_normalized = F.interpolate(
+                x_normalized, 
+                size=pretrained_size, 
+                mode='bilinear', 
+                align_corners=False
+            )
+        
         # Get predictions from pretrained model
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast('cuda', enabled=False):
             logits = self._model(x_normalized)
         
         # Adapt to our charset
