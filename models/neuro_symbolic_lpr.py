@@ -437,7 +437,7 @@ class NeuroSymbolicLPR(nn.Module):
                 {'params': self.quality_fusion.parameters()},
                 {'params': self.feature_to_image.parameters()},
                 {'params': self.generator.parameters()},
-                {'params': self.recognizer.parameters(), 'lr_scale': 0.01}
+                {'params': self.recognizer.parameters(), 'lr_scale': 0.1}
             ]
         else:
             raise ValueError(f"Unknown training stage: {stage}")

@@ -172,19 +172,19 @@ class TrainingConfig:
     lr_pretrain: float = 1e-4
     lr_stn: float = 1e-5  # Further reduced for stability - STN is extremely sensitive to large LR
     lr_restoration: float = 2e-4
-    lr_finetune: float = 1e-5
+    lr_finetune: float = 2e-5  # Increased for faster convergence
     lr_parseq_finetune: float = 1e-6  # Lower LR for pre-trained OCR
     
     # Training epochs for each stage
     epochs_pretrain: int = 50
     epochs_stn: int = 20
     epochs_restoration: int = 30
-    epochs_finetune: int = 100
+    epochs_finetune: int = 150  # Increased from 100 for better convergence
     
     # Loss weights (for L_total = L_pixel + w1*L_GAN + w2*L_OCR + w3*L_geo)
     weight_pixel: float = 1.0
-    weight_gan: float = 0.01  # Reduced from 0.1 to prevent GAN from overpowering generator early in training
-    weight_ocr: float = 0.5
+    weight_gan: float = 0.005  # Further reduced to stabilize GAN training
+    weight_ocr: float = 1.0  # Increased from 0.5 - OCR is the main objective
     weight_geometry: float = 0.1
     
     # Optimizer
