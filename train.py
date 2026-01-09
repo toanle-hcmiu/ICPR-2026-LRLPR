@@ -315,7 +315,12 @@ def train_epoch(
             targets['corners'] = corners
         
         # Forward pass with optional autocast for mixed precision
-        with autocast('cuda', enabled=use_amp):
+        # CRITICAL: Disable AMP for STN stage to prevent FP16 precision issues
+        # STN grid generation and affine transformations are highly sensitive to
+        # precision loss in FP16, causing NaN/Inf gradients and training collapse
+        use_amp_for_batch = use_amp and (stage != 'stn')
+        
+        with autocast('cuda', enabled=use_amp_for_batch):
             outputs = model(lr_frames, return_intermediates=True)
             
             # Compute generator loss

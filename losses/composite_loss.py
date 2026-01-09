@@ -23,28 +23,28 @@ class SelfSupervisedSTNLoss(nn.Module):
     1. Multi-frame consistency: Different frames of the same plate should have similar transformations
     2. Temporal smoothness: Adjacent frames should have smooth transformation changes
     3. Geometric plausibility: Transformations should be within reasonable bounds
-    4. Diversity encouragement: Prevent collapse to pure identity (allow some transformation)
     
-    The key insight is that we want the STN to LEARN to rectify, not just stay at identity.
-    So we use a combination of consistency losses (across frames) and plausibility constraints.
+    The key insight is that we want the STN to LEARN to rectify while maintaining
+    consistency across frames. The loss provides regularization without collapsing
+    to identity (which would be trivially consistent).
     
     Includes numerical stability safeguards to prevent NaN/Inf losses.
     """
     
     def __init__(
         self,
-        consistency_weight: float = 1.0,
-        temporal_weight: float = 0.5,
-        plausibility_weight: float = 0.2,
-        diversity_weight: float = 0.1,
-        max_loss_value: float = 50.0  # Clamp loss to prevent explosion
+        consistency_weight: float = 0.5,  # Reduced to prevent dominating
+        temporal_weight: float = 0.3,     # Reduced for smoother learning
+        plausibility_weight: float = 0.1, # Light regularization
+        max_loss_value: float = 20.0,     # Tighter clamp for STN stability
+        eps: float = 1e-8
     ):
         super().__init__()
         self.consistency_weight = consistency_weight
         self.temporal_weight = temporal_weight
         self.plausibility_weight = plausibility_weight
-        self.diversity_weight = diversity_weight
         self.max_loss_value = max_loss_value
+        self.eps = eps
         
         # Identity transformation matrix (2x3): [[1, 0, 0], [0, 1, 0]]
         self.register_buffer(
@@ -52,8 +52,10 @@ class SelfSupervisedSTNLoss(nn.Module):
             torch.tensor([[1, 0, 0], [0, 1, 0]], dtype=torch.float)
         )
     
-    def _safe_loss(self, loss: torch.Tensor) -> torch.Tensor:
+    def _safe_loss(self, loss: torch.Tensor, name: str = "") -> torch.Tensor:
         """Ensure loss is valid and clamped."""
+        if loss is None:
+            return loss
         if torch.isnan(loss).any() or torch.isinf(loss).any():
             return loss * 0.0
         return torch.clamp(loss, min=0.0, max=self.max_loss_value)
@@ -83,19 +85,18 @@ class SelfSupervisedSTNLoss(nn.Module):
         
         B, T = thetas.shape[:2]
         
-        # Clamp theta values to reasonable range
-        thetas_clamped = torch.clamp(thetas, min=-3.0, max=3.0)
+        # Clamp theta values to reasonable range (tighter bounds for stability)
+        thetas_clamped = torch.clamp(thetas, min=-2.0, max=2.0)
         
         total_loss = thetas.new_zeros(1).squeeze()
         
-        # 1. Multi-frame consistency loss (most important for learning)
+        # 1. Multi-frame consistency loss
         # All frames of the same license plate should have similar transformations
-        # This is the key learning signal: frames must agree on the rectification
         if T > 1:
             mean_theta = thetas_clamped.mean(dim=1, keepdim=True)  # (B, 1, 2, 3)
-            # Variance from mean
-            consistency_loss = ((thetas_clamped - mean_theta) ** 2).mean()
-            consistency_loss = self._safe_loss(consistency_loss)
+            # Use smooth L1 for robustness to outliers
+            consistency_loss = F.smooth_l1_loss(thetas_clamped, mean_theta.expand_as(thetas_clamped))
+            consistency_loss = self._safe_loss(consistency_loss, "consistency")
             total_loss = total_loss + self.consistency_weight * consistency_loss
         
         # 2. Temporal smoothness loss
@@ -103,75 +104,60 @@ class SelfSupervisedSTNLoss(nn.Module):
         if T > 1:
             # Difference between adjacent frames
             theta_diff = thetas_clamped[:, 1:] - thetas_clamped[:, :-1]  # (B, T-1, 2, 3)
-            temporal_loss = (theta_diff ** 2).mean()
-            temporal_loss = self._safe_loss(temporal_loss)
+            # Use smooth L1 for robustness
+            temporal_loss = F.smooth_l1_loss(theta_diff, torch.zeros_like(theta_diff))
+            temporal_loss = self._safe_loss(temporal_loss, "temporal")
             total_loss = total_loss + self.temporal_weight * temporal_loss
         
-        # 3. Geometric plausibility loss
-        # Transformations should be within reasonable bounds
-        # Scale should be positive and not too extreme (0.5 to 2.0)
+        # 3. Geometric plausibility loss (light regularization)
+        # Only penalize extreme values, not moderate transformations
         scale_x = thetas_clamped[:, :, 0, 0]
         scale_y = thetas_clamped[:, :, 1, 1]
         
-        # Penalize scales far from 1 (but allow some variation for rectification)
+        # Penalize scales very far from 1 (threshold at 0.7 to allow rectification)
         scale_deviation = (scale_x - 1).abs() + (scale_y - 1).abs()
-        # Only penalize if deviation is > 0.5 (allow reasonable scaling)
-        scale_penalty = F.relu(scale_deviation - 0.5) ** 2
+        scale_penalty = F.relu(scale_deviation - 0.7) ** 2
         
         # Shear should be small (off-diagonal elements)
         shear_x = thetas_clamped[:, :, 0, 1]
         shear_y = thetas_clamped[:, :, 1, 0]
-        shear_penalty = (shear_x ** 2 + shear_y ** 2)
+        # Only penalize large shear (threshold at 0.4)
+        shear_penalty = F.relu(shear_x.abs() - 0.4) ** 2 + F.relu(shear_y.abs() - 0.4) ** 2
         
-        # Translation should be bounded
+        # Translation penalty only for extreme values
         trans_x = thetas_clamped[:, :, 0, 2]
         trans_y = thetas_clamped[:, :, 1, 2]
-        # Only penalize if translation is > 0.5 (allow reasonable translation)
-        trans_penalty = F.relu(trans_x.abs() - 0.5) ** 2 + F.relu(trans_y.abs() - 0.5) ** 2
+        trans_penalty = F.relu(trans_x.abs() - 0.7) ** 2 + F.relu(trans_y.abs() - 0.7) ** 2
         
         plausibility_loss = (scale_penalty + shear_penalty + trans_penalty).mean()
-        plausibility_loss = self._safe_loss(plausibility_loss)
+        plausibility_loss = self._safe_loss(plausibility_loss, "plausibility")
         total_loss = total_loss + self.plausibility_weight * plausibility_loss
         
-        # 4. Corner-based loss if corners are available
-        # Use corner predictions for additional supervision
+        # 4. Corner-based consistency if corners are available
         if corners is not None and not (torch.isnan(corners).any() or torch.isinf(corners).any()):
             if corners.dim() == 3:
                 corners = corners.unsqueeze(1)  # (B, 1, 4, 2)
             
-            if corners.size(1) == T:
+            # Clamp corners for stability
+            corners = torch.clamp(corners, min=-2.0, max=2.0)
+            
+            if corners.size(1) == T and T > 1:
                 # Corner consistency: all frames should predict similar corners
                 mean_corners = corners.mean(dim=1, keepdim=True)
-                corner_consistency = ((corners - mean_corners) ** 2).mean()
-                corner_consistency = self._safe_loss(corner_consistency)
-                total_loss = total_loss + 0.5 * corner_consistency
+                corner_consistency = F.smooth_l1_loss(corners, mean_corners.expand_as(corners))
+                corner_consistency = self._safe_loss(corner_consistency, "corner_consistency")
+                total_loss = total_loss + 0.3 * corner_consistency
                 
-                # Corner rectangularity: opposite sides should be parallel
-                # Corners are ordered: top-left, top-right, bottom-right, bottom-left
-                # Top edge vector: corners[:, :, 1] - corners[:, :, 0]
-                # Bottom edge vector: corners[:, :, 2] - corners[:, :, 3]
-                # Left edge vector: corners[:, :, 3] - corners[:, :, 0]
-                # Right edge vector: corners[:, :, 2] - corners[:, :, 1]
+                # Corner rectangularity: encourage plate-like aspect ratio
+                # Top edge should be horizontal-ish, left edge should be vertical-ish
                 top_edge = corners[:, :, 1] - corners[:, :, 0]
-                bottom_edge = corners[:, :, 2] - corners[:, :, 3]
                 left_edge = corners[:, :, 3] - corners[:, :, 0]
-                right_edge = corners[:, :, 2] - corners[:, :, 1]
                 
-                # Parallel edges should have similar direction (dot product close to |a||b|)
-                # Normalized dot product for direction similarity
-                def direction_similarity(v1, v2, eps=1e-6):
-                    norm1 = torch.norm(v1, dim=-1, keepdim=True).clamp(min=eps)
-                    norm2 = torch.norm(v2, dim=-1, keepdim=True).clamp(min=eps)
-                    v1_n = v1 / norm1
-                    v2_n = v2 / norm2
-                    # Dot product of normalized vectors should be close to 1
-                    dot = (v1_n * v2_n).sum(dim=-1)
-                    return (1 - dot) ** 2  # Loss is 0 when parallel
-                
-                parallel_loss = direction_similarity(top_edge, bottom_edge).mean()
-                parallel_loss = parallel_loss + direction_similarity(left_edge, right_edge).mean()
-                parallel_loss = self._safe_loss(parallel_loss)
-                total_loss = total_loss + 0.3 * parallel_loss
+                # Edges should be roughly perpendicular (dot product near zero)
+                dot_product = (top_edge * left_edge).sum(dim=-1)
+                orthogonality_loss = (dot_product ** 2).mean()
+                orthogonality_loss = self._safe_loss(orthogonality_loss, "orthogonality")
+                total_loss = total_loss + 0.1 * orthogonality_loss
         
         # Final clamp
         total_loss = torch.clamp(total_loss, min=0.0, max=self.max_loss_value)
@@ -570,11 +556,10 @@ class CompositeLoss(nn.Module):
             if 'thetas' in outputs:
                 if not hasattr(self, 'stn_self_supervised_loss'):
                     self.stn_self_supervised_loss = SelfSupervisedSTNLoss(
-                        consistency_weight=1.0,  # Strong multi-frame consistency
-                        temporal_weight=0.5,     # Smooth temporal changes
-                        plausibility_weight=0.2, # Reasonable transformations
-                        diversity_weight=0.1,    # Prevent collapse
-                        max_loss_value=50.0      # Prevent explosion
+                        consistency_weight=0.5,   # Moderate multi-frame consistency
+                        temporal_weight=0.3,      # Smooth temporal changes
+                        plausibility_weight=0.1,  # Light regularization on geometry
+                        max_loss_value=20.0       # Tighter clamp for STN stability
                     )
                     # Move to same device as outputs
                     device = outputs['thetas'].device
@@ -584,10 +569,11 @@ class CompositeLoss(nn.Module):
                     outputs['thetas'],
                     outputs.get('corners', None)
                 )
-                self_sup_loss = self._clamp_loss(self_sup_loss)
+                self_sup_loss = self._clamp_loss(self_sup_loss, max_val=20.0)
                 loss_dict['self_supervised'] = self._safe_loss_item(self_sup_loss)
-                # Use a small weight for self-supervised loss (it's a regularizer)
-                weighted_self_sup = 0.1 * self_sup_loss
+                # Use moderate weight for self-supervised loss (regularizer)
+                # Not too small (needs to provide signal) or too large (shouldn't dominate)
+                weighted_self_sup = 0.2 * self_sup_loss
                 total_loss = weighted_self_sup if total_loss is None else total_loss + weighted_self_sup
             
             # ALWAYS use pixel reconstruction loss as the PRIMARY learning signal
@@ -627,6 +613,21 @@ class CompositeLoss(nn.Module):
             loss_dict = {}
             total_loss = None
             
+            # Check for NaN in all outputs first - early exit if model is corrupted
+            outputs_have_nan = any(
+                torch.isnan(v).any() or torch.isinf(v).any() 
+                for k, v in outputs.items() 
+                if isinstance(v, torch.Tensor)
+            )
+            
+            if outputs_have_nan:
+                # Model outputs are corrupted, return zero loss with gradient
+                any_output = next(v for v in outputs.values() if isinstance(v, torch.Tensor))
+                zero_loss = any_output.sum() * 0.0
+                loss_dict['total'] = 0.0
+                loss_dict['pixel'] = 0.0
+                return zero_loss, loss_dict
+            
             if 'hr_image' in outputs and 'hr_image' in targets:
                 # Check for NaN inputs
                 if not (torch.isnan(outputs['hr_image']).any() or torch.isnan(targets['hr_image']).any()):
@@ -642,7 +643,8 @@ class CompositeLoss(nn.Module):
                         l_gan = self.gan_loss(pred_fake, target_is_real=True)
                         l_gan = self._clamp_loss(l_gan)
                         loss_dict['gan'] = self._safe_loss_item(l_gan)
-                        weighted_gan = 0.1 * l_gan
+                        # Use reduced GAN weight for stability
+                        weighted_gan = self.weights['gan'] * l_gan
                         total_loss = weighted_gan if total_loss is None else total_loss + weighted_gan
             
             if 'layout_logits' in outputs and 'layout' in targets:

@@ -21,12 +21,16 @@ class CornerLoss(nn.Module):
     
     The corners are expected in normalized coordinates [-1, 1] in the order:
     [top-left, top-right, bottom-right, bottom-left]
+    
+    Includes numerical stability safeguards to prevent NaN/Inf losses.
     """
     
     def __init__(
         self,
         reduction: str = 'mean',
-        corner_weight: Optional[torch.Tensor] = None
+        corner_weight: Optional[torch.Tensor] = None,
+        max_loss_value: float = 50.0,
+        eps: float = 1e-8
     ):
         """
         Initialize the corner loss.
@@ -34,10 +38,14 @@ class CornerLoss(nn.Module):
         Args:
             reduction: Reduction method ('mean', 'sum', 'none').
             corner_weight: Optional weights for each corner (4,).
+            max_loss_value: Maximum loss value to clamp to (prevents explosion).
+            eps: Small epsilon for numerical stability.
         """
         super().__init__()
         
         self.reduction = reduction
+        self.max_loss_value = max_loss_value
+        self.eps = eps
         
         if corner_weight is not None:
             self.register_buffer('corner_weight', corner_weight)
@@ -51,7 +59,7 @@ class CornerLoss(nn.Module):
         mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
-        Compute corner loss.
+        Compute corner loss with numerical stability safeguards.
         
         Args:
             pred_corners: Predicted corners of shape (B, 4, 2).
@@ -59,8 +67,18 @@ class CornerLoss(nn.Module):
             mask: Optional mask for valid samples of shape (B,).
             
         Returns:
-            Corner loss value.
+            Corner loss value (clamped to prevent explosion).
         """
+        # Check for NaN/Inf inputs and return zero loss with gradient connection
+        if torch.isnan(pred_corners).any() or torch.isinf(pred_corners).any():
+            return pred_corners.sum() * 0.0
+        if torch.isnan(gt_corners).any() or torch.isinf(gt_corners).any():
+            return pred_corners.sum() * 0.0
+        
+        # Clamp inputs to reasonable range for stability
+        pred_corners = torch.clamp(pred_corners, min=-2.0, max=2.0)
+        gt_corners = torch.clamp(gt_corners, min=-2.0, max=2.0)
+        
         # Compute squared error
         squared_error = (pred_corners - gt_corners) ** 2  # (B, 4, 2)
         
@@ -79,15 +97,21 @@ class CornerLoss(nn.Module):
             sample_errors = sample_errors * mask
             num_valid = mask.sum().clamp(min=1)
         else:
-            num_valid = sample_errors.size(0)
+            num_valid = max(sample_errors.size(0), 1)
         
         # Reduce
         if self.reduction == 'mean':
-            return sample_errors.sum() / num_valid
+            loss = sample_errors.sum() / (num_valid + self.eps)
         elif self.reduction == 'sum':
-            return sample_errors.sum()
+            loss = sample_errors.sum()
         else:  # 'none'
-            return sample_errors
+            loss = sample_errors
+        
+        # Final clamp and NaN check
+        if torch.isnan(loss).any() or torch.isinf(loss).any():
+            return pred_corners.sum() * 0.0
+        
+        return torch.clamp(loss, min=0.0, max=self.max_loss_value)
     
     def forward_from_theta(
         self,

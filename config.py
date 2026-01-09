@@ -166,10 +166,11 @@ class TrainingConfig:
     batch_size_finetune: int = 8
     
     # Learning rates
-    # Note: STN learning rate reduced from 1e-4 to 5e-5 to prevent gradient explosion
-    # during geometry warm-up phase (see issue with NaN at epoch 16)
+    # Note: STN learning rate further reduced from 5e-5 to 1e-5 to prevent gradient explosion
+    # during geometry warm-up phase. STN affine transformations are extremely sensitive
+    # to learning rate - grid sampling gradients can explode with large parameter updates.
     lr_pretrain: float = 1e-4
-    lr_stn: float = 5e-5  # Reduced for stability - STN is sensitive to large LR
+    lr_stn: float = 1e-5  # Further reduced for stability - STN is extremely sensitive to large LR
     lr_restoration: float = 2e-4
     lr_finetune: float = 1e-5
     lr_parseq_finetune: float = 1e-6  # Lower LR for pre-trained OCR
@@ -182,7 +183,7 @@ class TrainingConfig:
     
     # Loss weights (for L_total = L_pixel + w1*L_GAN + w2*L_OCR + w3*L_geo)
     weight_pixel: float = 1.0
-    weight_gan: float = 0.1
+    weight_gan: float = 0.01  # Reduced from 0.1 to prevent GAN from overpowering generator early in training
     weight_ocr: float = 0.5
     weight_geometry: float = 0.1
     

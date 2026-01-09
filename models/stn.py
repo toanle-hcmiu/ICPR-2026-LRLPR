@@ -112,7 +112,7 @@ class LocalizationNetwork(nn.Module):
             x: Input feature map of shape (B, C, H, W).
             
         Returns:
-            Affine parameters of shape (B, 2, 3), clamped for numerical stability.
+            Affine parameters of shape (B, 2, 3), constrained for numerical stability.
         """
         batch_size = x.size(0)
         
@@ -124,16 +124,38 @@ class LocalizationNetwork(nn.Module):
         
         # Flatten and apply FC layers
         x = x.view(batch_size, -1)
-        theta = self.fc(x)
+        theta_raw = self.fc(x)
         
         # Reshape to 2x3 matrix
-        theta = theta.view(batch_size, 2, 3)
+        theta_raw = theta_raw.view(batch_size, 2, 3)
         
-        # Clamp affine parameters to reasonable ranges to prevent numerical instability
-        # Scale (theta[:, 0, 0] and theta[:, 1, 1]): typically 0.5 to 2.0
-        # Shear (theta[:, 0, 1] and theta[:, 1, 0]): typically -0.5 to 0.5
-        # Translation (theta[:, 0, 2] and theta[:, 1, 2]): typically -1.0 to 1.0
-        theta = torch.clamp(theta, min=-3.0, max=3.0)
+        # CRITICAL FIX: Use tanh-based bounding for smooth gradients and guaranteed bounds
+        # This prevents gradient explosion from unbounded affine parameters
+        # tanh provides smooth saturation (unlike hard clamp) and stable gradients
+        
+        # Scale components (indices [0,0] and [1,1]): bound to [0.5, 1.5] via tanh
+        # This allows reasonable scaling while preventing extreme values
+        # Formula: scale = 1.0 + 0.5 * tanh(raw) => range [0.5, 1.5]
+        scale_x = 1.0 + 0.5 * torch.tanh(theta_raw[:, 0, 0])
+        scale_y = 1.0 + 0.5 * torch.tanh(theta_raw[:, 1, 1])
+        
+        # Shear components (indices [0,1] and [1,0]): bound to [-0.3, 0.3]
+        # Shear should be small for license plate rectification
+        # Formula: shear = 0.3 * tanh(raw) => range [-0.3, 0.3]
+        shear_x = 0.3 * torch.tanh(theta_raw[:, 0, 1])
+        shear_y = 0.3 * torch.tanh(theta_raw[:, 1, 0])
+        
+        # Translation components (indices [0,2] and [1,2]): bound to [-0.5, 0.5]
+        # Translation should be bounded to prevent sampling outside image
+        # Formula: trans = 0.5 * tanh(raw) => range [-0.5, 0.5]
+        trans_x = 0.5 * torch.tanh(theta_raw[:, 0, 2])
+        trans_y = 0.5 * torch.tanh(theta_raw[:, 1, 2])
+        
+        # Construct bounded theta matrix
+        theta = torch.stack([
+            torch.stack([scale_x, shear_x, trans_x], dim=1),
+            torch.stack([shear_y, scale_y, trans_y], dim=1)
+        ], dim=1)
         
         return theta
 
