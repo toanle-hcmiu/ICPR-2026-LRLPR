@@ -827,6 +827,72 @@ def train_stage(
             for key, value in val_losses.items():
                 writer.add_scalar(f'val/{key}', value, epoch)
             
+            # ============================================
+            # Visualize Super-Resolution Samples
+            # ============================================
+            # Only visualize during stages where SR model is trained
+            # Log sample images every N epochs (configurable)
+            vis_interval = 5  # Visualize every 5 epochs
+            num_vis_samples = 4  # Number of samples to visualize
+            
+            if stage in ['restoration', 'full'] and ((epoch + 1) % vis_interval == 0 or epoch == 0):
+                model.eval()
+                with torch.no_grad():
+                    # Get a batch from validation loader
+                    vis_batch = next(iter(val_loader))
+                    vis_lr = vis_batch['lr_frames'][:num_vis_samples].to(device)
+                    vis_hr_gt = vis_batch['hr_image'][:num_vis_samples].to(device)
+                    vis_text = vis_batch['text'][:num_vis_samples]
+                    vis_text_indices = vis_batch['text_indices'][:num_vis_samples].to(device)
+                    
+                    # Get model outputs
+                    vis_outputs = model(vis_lr, vis_text_indices, return_intermediates=True)
+                    vis_hr_pred = vis_outputs['hr_image']
+                    
+                    # Denormalize images from [-1, 1] to [0, 1] for visualization
+                    vis_lr_first = (vis_lr[:, 0, :, :, :] + 1) / 2  # Take first frame
+                    vis_hr_gt_norm = (vis_hr_gt + 1) / 2
+                    vis_hr_pred_norm = (vis_hr_pred + 1) / 2
+                    
+                    # Clamp to valid range
+                    vis_lr_first = torch.clamp(vis_lr_first, 0, 1)
+                    vis_hr_gt_norm = torch.clamp(vis_hr_gt_norm, 0, 1)
+                    vis_hr_pred_norm = torch.clamp(vis_hr_pred_norm, 0, 1)
+                    
+                    # Upsample LR for comparison (so all images are same size)
+                    import torch.nn.functional as F_vis
+                    vis_lr_upsampled = F_vis.interpolate(
+                        vis_lr_first, 
+                        size=vis_hr_gt_norm.shape[2:], 
+                        mode='bilinear', 
+                        align_corners=False
+                    )
+                    
+                    # Log to TensorBoard as image grids
+                    from torchvision.utils import make_grid
+                    
+                    # Create comparison: LR (upsampled) | Predicted HR | Ground Truth HR
+                    for i in range(min(num_vis_samples, vis_hr_pred_norm.size(0))):
+                        comparison = torch.stack([
+                            vis_lr_upsampled[i],
+                            vis_hr_pred_norm[i],
+                            vis_hr_gt_norm[i]
+                        ], dim=0)
+                        grid = make_grid(comparison, nrow=3, padding=2, normalize=False)
+                        writer.add_image(
+                            f'samples/{vis_text[i]}_LR_Pred_GT', 
+                            grid, 
+                            epoch
+                        )
+                    
+                    # Also create a combined grid of all samples
+                    all_pred = make_grid(vis_hr_pred_norm, nrow=num_vis_samples, padding=2)
+                    all_gt = make_grid(vis_hr_gt_norm, nrow=num_vis_samples, padding=2)
+                    writer.add_image('samples/all_predicted_HR', all_pred, epoch)
+                    writer.add_image('samples/all_ground_truth_HR', all_gt, epoch)
+                    
+                    logger.info(f"Logged {num_vis_samples} SR visualization samples to TensorBoard")
+            
             # Save best model
             if plate_acc > best_acc:
                 best_acc = plate_acc
