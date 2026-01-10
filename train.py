@@ -1023,23 +1023,64 @@ def main():
             transform=None  # We'll handle transforms separately
         )
         
-        # Calculate split sizes
         total_size = len(full_dataset)
-        val_size = int(total_size * val_split_ratio)
-        test_size = int(total_size * test_split_ratio)
-        train_size = total_size - val_size - test_size
         
-        # Random split with fixed seed for reproducibility
-        generator = torch.Generator().manual_seed(config.training.seed)
-        train_indices, val_indices, test_indices = random_split(
-            range(total_size), 
-            [train_size, val_size, test_size],
-            generator=generator
-        )
+        # ============================================
+        # Stratified Split by Scenario and Plate Type
+        # ============================================
+        # Group samples by their stratification key (scenario + plate_type)
+        from collections import defaultdict
+        import random as py_random
+        
+        strata_groups = defaultdict(list)
+        for idx, sample in enumerate(full_dataset.samples):
+            # Extract scenario from track_dir path (e.g., "Scenario-A")
+            track_dir = sample.get('track_dir', sample.get('image_path', ''))
+            scenario = 'unknown'
+            for part in Path(track_dir).parts:
+                if part.startswith('Scenario-'):
+                    scenario = part
+                    break
+            
+            # Get plate type
+            plate_type = sample.get('layout', 'unknown')
+            
+            # Create stratification key
+            strata_key = f"{scenario}_{plate_type}"
+            strata_groups[strata_key].append(idx)
+        
+        # Log strata distribution
+        logger.info(f"Found {len(strata_groups)} stratification groups:")
+        for key, indices in sorted(strata_groups.items()):
+            logger.info(f"  {key}: {len(indices)} samples")
+        
+        # Split each stratum proportionally
+        py_random.seed(config.training.seed)
+        train_indices = []
+        val_indices = []
+        test_indices = []
+        
+        for strata_key, indices in strata_groups.items():
+            py_random.shuffle(indices)
+            n = len(indices)
+            n_val = max(1, int(n * val_split_ratio)) if n > 2 else 0
+            n_test = max(1, int(n * test_split_ratio)) if n > 2 else 0
+            n_train = n - n_val - n_test
+            
+            train_indices.extend(indices[:n_train])
+            val_indices.extend(indices[n_train:n_train + n_val])
+            test_indices.extend(indices[n_train + n_val:])
+        
+        # Shuffle within each set for training
+        py_random.shuffle(train_indices)
+        py_random.shuffle(val_indices)
+        py_random.shuffle(test_indices)
+        
+        logger.info(f"Stratified split: {len(train_indices)} train, {len(val_indices)} val, {len(test_indices)} test")
         
         # Save test indices for later evaluation
         test_indices_path = os.path.join(output_dir, 'test_indices.pt')
-        torch.save(test_indices.indices, test_indices_path)
+        torch.save(test_indices, test_indices_path)
         logger.info(f"Saved {len(test_indices)} test indices to {test_indices_path}")
         
         # For proper augmentation, we create two dataset instances
@@ -1059,8 +1100,8 @@ def main():
         )
         
         # Apply the split indices (train and val only - test is saved for later)
-        train_dataset.samples = [train_dataset.samples[i] for i in train_indices.indices]
-        val_dataset.samples = [val_dataset.samples[i] for i in val_indices.indices]
+        train_dataset.samples = [train_dataset.samples[i] for i in train_indices]
+        val_dataset.samples = [val_dataset.samples[i] for i in val_indices]
         
         logger.info(f"Split complete: {len(train_dataset)} train, {len(val_dataset)} val samples")
     elif not os.path.exists(train_dir) or not os.path.exists(val_dir):
