@@ -976,8 +976,12 @@ def main():
     test_split_ratio = args.test_split
     train_split_ratio = 1.0 - val_split_ratio - test_split_ratio
     
+    # Determine the data source directory for dynamic splitting
+    # Priority: 1) Pre-split folders, 2) Single train folder, 3) Root data folder, 4) Synthetic
+    data_source_dir = None
+    
     if os.path.exists(train_dir) and os.path.exists(val_dir):
-        # Pre-split folder structure exists - use it
+        # Pre-split folder structure exists - use it directly
         logger.info("Using pre-split data folders (train/ and val/)")
         train_dataset = RodoSolDataset(
             train_dir,
@@ -992,18 +996,27 @@ def main():
             lr_size=(config.data.lr_height, config.data.lr_width),
             hr_size=(config.data.hr_height, config.data.hr_width)
         )
+    elif os.path.exists(train_dir) and not os.path.exists(val_dir):
+        # Only train folder exists - use it for dynamic splitting
+        data_source_dir = train_dir
+        logger.info(f"Found train folder only, will split dynamically from: {train_dir}")
     elif os.path.exists(args.data_dir) and (
         list(Path(args.data_dir).glob('Scenario-*')) or 
         (Path(args.data_dir) / 'annotations.json').exists() or
         list(Path(args.data_dir).glob('*.jpg')) or
         list(Path(args.data_dir).glob('*.png'))
     ):
-        # Single folder with data - dynamically split into train/val/test
+        # Root data folder has data directly
+        data_source_dir = args.data_dir
+        logger.info(f"Found data in root folder, will split dynamically from: {args.data_dir}")
+    
+    # Handle dynamic splitting if data_source_dir was set
+    if data_source_dir is not None:
         logger.info(f"Dynamically splitting data: {train_split_ratio:.0%} train / {val_split_ratio:.0%} val / {test_split_ratio:.0%} test")
         
         # Load full dataset
         full_dataset = RodoSolDataset(
-            args.data_dir,
+            data_source_dir,
             num_frames=config.model.num_frames,
             lr_size=(config.data.lr_height, config.data.lr_width),
             hr_size=(config.data.hr_height, config.data.hr_width),
@@ -1031,14 +1044,14 @@ def main():
         
         # For proper augmentation, we create two dataset instances
         train_dataset = RodoSolDataset(
-            args.data_dir,
+            data_source_dir,
             num_frames=config.model.num_frames,
             lr_size=(config.data.lr_height, config.data.lr_width),
             hr_size=(config.data.hr_height, config.data.hr_width),
             transform=augmentation
         )
         val_dataset = RodoSolDataset(
-            args.data_dir,
+            data_source_dir,
             num_frames=config.model.num_frames,
             lr_size=(config.data.lr_height, config.data.lr_width),
             hr_size=(config.data.hr_height, config.data.hr_width),
@@ -1050,7 +1063,8 @@ def main():
         val_dataset.samples = [val_dataset.samples[i] for i in val_indices.indices]
         
         logger.info(f"Split complete: {len(train_dataset)} train, {len(val_dataset)} val samples")
-    else:
+    elif not os.path.exists(train_dir) or not os.path.exists(val_dir):
+        # Neither pre-split folders nor data found - use synthetic data
         logger.warning("Data directory not found, using synthetic data")
         train_dataset = SyntheticLPRDataset(
             num_samples=10000,
