@@ -25,7 +25,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, random_split
 from torch.utils.tensorboard import SummaryWriter
 from torch.amp import autocast, GradScaler
 from tqdm import tqdm
@@ -907,6 +907,10 @@ def main():
     parser.add_argument('--no-ema', action='store_true', help='Disable EMA model averaging')
     parser.add_argument('--early-stopping', type=int, default=0, 
                         help='Early stopping patience (0 to disable)')
+    parser.add_argument('--val-split', type=float, default=0.1,
+                        help='Validation split ratio when using single data folder (default: 0.1)')
+    parser.add_argument('--test-split', type=float, default=0.1,
+                        help='Test split ratio when using single data folder (default: 0.1)')
     args = parser.parse_args()
     
     # Load config
@@ -962,10 +966,19 @@ def main():
         augmentation = None
     
     # Check if data directory exists, use synthetic data if not
+    # Support both pre-split folders (data/train, data/val) and single folder (data/)
     train_dir = os.path.join(args.data_dir, 'train')
     val_dir = os.path.join(args.data_dir, 'val')
     
-    if os.path.exists(train_dir):
+    # Split ratios for validation and test (when using single data folder)
+    # Default: 80% train, 10% val, 10% test
+    val_split_ratio = args.val_split
+    test_split_ratio = args.test_split
+    train_split_ratio = 1.0 - val_split_ratio - test_split_ratio
+    
+    if os.path.exists(train_dir) and os.path.exists(val_dir):
+        # Pre-split folder structure exists - use it
+        logger.info("Using pre-split data folders (train/ and val/)")
         train_dataset = RodoSolDataset(
             train_dir,
             num_frames=config.model.num_frames,
@@ -979,6 +992,64 @@ def main():
             lr_size=(config.data.lr_height, config.data.lr_width),
             hr_size=(config.data.hr_height, config.data.hr_width)
         )
+    elif os.path.exists(args.data_dir) and (
+        list(Path(args.data_dir).glob('Scenario-*')) or 
+        (Path(args.data_dir) / 'annotations.json').exists() or
+        list(Path(args.data_dir).glob('*.jpg')) or
+        list(Path(args.data_dir).glob('*.png'))
+    ):
+        # Single folder with data - dynamically split into train/val/test
+        logger.info(f"Dynamically splitting data: {train_split_ratio:.0%} train / {val_split_ratio:.0%} val / {test_split_ratio:.0%} test")
+        
+        # Load full dataset
+        full_dataset = RodoSolDataset(
+            args.data_dir,
+            num_frames=config.model.num_frames,
+            lr_size=(config.data.lr_height, config.data.lr_width),
+            hr_size=(config.data.hr_height, config.data.hr_width),
+            transform=None  # We'll handle transforms separately
+        )
+        
+        # Calculate split sizes
+        total_size = len(full_dataset)
+        val_size = int(total_size * val_split_ratio)
+        test_size = int(total_size * test_split_ratio)
+        train_size = total_size - val_size - test_size
+        
+        # Random split with fixed seed for reproducibility
+        generator = torch.Generator().manual_seed(config.training.seed)
+        train_indices, val_indices, test_indices = random_split(
+            range(total_size), 
+            [train_size, val_size, test_size],
+            generator=generator
+        )
+        
+        # Save test indices for later evaluation
+        test_indices_path = os.path.join(output_dir, 'test_indices.pt')
+        torch.save(test_indices.indices, test_indices_path)
+        logger.info(f"Saved {len(test_indices)} test indices to {test_indices_path}")
+        
+        # For proper augmentation, we create two dataset instances
+        train_dataset = RodoSolDataset(
+            args.data_dir,
+            num_frames=config.model.num_frames,
+            lr_size=(config.data.lr_height, config.data.lr_width),
+            hr_size=(config.data.hr_height, config.data.hr_width),
+            transform=augmentation
+        )
+        val_dataset = RodoSolDataset(
+            args.data_dir,
+            num_frames=config.model.num_frames,
+            lr_size=(config.data.lr_height, config.data.lr_width),
+            hr_size=(config.data.hr_height, config.data.hr_width),
+            transform=None  # No augmentation for validation
+        )
+        
+        # Apply the split indices (train and val only - test is saved for later)
+        train_dataset.samples = [train_dataset.samples[i] for i in train_indices.indices]
+        val_dataset.samples = [val_dataset.samples[i] for i in val_indices.indices]
+        
+        logger.info(f"Split complete: {len(train_dataset)} train, {len(val_dataset)} val samples")
     else:
         logger.warning("Data directory not found, using synthetic data")
         train_dataset = SyntheticLPRDataset(
