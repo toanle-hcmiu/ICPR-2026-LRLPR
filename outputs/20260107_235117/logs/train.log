@@ -1,0 +1,20 @@
+2026-01-07 23:51:17,242 - INFO - Using device: cuda
+2026-01-07 23:51:33,632 - INFO - Train dataset size: 20000
+2026-01-07 23:51:33,632 - INFO - Val dataset size: 0
+2026-01-07 23:51:33,639 - INFO - Model: NeuroSymbolicLPR
+2026-01-07 23:51:33,640 - INFO - Total parameters: 26,689,838
+2026-01-07 23:51:33,641 - INFO - Trainable parameters: 26,689,838
+2026-01-07 23:51:33,641 - INFO -   encoder: 4,687,296 params
+2026-01-07 23:51:33,642 - INFO -   stn: 440,366 params
+2026-01-07 23:51:33,643 - INFO -   multi_frame_stn: 440,366 params
+2026-01-07 23:51:33,643 - INFO -   layout_classifier: 730,945 params
+2026-01-07 23:51:33,644 - INFO -   quality_fusion: 836,225 params
+2026-01-07 23:51:33,644 - INFO -   feature_to_image: 1,478,403 params
+2026-01-07 23:51:33,649 - INFO -   generator: 18,516,603 params
+2026-01-07 23:51:34,838 - INFO -   recognizer: 24,006,183 params
+2026-01-07 23:51:34,839 - INFO -   syntax_mask: 0 params
+2026-01-07 23:51:34,840 - INFO - Stage stn: Using batch size 32
+2026-01-07 23:51:34,840 - INFO - Starting training stage: stn
+2026-01-07 23:51:34,840 - INFO -   Mixed precision: True
+2026-01-07 23:51:34,840 - INFO -   EMA: True
+2026-01-07 23:51:34,840 - INFO -   Early stopping patience: 0
