@@ -1003,7 +1003,7 @@ def main():
     
     # Start TensorBoard in background for JupyterLab access
     import subprocess
-    tensorboard_port = 6006
+    tensorboard_port = 6007
     try:
         tb_process = subprocess.Popen(
             ['tensorboard', '--logdir', output_dir, '--port', str(tensorboard_port), '--bind_all'],
