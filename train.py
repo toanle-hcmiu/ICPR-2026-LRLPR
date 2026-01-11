@@ -1001,6 +1001,21 @@ def main():
     logger = setup_logging(log_dir)
     writer = SummaryWriter(log_dir)
     
+    # Start TensorBoard in background for JupyterLab access
+    import subprocess
+    tensorboard_port = 6006
+    try:
+        tb_process = subprocess.Popen(
+            ['tensorboard', '--logdir', output_dir, '--port', str(tensorboard_port), '--bind_all'],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        logger.info(f"TensorBoard started on port {tensorboard_port}")
+        logger.info(f"Access via: https://toanle.cvip.id.vn/proxy/{tensorboard_port}/")
+    except Exception as e:
+        logger.warning(f"Could not start TensorBoard: {e}")
+        logger.info(f"TensorBoard logs directory: {log_dir}")
+    
     # Setup device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logger.info(f"Using device: {device}")

@@ -613,6 +613,13 @@ class CompositeLoss(nn.Module):
             loss_dict = {}
             total_loss = None
             
+            # Get a reference tensor that definitely has gradients for fallback
+            ref_tensor = None
+            for k, v in outputs.items():
+                if isinstance(v, torch.Tensor) and v.requires_grad:
+                    ref_tensor = v
+                    break
+            
             # Check for NaN in all outputs first - early exit if model is corrupted
             outputs_have_nan = any(
                 torch.isnan(v).any() or torch.isinf(v).any() 
@@ -622,8 +629,13 @@ class CompositeLoss(nn.Module):
             
             if outputs_have_nan:
                 # Model outputs are corrupted, return zero loss with gradient
-                any_output = next(v for v in outputs.values() if isinstance(v, torch.Tensor))
-                zero_loss = any_output.sum() * 0.0
+                # Must use a tensor that requires_grad to maintain gradient flow
+                if ref_tensor is not None:
+                    zero_loss = ref_tensor.sum() * 0.0
+                else:
+                    # Last resort: create a new tensor with requires_grad
+                    any_output = next(v for v in outputs.values() if isinstance(v, torch.Tensor))
+                    zero_loss = (any_output.detach() * 0.0).sum().requires_grad_(True)
                 loss_dict['total'] = 0.0
                 loss_dict['pixel'] = 0.0
                 return zero_loss, loss_dict
@@ -657,11 +669,25 @@ class CompositeLoss(nn.Module):
             
             # If no loss was computed, create zero loss with gradient
             if total_loss is None:
-                if 'hr_image' in outputs:
+                if ref_tensor is not None:
+                    total_loss = ref_tensor.sum() * 0.0
+                elif 'hr_image' in outputs:
                     total_loss = outputs['hr_image'].sum() * 0.0
                 else:
                     any_output = next(iter(outputs.values()))
-                    total_loss = any_output.sum() * 0.0
+                    if isinstance(any_output, torch.Tensor):
+                        total_loss = any_output.sum() * 0.0
+                    else:
+                        # Create a minimal grad-enabled tensor
+                        total_loss = torch.tensor(0.0, requires_grad=True, device=next(iter(outputs.values())).device if outputs else 'cuda')
+            
+            # Ensure total_loss requires grad
+            if not total_loss.requires_grad:
+                # This shouldn't happen, but add safeguard
+                if ref_tensor is not None:
+                    total_loss = total_loss + ref_tensor.sum() * 0.0
+                else:
+                    total_loss = total_loss.requires_grad_(True)
             
             # Final clamp
             total_loss = self._clamp_loss(total_loss, max_val=100.0)
