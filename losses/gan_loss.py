@@ -91,6 +91,11 @@ class GANLoss(nn.Module):
         Returns:
             GAN loss value.
         """
+        # Clamp predictions to prevent NaN from extreme values
+        # BCEWithLogitsLoss can produce NaN when sigmoid(x) -> 0 or 1
+        # Clamping to [-15, 15] keeps sigmoid in safe range [~3e-7, ~1-3e-7]
+        prediction = torch.clamp(prediction, min=-15.0, max=15.0)
+        
         if self.gan_mode in ['vanilla', 'lsgan']:
             target_tensor = self.get_target_tensor(prediction, target_is_real)
             loss = self.loss(prediction, target_tensor)

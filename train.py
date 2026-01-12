@@ -24,6 +24,7 @@ import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, random_split
 from torch.utils.tensorboard import SummaryWriter
@@ -256,9 +257,11 @@ def train_epoch(
     stage: str,
     writer: Optional[SummaryWriter] = None,
     logger: Optional[logging.Logger] = None,
-    scaler: Optional[GradScaler] = None,
+    scaler_g: Optional[GradScaler] = None,
+    scaler_d: Optional[GradScaler] = None,
     ema: Optional[EMA] = None,
-    grad_clip_norm: float = 1.0
+    grad_clip_norm: float = 1.0,
+    total_epochs: int = 20
 ) -> Dict[str, float]:
     """
     Train for one epoch with optional mixed precision.
@@ -275,9 +278,11 @@ def train_epoch(
         stage: Training stage.
         writer: TensorBoard writer.
         logger: Logger instance.
-        scaler: GradScaler for mixed precision training.
+        scaler_g: GradScaler for generator mixed precision training.
+        scaler_d: GradScaler for discriminator mixed precision training.
         ema: EMA model for weight averaging.
         grad_clip_norm: Maximum norm for gradient clipping.
+        total_epochs: Total epochs for this stage (for noise decay).
         
     Returns:
         Dictionary of average losses.
@@ -288,10 +293,18 @@ def train_epoch(
     
     epoch_losses = {}
     num_batches = len(dataloader)
-    use_amp = scaler is not None
+    use_amp = scaler_g is not None
     nan_batch_count = 0
     max_nan_batches = 10  # Stop epoch if too many NaN batches
     scaler_reset_threshold = 5  # Reset scaler if too many NaN batches in a row
+    
+    # GAN training stabilization parameters
+    label_smoothing_real = 0.9  # Smooth real labels to prevent overconfidence
+    label_smoothing_fake = 0.0  # Keep fake labels at 0
+    d_update_freq = 1  # Update D every N batches (will increase if D too strong)
+    r1_gamma = 10.0  # R1 gradient penalty weight
+    # Instance noise: start at 0.1, decay to 0 over training
+    instance_noise_std = max(0.0, 0.1 * (1.0 - epoch / max(total_epochs, 1)))
     
     pbar = tqdm(dataloader, desc=f'Epoch {epoch}')
     
@@ -319,6 +332,7 @@ def train_epoch(
         # STN grid generation and affine transformations are highly sensitive to
         # precision loss in FP16, causing NaN/Inf gradients and training collapse
         use_amp_for_batch = use_amp and (stage != 'stn')
+        scaler = scaler_g  # Use generator scaler for main forward pass
         
         with autocast('cuda', enabled=use_amp_for_batch):
             outputs = model(lr_frames, return_intermediates=True)
@@ -408,38 +422,80 @@ def train_epoch(
         
         # Update discriminator if available and in appropriate stage
         if discriminator is not None and optimizer_d is not None and stage in ['restoration', 'full']:
+            # Skip D update based on frequency control
+            should_update_d = (batch_idx % d_update_freq == 0)
+            
             # Get real and fake images
-            real_hr = targets['hr_image']
-            fake_hr = outputs['hr_image'].detach()
+            real_hr = targets['hr_image'].clone()
+            fake_hr = outputs['hr_image'].detach().clone()
+            
+            # Add instance noise for training stability (decays over epochs)
+            if instance_noise_std > 0:
+                real_hr = real_hr + torch.randn_like(real_hr) * instance_noise_std
+                fake_hr = fake_hr + torch.randn_like(fake_hr) * instance_noise_std
             
             with autocast('cuda', enabled=use_amp):
                 # Discriminator forward
                 pred_real = discriminator(real_hr)
                 pred_fake = discriminator(fake_hr)
                 
-                # Discriminator loss
-                gan_loss = GANLoss('vanilla')
-                loss_d = (
-                    gan_loss(pred_real, target_is_real=True) +
-                    gan_loss(pred_fake, target_is_real=False)
-                ) / 2
+                # Discriminator loss with label smoothing
+                # Create smoothed target tensors
+                real_target = torch.full_like(pred_real, label_smoothing_real)
+                fake_target = torch.full_like(pred_fake, label_smoothing_fake)
+                
+                # Clamp predictions for numerical stability
+                pred_real_clamped = torch.clamp(pred_real, -15.0, 15.0)
+                pred_fake_clamped = torch.clamp(pred_fake, -15.0, 15.0)
+                
+                loss_d_real = F.binary_cross_entropy_with_logits(pred_real_clamped, real_target)
+                loss_d_fake = F.binary_cross_entropy_with_logits(pred_fake_clamped, fake_target)
+                loss_d = (loss_d_real + loss_d_fake) / 2
             
-            # Check for NaN discriminator loss
-            if not check_for_nan(loss_d, "loss_d"):
+            # Check D strength: if D is too strong, reduce update frequency
+            d_acc_real = (torch.sigmoid(pred_real) > 0.5).float().mean().item()
+            d_acc_fake = (torch.sigmoid(pred_fake) < 0.5).float().mean().item()
+            d_accuracy = (d_acc_real + d_acc_fake) / 2
+            
+            # Adaptive D update frequency: skip more often if D is winning
+            if d_accuracy > 0.9 and d_update_freq < 5:
+                d_update_freq = min(5, d_update_freq + 1)
+            elif d_accuracy < 0.7 and d_update_freq > 1:
+                d_update_freq = max(1, d_update_freq - 1)
+            
+            # Check for NaN discriminator loss and update if valid
+            if not check_for_nan(loss_d, "loss_d") and should_update_d:
                 optimizer_d.zero_grad()
-                if use_amp:
-                    scaler.scale(loss_d).backward()
-                    scaler.unscale_(optimizer_d)
+                
+                # R1 gradient penalty on real images (every 16 batches to save compute)
+                r1_penalty = torch.tensor(0.0, device=device)
+                if batch_idx % 16 == 0:
+                    real_hr_gp = targets['hr_image'].clone().requires_grad_(True)
+                    with autocast('cuda', enabled=False):  # Disable AMP for gradient penalty
+                        pred_real_gp = discriminator(real_hr_gp)
+                        grad_real = torch.autograd.grad(
+                            outputs=pred_real_gp.sum(),
+                            inputs=real_hr_gp,
+                            create_graph=True,
+                            retain_graph=True
+                        )[0]
+                        r1_penalty = grad_real.pow(2).view(grad_real.shape[0], -1).sum(1).mean()
+                    loss_d = loss_d + r1_gamma * r1_penalty
+                
+                if use_amp and scaler_d is not None:
+                    scaler_d.scale(loss_d).backward()
+                    scaler_d.unscale_(optimizer_d)
                     torch.nn.utils.clip_grad_norm_(discriminator.parameters(), max_norm=grad_clip_norm)
-                    scaler.step(optimizer_d)
-                    scaler.update()
+                    scaler_d.step(optimizer_d)
+                    scaler_d.update()
                 else:
                     loss_d.backward()
                     torch.nn.utils.clip_grad_norm_(discriminator.parameters(), max_norm=grad_clip_norm)
                     optimizer_d.step()
                 
                 loss_dict['loss_d'] = loss_d.item()
-            else:
+                loss_dict['d_accuracy'] = d_accuracy
+            elif check_for_nan(loss_d, "loss_d"):
                 if logger is not None:
                     logger.warning(f"Epoch {epoch}, Batch {batch_idx}: NaN discriminator loss, skipping D update")
         
@@ -752,17 +808,21 @@ def train_stage(
     optimizer_d = None
     
     if discriminator is not None and stage in ['restoration', 'full']:
+        # Select appropriate LR based on stage
+        lr_d = config.training.lr_restoration if stage == 'restoration' else config.training.lr_finetune
+        
         optimizer_d = optim.Adam(
             discriminator.parameters(),
-            lr=config.training.lr_restoration,
+            lr=lr_d,
             betas=config.training.betas
         )
     
     # Create scheduler
     scheduler = create_scheduler(optimizer_g, num_epochs, config)
     
-    # Create GradScaler for mixed precision
-    scaler = GradScaler('cuda') if use_amp and device.type == 'cuda' else None
+    # Create separate GradScalers for G and D to prevent scale interference
+    scaler_g = GradScaler('cuda') if use_amp and device.type == 'cuda' else None
+    scaler_d = GradScaler('cuda') if use_amp and device.type == 'cuda' and discriminator is not None else None
     
     # Create EMA model
     ema = EMA(model) if use_ema else None
@@ -779,7 +839,8 @@ def train_stage(
         train_losses = train_epoch(
             model, discriminator, train_loader, criterion,
             optimizer_g, optimizer_d, device, epoch, stage, writer, logger,
-            scaler=scaler, ema=ema, grad_clip_norm=grad_clip_norm
+            scaler_g=scaler_g, scaler_d=scaler_d, ema=ema, grad_clip_norm=grad_clip_norm,
+            total_epochs=num_epochs
         )
         
         # Log training losses
