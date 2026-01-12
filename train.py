@@ -34,7 +34,7 @@ import yaml
 
 from config import Config, get_default_config
 from models import NeuroSymbolicLPR, PatchDiscriminator
-from losses import CompositeLoss, CornerLoss, GANLoss
+from losses import CompositeLoss, CornerLoss, GANLoss, ConfusionMatrixTracker
 from losses.composite_loss import StagedTrainingManager
 from data import RodoSolDataset, SyntheticLPRDataset, LPRAugmentation, lpr_collate_fn
 
@@ -146,6 +146,9 @@ def create_optimizer(
         Configured optimizer.
     """
     param_groups = model.get_trainable_params(stage)
+    
+    # Filter out None param groups (e.g., from optional modules)
+    param_groups = [g for g in param_groups if g is not None]
     
     # Adjust learning rates based on lr_scale if present
     base_lr = {
@@ -567,6 +570,10 @@ def validate(
     total_chars = 0
     valid_layout_samples = 0  # Count samples with valid layout labels
     
+    # Confusion matrix tracking for LCOFL weight updates
+    # Check if criterion has LCOFL loss with confusion tracker
+    has_lcofl = hasattr(criterion, 'lcofl_loss') and criterion.lcofl_loss is not None
+    
     with torch.no_grad():
         for batch in tqdm(dataloader, desc='Validating'):
             lr_frames = batch['lr_frames'].to(device)
@@ -636,6 +643,10 @@ def validate(
                     layout_preds = (torch.sigmoid(outputs['layout_logits']) > 0.5).long().squeeze(-1)
                     correct_layout += (layout_preds[valid_layout_mask] == layout[valid_layout_mask]).sum().item()
                     valid_layout_samples += valid_layout_mask.sum().item()
+            
+            # Update confusion matrix for LCOFL (tracks confused character pairs)
+            if has_lcofl:
+                criterion.lcofl_loss.update_confusion_matrix(predictions, target_chars)
     
     # Average losses
     num_batches = len(dataloader)
@@ -648,6 +659,21 @@ def validate(
         'char_accuracy': correct_chars / total_chars if total_chars > 0 else 0.0,
         'layout_accuracy': correct_layout / valid_layout_samples if valid_layout_samples > 0 else 0.0,
     }
+    
+    # Finalize LCOFL confusion matrix weights for next epoch
+    # and add confused pairs to metrics for logging
+    if has_lcofl:
+        # Update character weights based on confusion matrix
+        criterion.lcofl_loss.finalize_epoch_weights(threshold=0.05)
+        
+        # Get confused character pairs for logging
+        confused_pairs = criterion.lcofl_loss.get_confused_pairs(threshold=0.05)
+        if confused_pairs:
+            # Add top 5 confused pairs to metrics for logging
+            metrics['confused_pairs'] = confused_pairs[:5]
+        
+        # Reset confusion matrix for next epoch
+        criterion.lcofl_loss.reset_confusion_matrix()
     
     return total_losses, metrics
 

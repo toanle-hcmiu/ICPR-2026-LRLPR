@@ -9,6 +9,16 @@ from .swinir import SwinIRGenerator, LightweightSRGenerator
 from .discriminator import PatchDiscriminator, MultiScaleDiscriminator
 from .parseq import PARSeqRecognizer, PretrainedPARSeq, load_pretrained_parseq
 from .syntax_mask import SyntaxMaskLayer
+from .deformable_conv import DeformableConv2d, DeformableConv2dSimple, create_deformable_conv
+from .shared_attention import (
+    SharedAttentionModule,
+    PixelLevelAttentionBlock,
+    ChannelAttentionUnit,
+    PositionalAttentionUnit,
+    GeometricalPerceptionUnit,
+    SubPixelConvolutionBlock,
+    create_shared_attention_network,
+)
 
 __all__ = [
     'NeuroSymbolicLPR',
@@ -28,4 +38,17 @@ __all__ = [
     'PretrainedPARSeq',
     'load_pretrained_parseq',
     'SyntaxMaskLayer',
+    # Deformable convolutions
+    'DeformableConv2d',
+    'DeformableConv2dSimple',
+    'create_deformable_conv',
+    # Shared attention
+    'SharedAttentionModule',
+    'PixelLevelAttentionBlock',
+    'ChannelAttentionUnit',
+    'PositionalAttentionUnit',
+    'GeometricalPerceptionUnit',
+    'SubPixelConvolutionBlock',
+    'create_shared_attention_network',
 ]
+

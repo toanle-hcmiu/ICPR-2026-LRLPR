@@ -16,6 +16,9 @@ This system recognizes Brazilian license plates in two formats:
 - **GAN Super-Resolution**: Full SwinIR-based image restoration (6 RSTB blocks, 180 embed dim)
 - **Pretrained PARSeq**: Uses pretrained PARSeq from [baudm/parseq](https://github.com/baudm/parseq) for state-of-the-art OCR
 - **Syntax-Masked Recognition**: Enforces valid plate formats using symbolic constraints
+- **LCOFL Loss**: Layout and Character Oriented Focal Loss with SSIM and confusion matrix tracking
+- **Deformable Convolutions**: Adaptive spatial sampling for better character handling
+- **Shared Attention Module**: PLTFAM-style attention with shared weights across blocks
 - **Mixed Precision Training**: 2x faster training with automatic mixed precision (AMP)
 - **EMA Model Averaging**: Exponential moving average for more stable final models
 - **Stage-Aware Validation**: Prevents NaN losses during staged training
@@ -241,14 +244,17 @@ ICPR-2026-LRLPR/
 │   ├── swinir.py             # Full SwinIR generator
 │   ├── discriminator.py      # PatchGAN discriminator
 │   ├── parseq.py             # PARSeq wrapper (pretrained + custom fallback)
-│   └── syntax_mask.py        # Dynamic syntax mask with soft inference
+│   ├── syntax_mask.py        # Dynamic syntax mask with soft inference
+│   ├── deformable_conv.py    # Deformable Convolution v2
+│   └── shared_attention.py   # PLTFAM-style shared attention module
 │
 ├── losses/
 │   ├── __init__.py
 │   ├── corner_loss.py        # STN corner supervision
 │   ├── gan_loss.py           # Adversarial losses (vanilla, lsgan, wgan)
 │   ├── composite_loss.py     # Combined loss + SelfSupervisedSTNLoss
-│   └── ocr_perceptual_loss.py # OCR-aware perceptual losses
+│   ├── ocr_perceptual_loss.py # OCR-aware perceptual losses
+│   └── lcofl_loss.py         # LCOFL loss with SSIM and confusion tracking
 │
 ├── data/
 │   ├── __init__.py
@@ -307,6 +313,23 @@ Additional losses in `losses/ocr_perceptual_loss.py`:
 | `OCRAwarePerceptualLoss` | Uses downstream OCR model to guide restoration |
 | `CharacterFocusLoss` | Edge-aware loss using Sobel operators |
 | `MultiScaleOCRLoss` | Evaluates OCR at multiple scales (1.0×, 0.5×, 0.25×) |
+
+### LCOFL Loss (Layout and Character Oriented Focal Loss)
+
+From "Enhancing License Plate Super-Resolution" (Nascimento et al.):
+
+```python
+# Enable in config
+config.training.use_lcofl = True
+config.training.weight_lcofl = 0.5
+```
+
+| Component | Description |
+|-----------|-------------|
+| Classification Loss | Weighted cross-entropy with dynamic character weights |
+| Layout Penalty | Penalizes digit/letter misplacements based on format |
+| SSIM Loss | Structural similarity for image quality |
+| Confusion Tracking | Increases weights for frequently confused character pairs |
 
 ## Plate Format Specifications (Hardcoded)
 
@@ -408,6 +431,15 @@ Annotations format:
 **Bug Fixes:**
 - 🐛 Fixed OCR loss NaN during STN stage validation
 - 🐛 Fixed loss accumulation skipping NaN values
+
+### v1.3.0 (Current)
+
+**LCOFL Paper Implementation:**
+- ✅ LCOFL Loss with 4 components (classification, layout penalty, SSIM, confusion tracking)
+- ✅ Deformable Convolution v2 module
+- ✅ PLTFAM-style Shared Attention Module
+- ✅ Confusion matrix tracking during validation
+- ✅ Dynamic character weight updates based on confusion pairs
 
 ### v1.1.0
 

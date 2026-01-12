@@ -8,6 +8,13 @@ from .ocr_perceptual_loss import (
     CharacterFocusLoss,
     MultiScaleOCRLoss,
 )
+from .lcofl_loss import (
+    LCOFLLoss,
+    LCOFLWithOCR,
+    SSIMLoss,
+    LayoutPenalty,
+    ConfusionMatrixTracker,
+)
 
 __all__ = [
     'CornerLoss',
@@ -19,4 +26,11 @@ __all__ = [
     'OCRAwarePerceptualLoss',
     'CharacterFocusLoss',
     'MultiScaleOCRLoss',
+    # LCOFL losses
+    'LCOFLLoss',
+    'LCOFLWithOCR',
+    'SSIMLoss',
+    'LayoutPenalty',
+    'ConfusionMatrixTracker',
 ]
+

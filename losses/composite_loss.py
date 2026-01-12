@@ -13,6 +13,7 @@ from typing import Dict, Optional, Tuple
 
 from .corner_loss import CornerLoss
 from .gan_loss import GANLoss, PixelLoss, PerceptualLoss
+from .lcofl_loss import LCOFLLoss, SSIMLoss, ConfusionMatrixTracker
 
 
 class SelfSupervisedSTNLoss(nn.Module):
@@ -342,9 +343,14 @@ class CompositeLoss(nn.Module):
         weight_geometry: float = 0.1,
         weight_layout: float = 0.1,
         weight_perceptual: float = 0.0,
+        weight_lcofl: float = 0.0,
+        weight_ssim: float = 0.0,
         gan_mode: str = 'vanilla',
         ocr_loss_type: str = 'cross_entropy',
-        use_perceptual: bool = False
+        use_perceptual: bool = False,
+        use_lcofl: bool = False,
+        lcofl_alpha: float = 1.0,
+        lcofl_beta: float = 2.0
     ):
         """
         Initialize composite loss.
@@ -356,9 +362,14 @@ class CompositeLoss(nn.Module):
             weight_geometry: Weight for geometry/corner loss.
             weight_layout: Weight for layout loss.
             weight_perceptual: Weight for perceptual loss.
+            weight_lcofl: Weight for LCOFL loss (0 to disable).
+            weight_ssim: Weight for SSIM loss (0 to disable).
             gan_mode: Type of GAN loss.
             ocr_loss_type: Type of OCR loss.
             use_perceptual: Whether to use perceptual loss.
+            use_lcofl: Whether to use LCOFL loss.
+            lcofl_alpha: LCOFL penalty increment for confused characters.
+            lcofl_beta: LCOFL layout violation penalty.
         """
         super().__init__()
         
@@ -368,7 +379,9 @@ class CompositeLoss(nn.Module):
             'ocr': weight_ocr,
             'geometry': weight_geometry,
             'layout': weight_layout,
-            'perceptual': weight_perceptual
+            'perceptual': weight_perceptual,
+            'lcofl': weight_lcofl,
+            'ssim': weight_ssim
         }
         
         # Individual losses
@@ -382,6 +395,24 @@ class CompositeLoss(nn.Module):
             self.perceptual_loss = PerceptualLoss()
         else:
             self.perceptual_loss = None
+        
+        # LCOFL loss (from paper: "Enhancing LP Super-Resolution")
+        if use_lcofl or weight_lcofl > 0:
+            self.lcofl_loss = LCOFLLoss(
+                weight_classification=1.0,
+                weight_layout=1.0,
+                weight_ssim=0.3,
+                alpha=lcofl_alpha,
+                beta=lcofl_beta
+            )
+        else:
+            self.lcofl_loss = None
+        
+        # Standalone SSIM loss (can be used without full LCOFL)
+        if weight_ssim > 0 and self.lcofl_loss is None:
+            self.ssim_loss = SSIMLoss()
+        else:
+            self.ssim_loss = None
     
     def forward(
         self,
@@ -475,6 +506,38 @@ class CompositeLoss(nn.Module):
                 l_perceptual = self._clamp_loss(l_perceptual)
                 loss_dict['perceptual'] = self._safe_loss_item(l_perceptual)
                 weighted = self.weights['perceptual'] * l_perceptual
+                total_loss = weighted if total_loss is None else total_loss + weighted
+        
+        # LCOFL loss (from Nascimento et al. paper)
+        if self.lcofl_loss is not None and 'masked_logits' in outputs and 'text_indices' in targets:
+            if not torch.isnan(outputs['masked_logits']).any():
+                # Get layout info for LCOFL
+                is_mercosul = targets.get('layout', torch.zeros(outputs['masked_logits'].size(0), device=outputs['masked_logits'].device))
+                
+                l_lcofl, lcofl_dict = self.lcofl_loss(
+                    logits=outputs['masked_logits'],
+                    targets=targets['text_indices'],
+                    is_mercosul=is_mercosul,
+                    generated_hr=outputs.get('hr_image'),
+                    gt_hr=targets.get('hr_image'),
+                    compute_ssim=self.weights.get('ssim', 0) > 0 or 'hr_image' in targets
+                )
+                l_lcofl = self._clamp_loss(l_lcofl)
+                loss_dict['lcofl'] = self._safe_loss_item(l_lcofl)
+                # Add LCOFL sub-components to loss dict for logging
+                for k, v in lcofl_dict.items():
+                    if k != 'total':
+                        loss_dict[f'lcofl_{k}'] = v
+                weighted = self.weights['lcofl'] * l_lcofl
+                total_loss = weighted if total_loss is None else total_loss + weighted
+        
+        # Standalone SSIM loss (when not using full LCOFL)
+        if self.ssim_loss is not None and 'hr_image' in outputs and 'hr_image' in targets:
+            if not (torch.isnan(outputs['hr_image']).any() or torch.isnan(targets['hr_image']).any()):
+                l_ssim = self.ssim_loss(outputs['hr_image'], targets['hr_image'])
+                l_ssim = self._clamp_loss(l_ssim)
+                loss_dict['ssim'] = self._safe_loss_item(l_ssim)
+                weighted = self.weights['ssim'] * l_ssim
                 total_loss = weighted if total_loss is None else total_loss + weighted
         
         # If no loss computed, create zero loss with gradient

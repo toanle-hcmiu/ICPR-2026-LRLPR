@@ -423,11 +423,15 @@ class NeuroSymbolicLPR(nn.Module):
                 {'params': self.stn.parameters()}
             ]
         elif stage == 'restoration':
+            # Train generator + OCR together so OCR learns as image quality improves
+            # This prevents 0% plate accuracy during restoration stage
             return [
                 {'params': self.generator.parameters()},
                 {'params': self.layout_classifier.parameters()},
                 {'params': self.quality_fusion.parameters()},
-                {'params': self.feature_to_image.parameters()}
+                {'params': self.feature_to_image.parameters()},
+                {'params': self.recognizer.parameters(), 'lr_scale': 0.5},  # Joint OCR training
+                {'params': self.syntax_mask.parameters(), 'lr_scale': 0.5} if hasattr(self.syntax_mask, 'parameters') else None
             ]
         elif stage == 'full':
             return [

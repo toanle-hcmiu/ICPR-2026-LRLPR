@@ -187,6 +187,18 @@ class TrainingConfig:
     weight_ocr: float = 1.0  # Increased from 0.5 - OCR is the main objective
     weight_geometry: float = 0.1
     
+    # LCOFL Loss (from Nascimento et al. "Enhancing LP Super-Resolution" paper)
+    # Set use_lcofl=True to enable Layout and Character Oriented Focal Loss
+    use_lcofl: bool = False  # Enable LCOFL loss
+    weight_lcofl: float = 0.5  # Weight for LCOFL loss
+    weight_ssim: float = 0.3  # Weight for SSIM structural similarity loss
+    lcofl_alpha: float = 1.0  # Penalty increment for confused character pairs
+    lcofl_beta: float = 2.0  # Layout violation penalty
+    
+    # Shared Attention and Deformable Convolutions (from same paper)
+    use_shared_attention: bool = True  # Enable shared attention module
+    use_deformable_conv: bool = True  # Enable deformable convolutions
+    
     # Optimizer
     optimizer: str = 'adamw'
     weight_decay: float = 0.01

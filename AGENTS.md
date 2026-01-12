@@ -33,7 +33,10 @@ LR Frames (5×16×48) → Encoder → STN → Layout+Fusion → SwinIR → PARSe
 | SwinIR | `models/swinir.py` | Super-resolution (4× upscale) |
 | PARSeq | `models/parseq.py` | Character recognition (pretrained) |
 | Syntax Mask | `models/syntax_mask.py` | Enforces valid plate formats |
+| Deformable Conv | `models/deformable_conv.py` | Adaptive spatial sampling |
+| Shared Attention | `models/shared_attention.py` | PLTFAM-style attention module |
 | Composite Loss | `losses/composite_loss.py` | Combined training loss |
+| LCOFL Loss | `losses/lcofl_loss.py` | Layout-aware character-oriented loss |
 
 ## Critical Constraints
 
@@ -105,6 +108,22 @@ Stage 3: Full - End-to-end fine-tuning
 2. Add stage-specific loss in `composite_loss.py:get_stage_loss()`
 3. Update validation in `train.py:validate()` for stage-aware loss
 4. Add freeze/unfreeze methods if needed
+
+### Using LCOFL Loss (Layout and Character Oriented Focal Loss)
+
+```python
+# In config.py or training script
+config.training.use_lcofl = True      # Enable LCOFL
+config.training.weight_lcofl = 0.5    # Weight for LCOFL
+config.training.weight_ssim = 0.3     # SSIM component weight
+config.training.lcofl_alpha = 1.0     # Confusion penalty increment
+config.training.lcofl_beta = 2.0      # Layout violation penalty
+```
+
+**Key files:**
+- `losses/lcofl_loss.py` - LCOFL implementation
+- `models/deformable_conv.py` - Deformable convolutions
+- `models/shared_attention.py` - PLTFAM-style attention
 
 ## Code Patterns
 
