@@ -199,6 +199,13 @@ class TrainingConfig:
     use_shared_attention: bool = True  # Enable shared attention module
     use_deformable_conv: bool = True  # Enable deformable convolutions
     
+    # OCR-as-Discriminator (from LCOFL paper)
+    # Replaces binary discriminator with OCR-based guidance for more stable training
+    use_ocr_discriminator: bool = False  # Enable OCR-based discrimination
+    weight_ocr_guidance: float = 1.0  # Weight for OCR guidance loss
+    freeze_ocr_discriminator: bool = True  # Keep OCR frozen during training
+    ocr_confidence_mode: str = 'mean'  # 'mean', 'min', or 'product'
+    
     # Optimizer
     optimizer: str = 'adamw'
     weight_decay: float = 0.01

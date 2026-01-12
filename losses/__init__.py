@@ -15,6 +15,12 @@ from .lcofl_loss import (
     LayoutPenalty,
     ConfusionMatrixTracker,
 )
+from .ocr_discriminator import (
+    OCRDiscriminator,
+    OCRDiscriminatorLoss,
+    RecognitionGuidedLoss,
+    create_ocr_discriminator,
+)
 
 __all__ = [
     'CornerLoss',
@@ -32,5 +38,11 @@ __all__ = [
     'SSIMLoss',
     'LayoutPenalty',
     'ConfusionMatrixTracker',
+    # OCR-as-Discriminator
+    'OCRDiscriminator',
+    'OCRDiscriminatorLoss',
+    'RecognitionGuidedLoss',
+    'create_ocr_discriminator',
 ]
+
 

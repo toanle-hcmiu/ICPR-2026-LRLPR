@@ -17,6 +17,7 @@ This system recognizes Brazilian license plates in two formats:
 - **Pretrained PARSeq**: Uses pretrained PARSeq from [baudm/parseq](https://github.com/baudm/parseq) for state-of-the-art OCR
 - **Syntax-Masked Recognition**: Enforces valid plate formats using symbolic constraints
 - **LCOFL Loss**: Layout and Character Oriented Focal Loss with SSIM and confusion matrix tracking
+- **OCR-as-Discriminator**: Uses OCR confidence as GAN discriminator for stable training
 - **Deformable Convolutions**: Adaptive spatial sampling for better character handling
 - **Shared Attention Module**: PLTFAM-style attention with shared weights across blocks
 - **Mixed Precision Training**: 2x faster training with automatic mixed precision (AMP)
@@ -254,7 +255,8 @@ ICPR-2026-LRLPR/
 │   ├── gan_loss.py           # Adversarial losses (vanilla, lsgan, wgan)
 │   ├── composite_loss.py     # Combined loss + SelfSupervisedSTNLoss
 │   ├── ocr_perceptual_loss.py # OCR-aware perceptual losses
-│   └── lcofl_loss.py         # LCOFL loss with SSIM and confusion tracking
+│   ├── lcofl_loss.py         # LCOFL loss with SSIM and confusion tracking
+│   └── ocr_discriminator.py  # OCR-as-Discriminator for stable GAN training
 │
 ├── data/
 │   ├── __init__.py
