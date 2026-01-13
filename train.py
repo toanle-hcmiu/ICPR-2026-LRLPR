@@ -305,9 +305,14 @@ def train_epoch(
     label_smoothing_real = 0.9  # Smooth real labels to prevent overconfidence
     label_smoothing_fake = 0.0  # Keep fake labels at 0
     d_update_freq = 1  # Update D every N batches (will increase if D too strong)
-    r1_gamma = 10.0  # R1 gradient penalty weight
+    r1_gamma = 5.0  # R1 gradient penalty weight (reduced for stability)
     # Instance noise: start at 0.1, decay to 0 over training
     instance_noise_std = max(0.0, 0.1 * (1.0 - epoch / max(total_epochs, 1)))
+    
+    # Discriminator stability: NaN tracking and warm-up
+    d_nan_count = 0  # Track consecutive NaN batches for discriminator
+    d_nan_threshold = 50  # Reset D if this many consecutive NaN batches
+    d_warmup_epochs = 3  # Delay D training for first few epochs to let G stabilize
     
     pbar = tqdm(dataloader, desc=f'Epoch {epoch}')
     
@@ -425,8 +430,9 @@ def train_epoch(
         
         # Update discriminator if available and in appropriate stage
         if discriminator is not None and optimizer_d is not None and stage in ['restoration', 'full']:
-            # Skip D update based on frequency control
-            should_update_d = (batch_idx % d_update_freq == 0)
+            # Skip D update based on frequency control and warm-up
+            # Delay D training for first few epochs to let G produce reasonable outputs
+            should_update_d = (epoch >= d_warmup_epochs) and (batch_idx % d_update_freq == 0)
             
             # Get real and fake images
             real_hr = targets['hr_image'].clone()
@@ -471,19 +477,30 @@ def train_epoch(
                 optimizer_d.zero_grad()
                 
                 # R1 gradient penalty on real images (every 16 batches to save compute)
+                # Fixed: Using create_graph=False to prevent gradient accumulation issues
                 r1_penalty = torch.tensor(0.0, device=device)
                 if batch_idx % 16 == 0:
-                    real_hr_gp = targets['hr_image'].clone().requires_grad_(True)
-                    with autocast('cuda', enabled=False):  # Disable AMP for gradient penalty
-                        pred_real_gp = discriminator(real_hr_gp)
-                        grad_real = torch.autograd.grad(
-                            outputs=pred_real_gp.sum(),
-                            inputs=real_hr_gp,
-                            create_graph=True,
-                            retain_graph=True
-                        )[0]
-                        r1_penalty = grad_real.pow(2).view(grad_real.shape[0], -1).sum(1).mean()
-                    loss_d = loss_d + r1_gamma * r1_penalty
+                    try:
+                        with torch.enable_grad():
+                            real_hr_gp = targets['hr_image'].detach().requires_grad_(True)
+                            # Disable AMP for gradient penalty computation
+                            with autocast('cuda', enabled=False):
+                                pred_real_gp = discriminator(real_hr_gp)
+                                grad_real = torch.autograd.grad(
+                                    outputs=pred_real_gp.sum(),
+                                    inputs=real_hr_gp,
+                                    create_graph=False,  # Don't create 2nd order graph
+                                    retain_graph=False
+                                )[0]
+                                r1_penalty = grad_real.pow(2).flatten(start_dim=1).sum(1).mean() * 0.5
+                        # Add with penalty (already scaled by 0.5 above)
+                        if not check_for_nan(r1_penalty, "r1_penalty"):
+                            loss_d = loss_d + r1_gamma * r1_penalty
+                    except RuntimeError as e:
+                        # Skip R1 penalty if gradient computation fails
+                        if logger is not None:
+                            logger.debug(f"R1 penalty computation failed: {e}")
+                        pass
                 
                 if use_amp and scaler_d is not None:
                     scaler_d.scale(loss_d).backward()
@@ -499,8 +516,19 @@ def train_epoch(
                 loss_dict['loss_d'] = loss_d.item()
                 loss_dict['d_accuracy'] = d_accuracy
             elif check_for_nan(loss_d, "loss_d"):
-                if logger is not None:
-                    logger.warning(f"Epoch {epoch}, Batch {batch_idx}: NaN discriminator loss, skipping D update")
+                d_nan_count += 1
+                if logger is not None and d_nan_count <= 5:  # Only log first few to reduce spam
+                    logger.warning(f"Epoch {epoch}, Batch {batch_idx}: NaN discriminator loss, skipping D update (count: {d_nan_count}/{d_nan_threshold})")
+                
+                # Reset discriminator if too many consecutive NaN batches
+                if d_nan_count >= d_nan_threshold:
+                    if logger is not None:
+                        logger.warning(f"Resetting discriminator weights due to {d_nan_count} consecutive NaN losses")
+                    reset_nan_parameters(discriminator, logger)
+                    d_nan_count = 0
+            else:
+                # Reset NaN counter on successful D update or valid loss
+                d_nan_count = 0
         
         # Accumulate losses (only for valid batches)
         for key, value in loss_dict.items():
@@ -834,14 +862,17 @@ def train_stage(
     optimizer_d = None
     
     if discriminator is not None and stage in ['restoration', 'full']:
-        # Select appropriate LR based on stage
-        lr_d = config.training.lr_restoration if stage == 'restoration' else config.training.lr_finetune
+        # TTUR (Two-Timescale Update Rule): D uses 4x higher learning rate
+        # and beta1=0 for more stable GAN training
+        base_lr = config.training.lr_restoration if stage == 'restoration' else config.training.lr_finetune
+        lr_d = base_lr * 4.0
         
         optimizer_d = optim.Adam(
             discriminator.parameters(),
             lr=lr_d,
-            betas=config.training.betas
+            betas=(0.0, 0.99)  # TTUR uses beta1=0 for discriminator
         )
+        logger.info(f"Stage {stage}: Using TTUR for D optimizer (lr={lr_d:.2e}, betas=(0.0, 0.99))")
     
     # Create scheduler
     scheduler = create_scheduler(optimizer_g, num_epochs, config)
