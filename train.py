@@ -313,6 +313,7 @@ def train_epoch(
     d_nan_count = 0  # Track consecutive NaN batches for discriminator
     d_nan_threshold = 50  # Reset D if this many consecutive NaN batches
     d_warmup_epochs = 3  # Delay D training for first few epochs to let G stabilize
+    d_reset_count = 0  # Track how many times D has been reset this epoch
     
     pbar = tqdm(dataloader, desc=f'Epoch {epoch}')
     
@@ -344,6 +345,17 @@ def train_epoch(
         
         with autocast('cuda', enabled=use_amp_for_batch):
             outputs = model(lr_frames, return_intermediates=True)
+            
+            # Validate generator output isn't producing extreme values
+            # This catches cases where the generator is collapsing before it causes NaN
+            if 'hr_image' in outputs and stage in ['restoration', 'full']:
+                hr_output = outputs['hr_image']
+                max_val = hr_output.abs().max().item()
+                if max_val > 2.0:  # After tanh, should be in [-1, 1], allow some margin
+                    if logger is not None and batch_idx % 100 == 0:
+                        logger.warning(f"Epoch {epoch}, Batch {batch_idx}: Generator output extreme (max={max_val:.2f})")
+                    # Safety clamp to prevent downstream NaN
+                    outputs['hr_image'] = torch.clamp(hr_output, -1.0, 1.0)
             
             # Compute generator loss
             if stage == 'stn':
@@ -438,6 +450,11 @@ def train_epoch(
             real_hr = targets['hr_image'].clone()
             fake_hr = outputs['hr_image'].detach().clone()
             
+            # Safety clamp: ensure images are in valid range before D
+            # This prevents NaN when generator produces extreme values
+            real_hr = torch.clamp(real_hr, -1.0, 1.0)
+            fake_hr = torch.clamp(fake_hr, -1.0, 1.0)
+            
             # Add instance noise for training stability (decays over epochs)
             if instance_noise_std > 0:
                 real_hr = real_hr + torch.randn_like(real_hr) * instance_noise_std
@@ -522,9 +539,22 @@ def train_epoch(
                 
                 # Reset discriminator if too many consecutive NaN batches
                 if d_nan_count >= d_nan_threshold:
+                    d_reset_count += 1
                     if logger is not None:
-                        logger.warning(f"Resetting discriminator weights due to {d_nan_count} consecutive NaN losses")
-                    reset_nan_parameters(discriminator, logger)
+                        logger.warning(f"Resetting discriminator weights due to {d_nan_count} consecutive NaN losses (reset #{d_reset_count} this epoch)")
+                    
+                    # Fully reinitialize discriminator if we've reset too many times
+                    # This means generator outputs are consistently bad
+                    if d_reset_count >= 3:
+                        if logger is not None:
+                            logger.warning(f"Discriminator reset {d_reset_count} times - reinitializing all weights")
+                        for m in discriminator.modules():
+                            if isinstance(m, (nn.Conv2d, nn.Linear)):
+                                nn.init.normal_(m.weight, 0, 0.02)
+                                if m.bias is not None:
+                                    nn.init.zeros_(m.bias)
+                    else:
+                        reset_nan_parameters(discriminator, logger)
                     d_nan_count = 0
             else:
                 # Reset NaN counter on successful D update or valid loss

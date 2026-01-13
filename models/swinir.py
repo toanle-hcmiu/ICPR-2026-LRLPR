@@ -459,6 +459,9 @@ class SwinIRGenerator(nn.Module):
         x = self.upsample(x)
         x = self.conv_last(x)
         
+        # Bound output to [-1, 1] for stable GAN training
+        x = torch.tanh(x)
+        
         # Remove padding
         if pad_h > 0 or pad_w > 0:
             x = x[:, :, :H * self.upscale, :W * self.upscale]
@@ -529,4 +532,6 @@ class LightweightSRGenerator(nn.Module):
         x = x + res
         x = self.upsample(x)
         x = self.conv_last(x)
+        # Bound output to [-1, 1] for stable GAN training
+        x = torch.tanh(x)
         return x
