@@ -312,7 +312,7 @@ def train_epoch(
     # Discriminator stability: NaN tracking and warm-up
     d_nan_count = 0  # Track consecutive NaN batches for discriminator
     d_nan_threshold = 50  # Reset D if this many consecutive NaN batches
-    d_warmup_epochs = 3  # Delay D training for first few epochs to let G stabilize
+    d_warmup_epochs = 10  # Delay D training for first few epochs to let G stabilize to let G stabilize
     d_reset_count = 0  # Track how many times D has been reset this epoch
     
     pbar = tqdm(dataloader, desc=f'Epoch {epoch}')
@@ -445,6 +445,11 @@ def train_epoch(
             # Skip D update based on frequency control and warm-up
             # Delay D training for first few epochs to let G produce reasonable outputs
             should_update_d = (epoch >= d_warmup_epochs) and (batch_idx % d_update_freq == 0)
+            
+            # Mode collapse detection: if pixel loss is suspiciously low, G may be outputting constant
+            # Skip D update to let G recover via pixel loss alone
+            if 'pixel' in loss_dict and loss_dict['pixel'] < 0.01:
+                should_update_d = False
             
             # Get real and fake images
             real_hr = targets['hr_image'].clone()
@@ -892,10 +897,10 @@ def train_stage(
     optimizer_d = None
     
     if discriminator is not None and stage in ['restoration', 'full']:
-        # TTUR (Two-Timescale Update Rule): D uses 4x higher learning rate
-        # and beta1=0 for more stable GAN training
+        # TTUR (Two-Timescale Update Rule): Use same LR as G (reduced from 4x)
+        # High D LR was causing instability and mode collapse
         base_lr = config.training.lr_restoration if stage == 'restoration' else config.training.lr_finetune
-        lr_d = base_lr * 4.0
+        lr_d = base_lr * 1.0  # Reduced from 4x to 1x for stability
         
         optimizer_d = optim.Adam(
             discriminator.parameters(),

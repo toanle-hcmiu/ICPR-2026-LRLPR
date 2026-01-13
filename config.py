@@ -183,7 +183,7 @@ class TrainingConfig:
     
     # Loss weights (for L_total = L_pixel + w1*L_GAN + w2*L_OCR + w3*L_geo)
     weight_pixel: float = 1.0
-    weight_gan: float = 0.005  # Further reduced to stabilize GAN training
+    weight_gan: float = 0.001  # Very low GAN weight to prevent D dominance and mode collapse
     weight_ocr: float = 1.0  # Increased from 0.5 - OCR is the main objective
     weight_geometry: float = 0.1
     
