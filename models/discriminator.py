@@ -111,7 +111,7 @@ class PatchDiscriminator(nn.Module):
                     channels, out_channels,
                     kernel_size=4, stride=2, padding=1,
                     use_spectral_norm=use_spectral_norm,
-                    use_bn=True
+                    use_bn=False  # Disabled: BN is incompatible with R1 gradient penalty
                 )
             )
             channels = out_channels
@@ -123,7 +123,7 @@ class PatchDiscriminator(nn.Module):
                 channels, out_channels,
                 kernel_size=4, stride=1, padding=1,
                 use_spectral_norm=use_spectral_norm,
-                use_bn=True
+                use_bn=False  # Disabled: BN is incompatible with R1 gradient penalty
             )
         )
         channels = out_channels

@@ -484,10 +484,12 @@ def train_epoch(
                 loss_d = None
                 d_accuracy = 0.5  # Default to random accuracy
                 
-                with autocast('cuda', enabled=use_amp):
-                    # Discriminator forward
-                    pred_real = discriminator(real_hr)
-                    pred_fake = discriminator(fake_hr)
+                # STABILITY FIX: Disable AMP for discriminator forward to prevent FP16 overflow
+                # When D becomes confident, logits can exceed FP16 range before clamping
+                with autocast('cuda', enabled=False):
+                    # Discriminator forward in FP32 for stability
+                    pred_real = discriminator(real_hr.float())
+                    pred_fake = discriminator(fake_hr.float())
                     
                     # Check for NaN in D outputs - skip entirely if corrupted
                     if torch.isnan(pred_real).any() or torch.isnan(pred_fake).any():
