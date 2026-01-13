@@ -312,8 +312,11 @@ def train_epoch(
     # Discriminator stability: NaN tracking and warm-up
     d_nan_count = 0  # Track consecutive NaN batches for discriminator
     d_nan_threshold = 50  # Reset D if this many consecutive NaN batches
-    d_warmup_epochs = 10  # Delay D training for first few epochs to let G stabilize to let G stabilize
+    d_warmup_epochs = 5  # Reduced from 10 - shorter warm-up for D
+    d_lr_warmup_epochs = 5  # Ramp up D learning rate gradually after warm-up
     d_reset_count = 0  # Track how many times D has been reset this epoch
+    max_d_resets_per_epoch = 3  # Fallback to pixel-only after this many resets
+    d_fallback_mode = False  # When True, skip GAN loss for rest of epoch
     
     pbar = tqdm(dataloader, desc=f'Epoch {epoch}')
     
@@ -442,128 +445,170 @@ def train_epoch(
         
         # Update discriminator if available and in appropriate stage
         if discriminator is not None and optimizer_d is not None and stage in ['restoration', 'full']:
-            # Skip D update based on frequency control and warm-up
-            # Delay D training for first few epochs to let G produce reasonable outputs
-            should_update_d = (epoch >= d_warmup_epochs) and (batch_idx % d_update_freq == 0)
-            
-            # Mode collapse detection: if pixel loss is suspiciously low, G may be outputting constant
-            # Skip D update to let G recover via pixel loss alone
-            if 'pixel' in loss_dict and loss_dict['pixel'] < 0.01:
-                should_update_d = False
-            
-            # Get real and fake images
-            real_hr = targets['hr_image'].clone()
-            fake_hr = outputs['hr_image'].detach().clone()
-            
-            # Safety clamp: ensure images are in valid range before D
-            # This prevents NaN when generator produces extreme values
-            real_hr = torch.clamp(real_hr, -1.0, 1.0)
-            fake_hr = torch.clamp(fake_hr, -1.0, 1.0)
-            
-            # Add instance noise for training stability (decays over epochs)
-            if instance_noise_std > 0:
-                real_hr = real_hr + torch.randn_like(real_hr) * instance_noise_std
-                fake_hr = fake_hr + torch.randn_like(fake_hr) * instance_noise_std
-            
-            with autocast('cuda', enabled=use_amp):
-                # Discriminator forward
-                pred_real = discriminator(real_hr)
-                pred_fake = discriminator(fake_hr)
+            # Skip D update if in fallback mode (too many resets this epoch)
+            if d_fallback_mode:
+                # Still log GAN loss as 0 for monitoring
+                loss_dict['loss_d'] = 0.0
+                loss_dict['d_accuracy'] = 0.0
+                # Skip entire D update block
+            else:
+                # Skip D update based on frequency control and warm-up
+                # Delay D training for first few epochs to let G produce reasonable outputs
+                should_update_d = (epoch >= d_warmup_epochs) and (batch_idx % d_update_freq == 0)
                 
-                # Discriminator loss with label smoothing
-                # Create smoothed target tensors
-                real_target = torch.full_like(pred_real, label_smoothing_real)
-                fake_target = torch.full_like(pred_fake, label_smoothing_fake)
+                # Apply D learning rate warmup after warm-up epochs
+                if epoch >= d_warmup_epochs and optimizer_d is not None:
+                    d_lr_factor = min(1.0, (epoch - d_warmup_epochs + 1) / max(1, d_lr_warmup_epochs))
+                    # Note: We don't modify LR in-place here as it's handled at epoch level
                 
-                # Clamp predictions for numerical stability
-                pred_real_clamped = torch.clamp(pred_real, -15.0, 15.0)
-                pred_fake_clamped = torch.clamp(pred_fake, -15.0, 15.0)
+                # Mode collapse detection: if pixel loss is suspiciously low, G may be outputting constant
+                # Skip D update to let G recover via pixel loss alone
+                if 'pixel' in loss_dict and loss_dict['pixel'] < 0.01:
+                    should_update_d = False
                 
-                loss_d_real = F.binary_cross_entropy_with_logits(pred_real_clamped, real_target)
-                loss_d_fake = F.binary_cross_entropy_with_logits(pred_fake_clamped, fake_target)
-                loss_d = (loss_d_real + loss_d_fake) / 2
-            
-            # Check D strength: if D is too strong, reduce update frequency
-            d_acc_real = (torch.sigmoid(pred_real) > 0.5).float().mean().item()
-            d_acc_fake = (torch.sigmoid(pred_fake) < 0.5).float().mean().item()
-            d_accuracy = (d_acc_real + d_acc_fake) / 2
-            
-            # Adaptive D update frequency: skip more often if D is winning
-            if d_accuracy > 0.9 and d_update_freq < 5:
-                d_update_freq = min(5, d_update_freq + 1)
-            elif d_accuracy < 0.7 and d_update_freq > 1:
-                d_update_freq = max(1, d_update_freq - 1)
-            
-            # Check for NaN discriminator loss and update if valid
-            if not check_for_nan(loss_d, "loss_d") and should_update_d:
-                optimizer_d.zero_grad()
+                # Get real and fake images
+                real_hr = targets['hr_image'].clone()
+                fake_hr = outputs['hr_image'].detach().clone()
                 
-                # R1 gradient penalty on real images (every 16 batches to save compute)
-                # Fixed: Using create_graph=False to prevent gradient accumulation issues
-                r1_penalty = torch.tensor(0.0, device=device)
-                if batch_idx % 16 == 0:
-                    try:
-                        with torch.enable_grad():
-                            real_hr_gp = targets['hr_image'].detach().requires_grad_(True)
-                            # Disable AMP for gradient penalty computation
-                            with autocast('cuda', enabled=False):
-                                pred_real_gp = discriminator(real_hr_gp)
-                                grad_real = torch.autograd.grad(
-                                    outputs=pred_real_gp.sum(),
-                                    inputs=real_hr_gp,
-                                    create_graph=False,  # Don't create 2nd order graph
-                                    retain_graph=False
-                                )[0]
-                                r1_penalty = grad_real.pow(2).flatten(start_dim=1).sum(1).mean() * 0.5
-                        # Add with penalty (already scaled by 0.5 above)
-                        if not check_for_nan(r1_penalty, "r1_penalty"):
-                            loss_d = loss_d + r1_gamma * r1_penalty
-                    except RuntimeError as e:
-                        # Skip R1 penalty if gradient computation fails
-                        if logger is not None:
-                            logger.debug(f"R1 penalty computation failed: {e}")
-                        pass
+                # Safety clamp: ensure images are in valid range before D
+                # This prevents NaN when generator produces extreme values
+                real_hr = torch.clamp(real_hr, -1.0, 1.0)
+                fake_hr = torch.clamp(fake_hr, -1.0, 1.0)
                 
-                if use_amp and scaler_d is not None:
-                    scaler_d.scale(loss_d).backward()
-                    scaler_d.unscale_(optimizer_d)
-                    torch.nn.utils.clip_grad_norm_(discriminator.parameters(), max_norm=grad_clip_norm)
-                    scaler_d.step(optimizer_d)
-                    scaler_d.update()
-                else:
-                    loss_d.backward()
-                    torch.nn.utils.clip_grad_norm_(discriminator.parameters(), max_norm=grad_clip_norm)
-                    optimizer_d.step()
+                # Add instance noise for training stability (decays over epochs)
+                if instance_noise_std > 0:
+                    real_hr = real_hr + torch.randn_like(real_hr) * instance_noise_std
+                    fake_hr = fake_hr + torch.randn_like(fake_hr) * instance_noise_std
                 
-                loss_dict['loss_d'] = loss_d.item()
-                loss_dict['d_accuracy'] = d_accuracy
-            elif check_for_nan(loss_d, "loss_d"):
-                d_nan_count += 1
-                if logger is not None and d_nan_count <= 5:  # Only log first few to reduce spam
-                    logger.warning(f"Epoch {epoch}, Batch {batch_idx}: NaN discriminator loss, skipping D update (count: {d_nan_count}/{d_nan_threshold})")
+                # Initialize loss_d to None to track if it was computed
+                loss_d = None
+                d_accuracy = 0.5  # Default to random accuracy
                 
-                # Reset discriminator if too many consecutive NaN batches
-                if d_nan_count >= d_nan_threshold:
-                    d_reset_count += 1
-                    if logger is not None:
-                        logger.warning(f"Resetting discriminator weights due to {d_nan_count} consecutive NaN losses (reset #{d_reset_count} this epoch)")
+                with autocast('cuda', enabled=use_amp):
+                    # Discriminator forward
+                    pred_real = discriminator(real_hr)
+                    pred_fake = discriminator(fake_hr)
                     
-                    # Fully reinitialize discriminator if we've reset too many times
-                    # This means generator outputs are consistently bad
-                    if d_reset_count >= 3:
+                    # Check for NaN in D outputs - skip entirely if corrupted
+                    if torch.isnan(pred_real).any() or torch.isnan(pred_fake).any():
+                        d_nan_count += 1
+                        should_update_d = False
+                        if d_nan_count >= d_nan_threshold:
+                            d_reset_count += 1
+                            if logger is not None:
+                                logger.warning(f"Resetting discriminator weights due to {d_nan_count} consecutive NaN outputs (reset #{d_reset_count} this epoch)")
+                            # Reset D weights
+                            for m in discriminator.modules():
+                                if isinstance(m, (nn.Conv2d, nn.Linear)):
+                                    nn.init.normal_(m.weight, 0, 0.02)
+                                    if m.bias is not None:
+                                        nn.init.zeros_(m.bias)
+                            d_nan_count = 0
+                            
+                            if d_reset_count >= max_d_resets_per_epoch:
+                                d_fallback_mode = True
+                                if logger:
+                                    logger.warning(f"Epoch {epoch}: Too many D resets ({d_reset_count}), falling back to pixel-only training")
+                    else:
+                        # Reset NaN counter on successful D forward
+                        d_nan_count = 0
+                        
+                        # Discriminator loss with label smoothing
+                        # Create smoothed target tensors
+                        real_target = torch.full_like(pred_real, label_smoothing_real)
+                        fake_target = torch.full_like(pred_fake, label_smoothing_fake)
+                        
+                        # Stricter clamping with NaN replacement for numerical stability
+                        pred_real_safe = torch.where(
+                            torch.isnan(pred_real) | torch.isinf(pred_real),
+                            torch.zeros_like(pred_real),
+                            torch.clamp(pred_real, -10.0, 10.0)
+                        )
+                        pred_fake_safe = torch.where(
+                            torch.isnan(pred_fake) | torch.isinf(pred_fake),
+                            torch.zeros_like(pred_fake),
+                            torch.clamp(pred_fake, -10.0, 10.0)
+                        )
+                        
+                        loss_d_real = F.binary_cross_entropy_with_logits(pred_real_safe, real_target)
+                        loss_d_fake = F.binary_cross_entropy_with_logits(pred_fake_safe, fake_target)
+                        loss_d = (loss_d_real + loss_d_fake) / 2
+                        
+                        # Check D strength: if D is too strong, reduce update frequency
+                        d_acc_real = (torch.sigmoid(pred_real_safe) > 0.5).float().mean().item()
+                        d_acc_fake = (torch.sigmoid(pred_fake_safe) < 0.5).float().mean().item()
+                        d_accuracy = (d_acc_real + d_acc_fake) / 2
+                
+                # Adaptive D update frequency: skip more often if D is winning
+                if d_accuracy > 0.9 and d_update_freq < 5:
+                    d_update_freq = min(5, d_update_freq + 1)
+                elif d_accuracy < 0.7 and d_update_freq > 1:
+                    d_update_freq = max(1, d_update_freq - 1)
+                
+                # Check for NaN discriminator loss and update if valid
+                if loss_d is not None and not check_for_nan(loss_d, "loss_d") and should_update_d:
+                    optimizer_d.zero_grad()
+                    
+                    # R1 gradient penalty on real images (every 16 batches to save compute)
+                    r1_penalty = torch.tensor(0.0, device=device)
+                    if batch_idx % 16 == 0:
+                        try:
+                            with torch.enable_grad():
+                                real_hr_gp = targets['hr_image'].detach().requires_grad_(True)
+                                # Disable AMP for gradient penalty computation
+                                with autocast('cuda', enabled=False):
+                                    pred_real_gp = discriminator(real_hr_gp)
+                                    grad_real = torch.autograd.grad(
+                                        outputs=pred_real_gp.sum(),
+                                        inputs=real_hr_gp,
+                                        create_graph=True,
+                                        retain_graph=False
+                                    )[0]
+                                    r1_penalty = grad_real.pow(2).flatten(start_dim=1).sum(1).mean() * 0.5
+                            # Add with penalty (already scaled by 0.5 above)
+                            if not check_for_nan(r1_penalty, "r1_penalty"):
+                                loss_d = loss_d + r1_gamma * r1_penalty
+                        except RuntimeError as e:
+                            # Skip R1 penalty if gradient computation fails
+                            if logger is not None:
+                                logger.debug(f"R1 penalty computation failed: {e}")
+                    
+                    if use_amp and scaler_d is not None:
+                        scaler_d.scale(loss_d).backward()
+                        scaler_d.unscale_(optimizer_d)
+                        torch.nn.utils.clip_grad_norm_(discriminator.parameters(), max_norm=grad_clip_norm)
+                        scaler_d.step(optimizer_d)
+                        scaler_d.update()
+                    else:
+                        loss_d.backward()
+                        torch.nn.utils.clip_grad_norm_(discriminator.parameters(), max_norm=grad_clip_norm)
+                        optimizer_d.step()
+                    
+                    loss_dict['loss_d'] = loss_d.item()
+                    loss_dict['d_accuracy'] = d_accuracy
+                elif loss_d is not None and check_for_nan(loss_d, "loss_d"):
+                    d_nan_count += 1
+                    if logger is not None and d_nan_count <= 5:  # Only log first few to reduce spam
+                        logger.warning(f"Epoch {epoch}, Batch {batch_idx}: NaN discriminator loss, skipping D update (count: {d_nan_count}/{d_nan_threshold})")
+                    
+                    # Reset discriminator if too many consecutive NaN batches
+                    if d_nan_count >= d_nan_threshold:
+                        d_reset_count += 1
                         if logger is not None:
-                            logger.warning(f"Discriminator reset {d_reset_count} times - reinitializing all weights")
+                            logger.warning(f"Resetting discriminator weights due to {d_nan_count} consecutive NaN losses (reset #{d_reset_count} this epoch)")
+                        
+                        # Reinitialize discriminator weights
                         for m in discriminator.modules():
                             if isinstance(m, (nn.Conv2d, nn.Linear)):
                                 nn.init.normal_(m.weight, 0, 0.02)
                                 if m.bias is not None:
                                     nn.init.zeros_(m.bias)
-                    else:
-                        reset_nan_parameters(discriminator, logger)
-                    d_nan_count = 0
-            else:
-                # Reset NaN counter on successful D update or valid loss
-                d_nan_count = 0
+                        d_nan_count = 0
+                        
+                        if d_reset_count >= max_d_resets_per_epoch:
+                            d_fallback_mode = True
+                            if logger:
+                                logger.warning(f"Epoch {epoch}: Too many D resets ({d_reset_count}), falling back to pixel-only training")
         
         # Accumulate losses (only for valid batches)
         for key, value in loss_dict.items():
