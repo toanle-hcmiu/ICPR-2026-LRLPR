@@ -718,8 +718,9 @@ class CompositeLoss(nn.Module):
                         l_gan = self.gan_loss(pred_fake, target_is_real=True)
                         l_gan = self._clamp_loss(l_gan)
                         loss_dict['gan'] = self._safe_loss_item(l_gan)
-                        # Use reduced GAN weight for stability
-                        weighted_gan = self.weights['gan'] * l_gan
+                        # Use capped GAN weight for stability (max 0.01)
+                        capped_gan_weight = min(0.01, self.weights['gan'])
+                        weighted_gan = capped_gan_weight * l_gan
                         total_loss = weighted_gan if total_loss is None else total_loss + weighted_gan
             
             if 'layout_logits' in outputs and 'layout' in targets:
