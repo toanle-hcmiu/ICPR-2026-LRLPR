@@ -563,7 +563,7 @@ def train_epoch(
                                     grad_real = torch.autograd.grad(
                                         outputs=pred_real_gp.sum(),
                                         inputs=real_hr_gp,
-                                        create_graph=True,
+                                        create_graph=False,  # Only need 1st order gradients for R1
                                         retain_graph=False
                                     )[0]
                                     r1_penalty = grad_real.pow(2).flatten(start_dim=1).sum(1).mean() * 0.5
