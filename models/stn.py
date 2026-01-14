@@ -100,9 +100,14 @@ class LocalizationNetwork(nn.Module):
     
     def _init_identity(self):
         """Initialize the final layer to output identity transformation."""
-        # Identity affine: [[1, 0, 0], [0, 1, 0]]
+        # FIX: Initialize to zeros so tanh(0)=0, resulting in:
+        # - Scale = 1.0 + 0.5 * tanh(0) = 1.0 (identity)
+        # - Shear = 0.3 * tanh(0) = 0.0 (no shear)
+        # - Translation = 0.5 * tanh(0) = 0.0 (no translation)
+        # The old initialization [1, 0, 0, 0, 1, 0] caused tanh(1)≈0.76,
+        # resulting in scale = 1.38 (unwanted 38% zoom-in)
         self.fc[-1].weight.data.zero_()
-        self.fc[-1].bias.data.copy_(torch.tensor([1, 0, 0, 0, 1, 0], dtype=torch.float))
+        self.fc[-1].bias.data.zero_()
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
