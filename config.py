@@ -162,7 +162,7 @@ class TrainingConfig:
     # Batch sizes for each training stage
     batch_size_pretrain: int = 128
     batch_size_stn: int = 32
-    batch_size_restoration: int = 16
+    batch_size_restoration: int = 32  # Increased from 16 to stabilize BatchNorm in Discriminator
     batch_size_finetune: int = 8
     
     # Learning rates
@@ -171,7 +171,7 @@ class TrainingConfig:
     # to learning rate - grid sampling gradients can explode with large parameter updates.
     lr_pretrain: float = 1e-4
     lr_stn: float = 1e-5  # Further reduced for stability - STN is extremely sensitive to large LR
-    lr_restoration: float = 2e-4
+    lr_restoration: float = 5e-5  # Reduced from 2e-4 to fix GAN instability (discriminator collapse)
     lr_finetune: float = 2e-5  # Increased for faster convergence
     lr_parseq_finetune: float = 1e-6  # Lower LR for pre-trained OCR
     
@@ -201,7 +201,7 @@ class TrainingConfig:
     
     # OCR-as-Discriminator (from LCOFL paper)
     # Replaces binary discriminator with OCR-based guidance for more stable training
-    use_ocr_discriminator: bool = False  # Enable OCR-based discrimination
+    use_ocr_discriminator: bool = True  # Enabled: Uses OCR confidence as discriminator (more stable than binary GAN)
     weight_ocr_guidance: float = 1.0  # Weight for OCR guidance loss
     freeze_ocr_discriminator: bool = True  # Keep OCR frozen during training
     ocr_confidence_mode: str = 'mean'  # 'mean', 'min', or 'product'
@@ -217,7 +217,7 @@ class TrainingConfig:
     min_lr: float = 1e-7
     
     # Gradient clipping
-    grad_clip_norm: float = 1.0
+    grad_clip_norm: float = 0.5  # Reduced from 1.0 to prevent gradient explosion during GAN training
     grad_clip_norm_stn: float = 0.5  # Tighter clipping for STN stage to prevent explosion
     
     # Checkpointing
