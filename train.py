@@ -312,7 +312,7 @@ def train_epoch(
     # Discriminator stability: NaN tracking and warm-up
     d_nan_count = 0  # Track consecutive NaN batches for discriminator
     d_nan_threshold = 50  # Reset D if this many consecutive NaN batches
-    d_warmup_epochs = 5  # Reduced from 10 - shorter warm-up for D
+    d_warmup_epochs = 10  # Increased from 5 - Generator needs more time to learn basic colors via L1 before GAN kicks in
     d_lr_warmup_epochs = 5  # Ramp up D learning rate gradually after warm-up
     d_reset_count = 0  # Track how many times D has been reset this epoch
     max_d_resets_per_epoch = 3  # Fallback to pixel-only after this many resets
@@ -360,13 +360,20 @@ def train_epoch(
                     # Safety clamp to prevent downstream NaN
                     outputs['hr_image'] = torch.clamp(hr_output, -1.0, 1.0)
             
+            # FIX: Completely disable GAN loss during warm-up period
+            # During warm-up, G learns only from Pixel Loss (L1) to produce basic colors/shapes
+            # before the adversarial training begins. This prevents D from suppressing G too early.
+            current_discriminator = discriminator
+            if discriminator is not None and epoch < d_warmup_epochs:
+                current_discriminator = None  # Pass None to skip GAN loss computation
+            
             # Compute generator loss
             if stage == 'stn':
                 loss_g, loss_dict = criterion.get_stage_loss('stn', outputs, targets)
             elif stage == 'restoration':
-                loss_g, loss_dict = criterion.get_stage_loss('restoration', outputs, targets, discriminator)
+                loss_g, loss_dict = criterion.get_stage_loss('restoration', outputs, targets, current_discriminator)
             else:
-                loss_g, loss_dict = criterion(outputs, targets, discriminator)
+                loss_g, loss_dict = criterion(outputs, targets, current_discriminator)
         
         # Check for NaN loss and skip batch if detected
         if check_for_nan(loss_g, "loss_g"):
@@ -936,7 +943,8 @@ def train_stage(
         weight_pixel=config.training.weight_pixel,
         weight_gan=config.training.weight_gan,
         weight_ocr=config.training.weight_ocr,
-        weight_geometry=config.training.weight_geometry
+        weight_geometry=config.training.weight_geometry,
+        gan_mode='lsgan'  # Use LSGAN (MSE loss) instead of vanilla (BCE) to prevent vanishing gradients when D is too strong
     )
     
     # Create optimizers
