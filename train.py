@@ -1185,6 +1185,8 @@ def main():
                         help='Validation split ratio when using single data folder (default: 0.1)')
     parser.add_argument('--test-split', type=float, default=0.1,
                         help='Test split ratio when using single data folder (default: 0.1)')
+    parser.add_argument('--reset-epoch', action='store_true',
+                        help='Reset epoch to 0 when resuming (use when loading weights from different stage)')
     args = parser.parse_args()
     
     # Load config
@@ -1422,8 +1424,12 @@ def main():
     start_epoch = 0
     if args.resume is not None:
         checkpoint = load_checkpoint(model, args.resume, discriminator)
-        start_epoch = checkpoint.get('epoch', 0) + 1
-        logger.info(f"Resumed from {args.resume}, starting at epoch {start_epoch}")
+        if args.reset_epoch:
+            start_epoch = 0
+            logger.info(f"Loaded weights from {args.resume}, reset epoch to 0 (--reset-epoch)")
+        else:
+            start_epoch = checkpoint.get('epoch', 0) + 1
+            logger.info(f"Resumed from {args.resume}, starting at epoch {start_epoch}")
     
     # Determine stages to train
     if args.stage == 'all':
