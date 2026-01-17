@@ -6,12 +6,9 @@ super-resolution, based on the paper "SwinIR: Image Restoration Using Swin Trans
 It uses Swin Transformer blocks with shifted window attention to restore 
 high-resolution details from low-resolution inputs.
 
-Enhanced with optional Shared Attention Module (PLTFAM-style) from the LCOFL paper:
-"Enhancing License Plate Super-Resolution: A Layout-Aware and Character-Driven Approach"
+Optionally enhanced with Shared Attention Module for improved character recognition.
 
-Reference: 
-- SwinIR: https://github.com/JingyunLiang/SwinIR
-- LCOFL: Nascimento et al. (SIBGRAPI 2024)
+Reference: https://github.com/JingyunLiang/SwinIR
 """
 
 import torch
@@ -268,7 +265,7 @@ class RSTB(nn.Module):
     Residual Swin Transformer Block (RSTB).
     
     Contains multiple Swin Transformer blocks with residual connection.
-    Optionally enhanced with shared attention module (PLTFAM-style) from LCOFL paper.
+    Optionally enhanced with shared attention module.
     """
     
     def __init__(
@@ -335,8 +332,7 @@ class RSTB(nn.Module):
         x = x.view(B, H, W, C).permute(0, 3, 1, 2)
         x = self.conv(x)
         
-        # Apply shared attention if provided (PLTFAM-style from LCOFL paper)
-        # The shared attention module expects BCHW format
+        # Apply shared attention if provided
         if self.shared_attention is not None:
             x = self.shared_attention(x)
         
@@ -407,7 +403,7 @@ class SwinIRGenerator(nn.Module):
             drop_rate: Dropout rate.
             attn_drop_rate: Attention dropout rate.
             drop_path_rate: Stochastic depth rate.
-            use_shared_attention: Whether to use shared attention (PLTFAM-style from LCOFL paper).
+            use_shared_attention: Whether to use shared attention.
             use_deformable: Whether to use deformable convolutions in shared attention.
         """
         super().__init__()
@@ -432,11 +428,10 @@ class SwinIRGenerator(nn.Module):
         # Shallow feature extraction
         self.conv_first = nn.Conv2d(in_channels, embed_dim, 3, 1, 1)
         
-        # Create shared attention module if enabled (PLTFAM-style from LCOFL paper)
+        # Create shared attention module if enabled
         # A single attention module is shared across all RSTB blocks for:
         # 1. Consistent feature emphasis from early to late layers
         # 2. Parameter efficiency through weight sharing
-        # 3. Better character feature extraction
         self.shared_attention = None
         if use_shared_attention and HAS_SHARED_ATTENTION:
             self.shared_attention = SharedAttentionModule(

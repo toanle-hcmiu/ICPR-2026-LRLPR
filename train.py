@@ -377,8 +377,8 @@ def train_epoch(
             else:
                 loss_g, loss_dict = criterion(outputs, targets, current_discriminator)
             
-            # Add OCR-based guidance loss if configured (from LCOFL paper)
-            # This uses recognition confidence to guide super-resolution
+            # Add OCR-based guidance loss if configured
+            # Uses recognition confidence to guide super-resolution
             if ocr_discriminator_loss is not None and stage in ['restoration', 'full']:
                 # Get text targets (remove BOS/EOS tokens)
                 text_targets = targets['text_indices'][:, 1:-1]  # (B, PLATE_LENGTH)
@@ -999,13 +999,12 @@ def train_stage(
         gan_mode='lsgan'  # Use LSGAN (MSE loss) instead of vanilla (BCE) to prevent vanishing gradients when D is too strong
     )
     
-    # Create OCR Discriminator if configured (from LCOFL paper: Nascimento et al.)
+    # Create OCR Discriminator if configured
     # Uses OCR recognition confidence instead of binary real/fake classification
-    # This provides more stable training and directly optimizes for recognizability
     ocr_discriminator = None
     ocr_discriminator_loss = None
     if config.training.use_ocr_discriminator and stage in ['restoration', 'full']:
-        logger.info("Using OCR-as-Discriminator for GAN training (LCOFL paper approach)")
+        logger.info("Using OCR-as-Discriminator for GAN training")
         logger.info(f"  OCR frozen: {config.training.freeze_ocr_discriminator}")
         logger.info(f"  Confidence mode: {config.training.ocr_confidence_mode}")
         logger.info(f"  OCR guidance weight: {config.training.weight_ocr_guidance}")
@@ -1305,7 +1304,7 @@ def main():
     logger.info(f"Using device: {device}")
     
     # Create model
-    # With optional LCOFL enhancements (shared attention, deformable convolutions)
+    # With optional shared attention and deformable convolutions
     model = NeuroSymbolicLPR(
         num_frames=config.model.num_frames,
         lr_size=(config.data.lr_height, config.data.lr_width),
@@ -1315,7 +1314,7 @@ def main():
     ).to(device)
     
     if config.training.use_shared_attention:
-        logger.info("Model using shared attention (PLTFAM-style from LCOFL paper)")
+        logger.info("Model using shared attention")
     if config.training.use_deformable_conv:
         logger.info("Model using deformable convolutions")
     

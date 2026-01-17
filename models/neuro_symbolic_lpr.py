@@ -68,8 +68,7 @@ class NeuroSymbolicLPR(nn.Module):
         swinir_num_heads: list = None,  # Default: [6, 6, 6, 6, 6, 6]
         swinir_window_size: int = 8,
         
-        # Shared Attention configuration (from LCOFL paper: Nascimento et al.)
-        # PLTFAM-style attention with shared weights across all RSTB blocks
+        # Shared Attention configuration
         use_shared_attention: bool = False,
         use_deformable_conv: bool = False,
         
@@ -103,7 +102,7 @@ class NeuroSymbolicLPR(nn.Module):
             swinir_depths: Depths for SwinIR transformer blocks (default: [6]*6).
             swinir_num_heads: Number of heads for SwinIR (default: [6]*6).
             swinir_window_size: Window size for SwinIR attention.
-            use_shared_attention: Enable shared attention (PLTFAM-style from LCOFL paper).
+            use_shared_attention: Enable shared attention in SwinIR.
             use_deformable_conv: Enable deformable convolutions in shared attention.
             use_pretrained_parseq: Whether to use pretrained PARSeq (recommended).
             parseq_model_name: Pretrained model name ('parseq' or 'parseq_tiny').
@@ -187,7 +186,7 @@ class NeuroSymbolicLPR(nn.Module):
         )
         
         # Upsampling from LR to HR using full SwinIR architecture
-        # With optional shared attention (PLTFAM-style) from LCOFL paper
+        # With optional shared attention
         upscale = hr_size[0] // lr_size[0]
         
         self.generator = SwinIRGenerator(
