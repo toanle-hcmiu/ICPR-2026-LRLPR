@@ -857,13 +857,38 @@ def load_checkpoint(
     optimizer_g: Optional[optim.Optimizer] = None,
     optimizer_d: Optional[optim.Optimizer] = None
 ) -> Dict:
-    """Load training checkpoint."""
+    """
+    Load training checkpoint with backward compatibility.
+    
+    Uses strict=False to allow loading checkpoints from older model versions
+    that may not have new components (e.g., shared attention module).
+    Missing weights will be randomly initialized.
+    """
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
     
-    model.load_state_dict(checkpoint['model_state_dict'])
+    # Use strict=False for backward compatibility with older checkpoints
+    # This allows loading checkpoints that don't have shared attention weights
+    missing_keys, unexpected_keys = model.load_state_dict(
+        checkpoint['model_state_dict'], 
+        strict=False
+    )
+    
+    # Log any missing or unexpected keys for debugging
+    if missing_keys:
+        # Filter to just show summary instead of all keys
+        shared_attn_keys = [k for k in missing_keys if 'shared_attention' in k]
+        other_keys = [k for k in missing_keys if 'shared_attention' not in k]
+        
+        if shared_attn_keys:
+            print(f"[INFO] Checkpoint missing {len(shared_attn_keys)} shared_attention weights (will be randomly initialized)")
+        if other_keys:
+            print(f"[WARNING] Checkpoint missing {len(other_keys)} other weights: {other_keys[:5]}...")
+    
+    if unexpected_keys:
+        print(f"[WARNING] Checkpoint has {len(unexpected_keys)} unexpected keys: {unexpected_keys[:5]}...")
     
     if discriminator is not None and 'discriminator_state_dict' in checkpoint:
-        discriminator.load_state_dict(checkpoint['discriminator_state_dict'])
+        discriminator.load_state_dict(checkpoint['discriminator_state_dict'], strict=False)
     
     if optimizer_g is not None and 'optimizer_g_state_dict' in checkpoint:
         optimizer_g.load_state_dict(checkpoint['optimizer_g_state_dict'])
