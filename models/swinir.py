@@ -6,15 +6,28 @@ super-resolution, based on the paper "SwinIR: Image Restoration Using Swin Trans
 It uses Swin Transformer blocks with shifted window attention to restore 
 high-resolution details from low-resolution inputs.
 
-Reference: https://github.com/JingyunLiang/SwinIR
+Enhanced with optional Shared Attention Module (PLTFAM-style) from the LCOFL paper:
+"Enhancing License Plate Super-Resolution: A Layout-Aware and Character-Driven Approach"
+
+Reference: 
+- SwinIR: https://github.com/JingyunLiang/SwinIR
+- LCOFL: Nascimento et al. (SIBGRAPI 2024)
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Tuple, Optional, List
+from typing import Tuple, Optional, List, Union
 import math
 from einops import rearrange
+
+# Import SharedAttentionModule for optional PLTFAM-style attention
+try:
+    from .shared_attention import SharedAttentionModule
+    HAS_SHARED_ATTENTION = True
+except ImportError:
+    SharedAttentionModule = None
+    HAS_SHARED_ATTENTION = False
 
 
 def window_partition(x: torch.Tensor, window_size: int) -> torch.Tensor:
@@ -255,6 +268,7 @@ class RSTB(nn.Module):
     Residual Swin Transformer Block (RSTB).
     
     Contains multiple Swin Transformer blocks with residual connection.
+    Optionally enhanced with shared attention module (PLTFAM-style) from LCOFL paper.
     """
     
     def __init__(
@@ -267,12 +281,29 @@ class RSTB(nn.Module):
         mlp_ratio: float = 4.0,
         drop: float = 0.0,
         attn_drop: float = 0.0,
-        drop_path: float = 0.0
+        drop_path: float = 0.0,
+        shared_attention: Optional[nn.Module] = None
     ):
+        """
+        Initialize RSTB.
+        
+        Args:
+            dim: Feature dimension.
+            input_resolution: Input resolution (H, W).
+            depth: Number of Swin Transformer blocks.
+            num_heads: Number of attention heads.
+            window_size: Window size for attention.
+            mlp_ratio: MLP expansion ratio.
+            drop: Dropout rate.
+            attn_drop: Attention dropout rate.
+            drop_path: Stochastic depth rate.
+            shared_attention: Optional shared attention module (PLTFAM-style).
+        """
         super().__init__()
         
         self.dim = dim
         self.input_resolution = input_resolution
+        self.shared_attention = shared_attention
         
         self.blocks = nn.ModuleList([
             SwinTransformerBlock(
@@ -300,11 +331,20 @@ class RSTB(nn.Module):
         for block in self.blocks:
             x = block(x)
         
+        # Convert to BCHW for conv
         x = x.view(B, H, W, C).permute(0, 3, 1, 2)
         x = self.conv(x)
+        
+        # Apply shared attention if provided (PLTFAM-style from LCOFL paper)
+        # The shared attention module expects BCHW format
+        if self.shared_attention is not None:
+            x = self.shared_attention(x)
+        
+        # Convert back to BLC for residual
         x = x.permute(0, 2, 3, 1).view(B, L, C)
         
         return x + shortcut
+
 
 
 class Upsample(nn.Module):
@@ -347,7 +387,9 @@ class SwinIRGenerator(nn.Module):
         img_size: Tuple[int, int] = (16, 48),
         drop_rate: float = 0.0,
         attn_drop_rate: float = 0.0,
-        drop_path_rate: float = 0.1
+        drop_path_rate: float = 0.1,
+        use_shared_attention: bool = False,
+        use_deformable: bool = False
     ):
         """
         Initialize SwinIR Generator.
@@ -365,6 +407,8 @@ class SwinIRGenerator(nn.Module):
             drop_rate: Dropout rate.
             attn_drop_rate: Attention dropout rate.
             drop_path_rate: Stochastic depth rate.
+            use_shared_attention: Whether to use shared attention (PLTFAM-style from LCOFL paper).
+            use_deformable: Whether to use deformable convolutions in shared attention.
         """
         super().__init__()
         
@@ -375,6 +419,7 @@ class SwinIRGenerator(nn.Module):
         
         self.window_size = window_size
         self.upscale = upscale
+        self.use_shared_attention = use_shared_attention
         num_layers = len(depths)
         
         # Pad image size to be divisible by window size
@@ -386,6 +431,19 @@ class SwinIRGenerator(nn.Module):
         
         # Shallow feature extraction
         self.conv_first = nn.Conv2d(in_channels, embed_dim, 3, 1, 1)
+        
+        # Create shared attention module if enabled (PLTFAM-style from LCOFL paper)
+        # A single attention module is shared across all RSTB blocks for:
+        # 1. Consistent feature emphasis from early to late layers
+        # 2. Parameter efficiency through weight sharing
+        # 3. Better character feature extraction
+        self.shared_attention = None
+        if use_shared_attention and HAS_SHARED_ATTENTION:
+            self.shared_attention = SharedAttentionModule(
+                in_channels=embed_dim,
+                reduction_ratio=16,
+                use_deformable=use_deformable
+            )
         
         # Deep feature extraction (Swin Transformer blocks)
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]
@@ -401,7 +459,8 @@ class SwinIRGenerator(nn.Module):
                 mlp_ratio=mlp_ratio,
                 drop=drop_rate,
                 attn_drop=attn_drop_rate,
-                drop_path=dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])]
+                drop_path=dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])],
+                shared_attention=self.shared_attention
             )
             self.layers.append(layer)
         

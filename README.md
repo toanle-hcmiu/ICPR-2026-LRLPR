@@ -434,12 +434,31 @@ Annotations format:
 - 🐛 Fixed OCR loss NaN during STN stage validation
 - 🐛 Fixed loss accumulation skipping NaN values
 
-### v1.3.0 (Current)
+### v1.4.0 (Current)
+
+**GAN Training Stability Fixes:**
+- 🐛 Fixed LSGAN mismatch: Generator used MSE but Discriminator used BCE
+- 🐛 Fixed warm-up period: GAN loss now completely disabled during warm-up
+- 🐛 Fixed GAN weight cap: Was capped at 0.01 instead of config value 0.05
+- 🐛 Fixed R1 penalty: Reduced from 5.0 to 1.0 for LSGAN stability  
+- 🐛 Fixed validation loss: Was returning 0.0 due to NaN check on all outputs
+- ✅ Added `--reset-epoch` flag for resuming training with epoch reset
+- ✅ Increased warm-up epochs from 5 to 10
+
+**Documentation:**
+- ✅ Updated AGENTS.md with known issues and unintegrated features
+- ✅ Clarified features implemented but not yet integrated:
+  - OCR-as-Discriminator (`losses/ocr_discriminator.py`) - NOT integrated
+  - Deformable Conv (`models/deformable_conv.py`) - NOT integrated  
+  - Shared Attention (`models/shared_attention.py`) - NOT integrated
+
+### v1.3.0
 
 **LCOFL Paper Implementation:**
 - ✅ LCOFL Loss with 4 components (classification, layout penalty, SSIM, confusion tracking)
-- ✅ Deformable Convolution v2 module
-- ✅ PLTFAM-style Shared Attention Module
+- ✅ Deformable Convolution v2 module (implemented, not integrated)
+- ✅ PLTFAM-style Shared Attention Module (implemented, not integrated)
+- ✅ OCR-as-Discriminator module (implemented, not integrated)
 - ✅ Confusion matrix tracking during validation
 - ✅ Dynamic character weight updates based on confusion pairs
 

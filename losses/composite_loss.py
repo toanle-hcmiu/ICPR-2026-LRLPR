@@ -683,20 +683,16 @@ class CompositeLoss(nn.Module):
                     ref_tensor = v
                     break
             
-            # Check for NaN in all outputs first - early exit if model is corrupted
-            outputs_have_nan = any(
-                torch.isnan(v).any() or torch.isinf(v).any() 
-                for k, v in outputs.items() 
-                if isinstance(v, torch.Tensor)
-            )
+            # For restoration, only check hr_image for NaN (other outputs like masked_logits may have NaN during early training)
+            hr_image_has_nan = False
+            if 'hr_image' in outputs:
+                hr_image_has_nan = torch.isnan(outputs['hr_image']).any() or torch.isinf(outputs['hr_image']).any()
             
-            if outputs_have_nan:
-                # Model outputs are corrupted, return zero loss with gradient
-                # Must use a tensor that requires_grad to maintain gradient flow
+            if hr_image_has_nan:
+                # HR image is corrupted, return zero loss
                 if ref_tensor is not None:
                     zero_loss = ref_tensor.sum() * 0.0
                 else:
-                    # Last resort: create a new tensor with requires_grad
                     any_output = next(v for v in outputs.values() if isinstance(v, torch.Tensor))
                     zero_loss = (any_output.detach() * 0.0).sum().requires_grad_(True)
                 loss_dict['total'] = 0.0
@@ -704,8 +700,8 @@ class CompositeLoss(nn.Module):
                 return zero_loss, loss_dict
             
             if 'hr_image' in outputs and 'hr_image' in targets:
-                # Check for NaN inputs
-                if not (torch.isnan(outputs['hr_image']).any() or torch.isnan(targets['hr_image']).any()):
+                # Check for NaN in targets as well
+                if not torch.isnan(targets['hr_image']).any():
                     l_pixel = self.pixel_loss(outputs['hr_image'], targets['hr_image'])
                     l_pixel = self._clamp_loss(l_pixel)
                     loss_dict['pixel'] = self._safe_loss_item(l_pixel)
@@ -718,9 +714,8 @@ class CompositeLoss(nn.Module):
                         l_gan = self.gan_loss(pred_fake, target_is_real=True)
                         l_gan = self._clamp_loss(l_gan)
                         loss_dict['gan'] = self._safe_loss_item(l_gan)
-                        # Use capped GAN weight for stability (max 0.01)
-                        capped_gan_weight = min(0.01, self.weights['gan'])
-                        weighted_gan = capped_gan_weight * l_gan
+                        # Use config GAN weight (removed artificial cap of 0.01)
+                        weighted_gan = self.weights['gan'] * l_gan
                         total_loss = weighted_gan if total_loss is None else total_loss + weighted_gan
             
             if 'layout_logits' in outputs and 'layout' in targets:

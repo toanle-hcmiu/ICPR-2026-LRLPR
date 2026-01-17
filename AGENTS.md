@@ -194,6 +194,37 @@ def _clamp_loss(self, loss, max_val=100.0):
 **Gotcha**: Logits are `(B, PLATE_LENGTH, VOCAB_SIZE)` - no BOS/EOS  
 **Solution**: Slice targets: `targets[:, 1:PLATE_LENGTH + 1]`
 
+### 6. GAN Training Stability
+**Issues Fixed**: LSGAN mismatch, GAN weight cap, R1 penalty, warm-up  
+**File**: `train.py`, `losses/composite_loss.py`  
+**Details**: See commit history or walkthrough artifact for full list
+
+## LCOFL Paper Features (Nascimento et al.)
+
+> **INTEGRATED**: These features from "Enhancing License Plate Super-Resolution: A Layout-Aware and Character-Driven Approach" are now fully integrated.
+
+### OCR-as-Discriminator
+- **File**: `losses/ocr_discriminator.py`
+- **Config**: `use_ocr_discriminator: True` (config.py line 204)
+- **Status**: ✅ Integrated into `train.py:train_stage()` and `train_epoch()`
+- **Purpose**: Uses OCR recognition confidence instead of binary real/fake for more stable GAN training
+- **Usage**: Set `config.training.use_ocr_discriminator = True` to enable
+
+### Shared Attention Module (PLTFAM-style)
+- **File**: `models/shared_attention.py`
+- **Config**: `use_shared_attention: True` (config.py line 199)
+- **Status**: ✅ Integrated into `models/swinir.py` RSTB blocks
+- **Purpose**: Three-fold attention (Channel, Positional, Geometrical) with shared weights across all RSTB blocks
+- **Usage**: Set `config.training.use_shared_attention = True` to enable
+
+### Deformable Convolutions
+- **File**: `models/deformable_conv.py`
+- **Config**: `use_deformable_conv: True` (config.py line 200)
+- **Status**: ✅ Integrated via Shared Attention Module
+- **Purpose**: Adaptive spatial sampling for character alignment
+- **Usage**: Set `config.training.use_deformable_conv = True` (requires `use_shared_attention = True`)
+
+
 ## Testing Changes
 
 ### Quick Validation

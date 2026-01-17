@@ -107,7 +107,7 @@ class PretrainedPARSeq(nn.Module):
             
             self._loaded = True
             self._use_fallback = False
-            print(f"✓ Loaded pretrained PARSeq ({self.model_name})")
+            print(f"[OK] Loaded pretrained PARSeq ({self.model_name})")
             
         except Exception as e:
             warnings.warn(
@@ -130,7 +130,7 @@ class PretrainedPARSeq(nn.Module):
             self._model = None
             self._use_fallback = True
             self._loaded = True
-            print(f"✓ Initialized custom PARSeq fallback implementation")
+            print("[OK] Initialized custom PARSeq fallback implementation")
     
     def _create_charset_adapter(self):
         """

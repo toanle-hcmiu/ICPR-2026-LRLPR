@@ -36,6 +36,7 @@ from config import Config, get_default_config
 from models import NeuroSymbolicLPR, PatchDiscriminator
 from losses import CompositeLoss, CornerLoss, GANLoss, ConfusionMatrixTracker
 from losses.composite_loss import StagedTrainingManager
+from losses.ocr_discriminator import create_ocr_discriminator, OCRDiscriminatorLoss
 from data import RodoSolDataset, SyntheticLPRDataset, LPRAugmentation, lpr_collate_fn
 
 
@@ -264,7 +265,8 @@ def train_epoch(
     scaler_d: Optional[GradScaler] = None,
     ema: Optional[EMA] = None,
     grad_clip_norm: float = 1.0,
-    total_epochs: int = 20
+    total_epochs: int = 20,
+    ocr_discriminator_loss: Optional['OCRDiscriminatorLoss'] = None
 ) -> Dict[str, float]:
     """
     Train for one epoch with optional mixed precision.
@@ -305,7 +307,7 @@ def train_epoch(
     label_smoothing_real = 0.9  # Smooth real labels to prevent overconfidence
     label_smoothing_fake = 0.0  # Keep fake labels at 0
     d_update_freq = 1  # Update D every N batches (will increase if D too strong)
-    r1_gamma = 5.0  # R1 gradient penalty weight (reduced for stability)
+    r1_gamma = 1.0  # R1 gradient penalty weight (reduced from 5.0 for LSGAN stability)
     # Instance noise: start at 0.1, decay to 0 over training
     instance_noise_std = max(0.0, 0.1 * (1.0 - epoch / max(total_epochs, 1)))
     
@@ -374,6 +376,27 @@ def train_epoch(
                 loss_g, loss_dict = criterion.get_stage_loss('restoration', outputs, targets, current_discriminator)
             else:
                 loss_g, loss_dict = criterion(outputs, targets, current_discriminator)
+            
+            # Add OCR-based guidance loss if configured (from LCOFL paper)
+            # This uses recognition confidence to guide super-resolution
+            if ocr_discriminator_loss is not None and stage in ['restoration', 'full']:
+                # Get text targets (remove BOS/EOS tokens)
+                text_targets = targets['text_indices'][:, 1:-1]  # (B, PLATE_LENGTH)
+                
+                # Compute OCR guidance loss on generated HR images
+                ocr_loss, ocr_metrics = ocr_discriminator_loss.generator_loss(
+                    fake_images=outputs['hr_image'],
+                    targets=text_targets,
+                    real_images=targets['hr_image']
+                )
+                
+                # Add to total loss
+                if not check_for_nan(ocr_loss, "ocr_guidance"):
+                    loss_g = loss_g + ocr_loss
+                    loss_dict['ocr_guidance'] = ocr_metrics.get('total', ocr_loss.item())
+                    loss_dict['ocr_fake_conf'] = ocr_metrics.get('fake_confidence', 0.0)
+                    if 'real_confidence' in ocr_metrics:
+                        loss_dict['ocr_real_conf'] = ocr_metrics['real_confidence']
         
         # Check for NaN loss and skip batch if detected
         if check_for_nan(loss_g, "loss_g"):
@@ -539,13 +562,17 @@ def train_epoch(
                             torch.clamp(pred_fake, -10.0, 10.0)
                         )
                         
-                        loss_d_real = F.binary_cross_entropy_with_logits(pred_real_safe, real_target)
-                        loss_d_fake = F.binary_cross_entropy_with_logits(pred_fake_safe, fake_target)
+                        # LSGAN discriminator loss: use MSE instead of BCE
+                        # Real samples should output ~1.0, fake samples should output ~0.0
+                        # Use MSE loss (LSGAN) instead of BCE
+                        loss_d_real = F.mse_loss(pred_real_safe, real_target)
+                        loss_d_fake = F.mse_loss(pred_fake_safe, fake_target)
                         loss_d = (loss_d_real + loss_d_fake) / 2
                         
-                        # Check D strength: if D is too strong, reduce update frequency
-                        d_acc_real = (torch.sigmoid(pred_real_safe) > 0.5).float().mean().item()
-                        d_acc_fake = (torch.sigmoid(pred_fake_safe) < 0.5).float().mean().item()
+                        # For LSGAN, accuracy is based on distance from target
+                        # Real is correct if pred > 0.5, Fake is correct if pred < 0.5
+                        d_acc_real = (pred_real_safe > 0.5).float().mean().item()
+                        d_acc_fake = (pred_fake_safe < 0.5).float().mean().item()
                         d_accuracy = (d_acc_real + d_acc_fake) / 2
                 
                 # Adaptive D update frequency: skip more often if D is winning
@@ -947,6 +974,28 @@ def train_stage(
         gan_mode='lsgan'  # Use LSGAN (MSE loss) instead of vanilla (BCE) to prevent vanishing gradients when D is too strong
     )
     
+    # Create OCR Discriminator if configured (from LCOFL paper: Nascimento et al.)
+    # Uses OCR recognition confidence instead of binary real/fake classification
+    # This provides more stable training and directly optimizes for recognizability
+    ocr_discriminator = None
+    ocr_discriminator_loss = None
+    if config.training.use_ocr_discriminator and stage in ['restoration', 'full']:
+        logger.info("Using OCR-as-Discriminator for GAN training (LCOFL paper approach)")
+        logger.info(f"  OCR frozen: {config.training.freeze_ocr_discriminator}")
+        logger.info(f"  Confidence mode: {config.training.ocr_confidence_mode}")
+        logger.info(f"  OCR guidance weight: {config.training.weight_ocr_guidance}")
+        
+        ocr_discriminator = create_ocr_discriminator(
+            ocr_model=model.recognizer,
+            freeze_ocr=config.training.freeze_ocr_discriminator,
+            confidence_mode=config.training.ocr_confidence_mode
+        )
+        ocr_discriminator_loss = OCRDiscriminatorLoss(
+            ocr_discriminator=ocr_discriminator,
+            generator_loss_type='combined',
+            lambda_conf=config.training.weight_ocr_guidance
+        )
+    
     # Create optimizers
     optimizer_g = create_optimizer(model, stage, config)
     optimizer_d = None
@@ -987,7 +1036,7 @@ def train_stage(
             model, discriminator, train_loader, criterion,
             optimizer_g, optimizer_d, device, epoch, stage, writer, logger,
             scaler_g=scaler_g, scaler_d=scaler_d, ema=ema, grad_clip_norm=grad_clip_norm,
-            total_epochs=num_epochs
+            total_epochs=num_epochs, ocr_discriminator_loss=ocr_discriminator_loss
         )
         
         # Log training losses
@@ -1231,11 +1280,19 @@ def main():
     logger.info(f"Using device: {device}")
     
     # Create model
+    # With optional LCOFL enhancements (shared attention, deformable convolutions)
     model = NeuroSymbolicLPR(
         num_frames=config.model.num_frames,
         lr_size=(config.data.lr_height, config.data.lr_width),
         hr_size=(config.data.hr_height, config.data.hr_width),
+        use_shared_attention=config.training.use_shared_attention,
+        use_deformable_conv=config.training.use_deformable_conv,
     ).to(device)
+    
+    if config.training.use_shared_attention:
+        logger.info("Model using shared attention (PLTFAM-style from LCOFL paper)")
+    if config.training.use_deformable_conv:
+        logger.info("Model using deformable convolutions")
     
     # Create discriminator
     discriminator = PatchDiscriminator(
