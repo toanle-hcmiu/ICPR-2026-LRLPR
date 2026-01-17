@@ -138,17 +138,19 @@ class LocalizationNetwork(nn.Module):
         # This prevents gradient explosion from unbounded affine parameters
         # tanh provides smooth saturation (unlike hard clamp) and stable gradients
         
-        # Scale components (indices [0,0] and [1,1]): bound to [0.5, 1.5] via tanh
-        # This allows reasonable scaling while preventing extreme values
-        # Formula: scale = 1.0 + 0.5 * tanh(raw) => range [0.5, 1.5]
-        scale_x = 1.0 + 0.5 * torch.tanh(theta_raw[:, 0, 0])
-        scale_y = 1.0 + 0.5 * torch.tanh(theta_raw[:, 1, 1])
+        # UNIFORM Scale: Use average of both scale components to prevent stretching
+        # This ensures rectangular output (same scale for both dimensions)
+        # Formula: scale = 1.0 + 0.5 * tanh(avg_raw) => range [0.5, 1.5]
+        scale_raw = (theta_raw[:, 0, 0] + theta_raw[:, 1, 1]) / 2
+        scale = 1.0 + 0.5 * torch.tanh(scale_raw)
+        scale_x = scale  # Same for x and y
+        scale_y = scale
         
-        # Shear components (indices [0,1] and [1,0]): bound to [-0.3, 0.3]
-        # Shear should be small for license plate rectification
-        # Formula: shear = 0.3 * tanh(raw) => range [-0.3, 0.3]
-        shear_x = 0.3 * torch.tanh(theta_raw[:, 0, 1])
-        shear_y = 0.3 * torch.tanh(theta_raw[:, 1, 0])
+        # Shear components: REDUCED to ±0.1 to prevent parallelogram distortion
+        # License plates should be rectangular, so minimal shear is needed
+        # Formula: shear = 0.1 * tanh(raw) => range [-0.1, 0.1]
+        shear_x = 0.1 * torch.tanh(theta_raw[:, 0, 1])
+        shear_y = 0.1 * torch.tanh(theta_raw[:, 1, 0])
         
         # Translation components (indices [0,2] and [1,2]): bound to [-0.5, 0.5]
         # Translation should be bounded to prevent sampling outside image

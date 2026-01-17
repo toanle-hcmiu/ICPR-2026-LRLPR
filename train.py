@@ -390,13 +390,24 @@ def train_epoch(
                     real_images=targets['hr_image']
                 )
                 
-                # Add to total loss
-                if not check_for_nan(ocr_loss, "ocr_guidance"):
-                    loss_g = loss_g + ocr_loss
-                    loss_dict['ocr_guidance'] = ocr_metrics.get('total', ocr_loss.item())
-                    loss_dict['ocr_fake_conf'] = ocr_metrics.get('fake_confidence', 0.0)
-                    if 'real_confidence' in ocr_metrics:
-                        loss_dict['ocr_real_conf'] = ocr_metrics['real_confidence']
+                # Only apply OCR guidance if the OCR model has meaningful confidence
+                # If real image confidence is too low, the OCR model is untrained/unreliable
+                real_conf = ocr_metrics.get('real_confidence', 0.0)
+                min_ocr_confidence = 0.10  # 10% threshold
+                
+                if real_conf >= min_ocr_confidence:
+                    # Add to total loss
+                    if not check_for_nan(ocr_loss, "ocr_guidance"):
+                        loss_g = loss_g + ocr_loss
+                        loss_dict['ocr_guidance'] = ocr_metrics.get('total', ocr_loss.item())
+                else:
+                    # Skip OCR guidance - model not ready
+                    loss_dict['ocr_guidance'] = 0.0
+                
+                # Always log confidence for monitoring
+                loss_dict['ocr_fake_conf'] = ocr_metrics.get('fake_confidence', 0.0)
+                if 'real_confidence' in ocr_metrics:
+                    loss_dict['ocr_real_conf'] = ocr_metrics['real_confidence']
         
         # Check for NaN loss and skip batch if detected
         if check_for_nan(loss_g, "loss_g"):
