@@ -253,7 +253,7 @@ class OCRDiscriminatorLoss(nn.Module):
             # Direct cross-entropy on OCR predictions
             logits = output['logits']  # (B, L, V)
             B, L, V = logits.shape
-            loss = self.ce_loss(logits.view(-1, V), targets.view(-1))
+            loss = self.ce_loss(logits.reshape(-1, V), targets.reshape(-1))
             
         elif self.generator_loss_type == 'combined':
             # Combine confidence and cross-entropy
@@ -261,7 +261,7 @@ class OCRDiscriminatorLoss(nn.Module):
             
             logits = output['logits']
             B, L, V = logits.shape
-            ce_loss = self.ce_loss(logits.view(-1, V), targets.view(-1))
+            ce_loss = self.ce_loss(logits.reshape(-1, V), targets.reshape(-1))
             
             loss = self.lambda_conf * conf_loss + self.lambda_ce * ce_loss
             metrics['ce_loss'] = ce_loss.item()
