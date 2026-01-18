@@ -228,9 +228,9 @@ class PretrainedPARSeq(nn.Module):
         if self._model is None:
             raise RuntimeError("PARSeq model not loaded. Check your internet connection.")
         
-        # Pretrained model expects images in [0, 1] range
-        # Our images are in [-1, 1] range
-        x_normalized = (x + 1) / 2
+        # Pretrained PARSeq expects images in [-1, 1] range
+        # Our images are already in [-1, 1] range from the dataset
+        x_normalized = x  # No conversion needed!
         
         # Pretrained PARSeq expects 32x128 images, resize if needed
         pretrained_size = (32, 128)
