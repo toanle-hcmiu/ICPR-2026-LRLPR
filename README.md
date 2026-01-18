@@ -27,51 +27,262 @@ This system recognizes Brazilian license plates in two formats:
 
 ## Architecture
 
+The system implements a **4-phase end-to-end pipeline** for low-resolution license plate recognition, combining deep learning with symbolic reasoning.
+
+### High-Level Overview
+
 ```
-Input (5 LR Frames: 16×48)
-       │
-       ▼
-┌─────────────────┐
-│ Shared CNN      │  Phase 1: Feature Extraction
-│ Encoder         │  (4 blocks, 64→512 channels)
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│ Spatial         │  Phase 1: Geometric Alignment
-│ Transformer Net │  (Self-supervised + Corner Loss)
-└────────┬────────┘
-         │
-    ┌────┴────┐
-    │         │
-    ▼         ▼
-┌───────┐ ┌────────────┐
-│Layout │ │Quality     │  Phase 2: Classification & Fusion
-│Classif│ │Scorer+Fuse │
-└───┬───┘ └─────┬──────┘
-    │           │
-    │      ┌────┘
-    │      ▼
-    │  ┌─────────────────┐
-    │  │ SwinIR          │  Phase 3: Super-Resolution (4×)
-    │  │ Generator       │  (6 RSTB, 180 dim, window=8)
-    │  └────────┬────────┘
-    │           │
-    │           ▼
-    │  ┌─────────────────┐
-    │  │ Pretrained      │  Phase 4: Recognition
-    │  │ PARSeq          │  (from baudm/parseq)
-    │  └────────┬────────┘
-    │           │
-    ▼           ▼
-┌─────────────────────────┐
-│ Syntax Mask Layer       │  Neuro-Symbolic Integration
-│ (Dynamic Constraints)   │
-└────────────┬────────────┘
-             │
-             ▼
-      Plate Text Output (64×192 HR)
+Input: 5 LR Frames (16×48×3 each)
+              │
+              ▼
+┌─────────────────────────────────────────────────────────────┐
+│  PHASE 1: Feature Extraction & Geometric Alignment           │
+│  ┌─────────────┐     ┌─────────────┐                        │
+│  │ SharedCNN   │──▶──│    STN      │  Rectified Features    │
+│  │ Encoder     │     │ (Affine)    │  (B,T,512,4,12)        │
+│  └─────────────┘     └──────┬──────┘                        │
+└──────────────────────────────┼──────────────────────────────┘
+                               │
+              ┌────────────────┼────────────────┐
+              ▼                ▼                ▼
+┌─────────────────────────────────────────────────────────────┐
+│  PHASE 2: Classification & Frame Fusion                      │
+│  ┌─────────────┐     ┌─────────────────────────┐            │
+│  │  Layout     │     │ Quality Scorer + Fusion │            │
+│  │ Classifier  │     │ (Weighted Average)      │            │
+│  └──────┬──────┘     └───────────┬─────────────┘            │
+│         │                        │                          │
+│    Layout Prob              Fused Feature                   │
+│   (Brazilian/               (B,512,4,12)                    │
+│    Mercosul)                     │                          │
+└─────────────────────────────────┬┼──────────────────────────┘
+                               │  │
+                               ▼  ▼
+┌─────────────────────────────────────────────────────────────┐
+│  PHASE 3: Super-Resolution (4× Upscaling)                    │
+│  ┌─────────────────────────────────────────────────────┐    │
+│  │              SwinIR Generator                        │    │
+│  │  ┌─────────────────────────────────────────────────┐│    │
+│  │  │ 6 RSTB Blocks (each with Shared Attention)      ││    │
+│  │  │ • Swin Transformer Layers (window=8)            ││    │
+│  │  │ • 180 embed dim, 6 heads                        ││    │
+│  │  │ • Deformable Conv support                       ││    │
+│  │  └─────────────────────────────────────────────────┘│    │
+│  └────────────────────────┬────────────────────────────┘    │
+│                           │                                  │
+│                     HR Image (64×192×3)                      │
+└───────────────────────────┬─────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│  PHASE 4: Recognition & Neuro-Symbolic Decoding              │
+│  ┌─────────────┐     ┌─────────────────────────────────┐    │
+│  │ PARSeq      │──▶──│     Syntax Mask Layer           │    │
+│  │ (Pretrained)│     │ (Dynamic Position Constraints)  │    │
+│  └─────────────┘     └───────────────┬─────────────────┘    │
+│                                      │                       │
+│                              Masked Logits (B,7,39)          │
+└──────────────────────────────────────┼──────────────────────┘
+                                       │
+                                       ▼
+                         Output: Plate Text (7 chars)
+                         Example: "ABC1234" or "ABC1D23"
 ```
+
+---
+
+### Detailed Component Specifications
+
+#### Phase 1: Feature Extraction & Geometric Alignment
+
+| Component | Architecture | Input → Output |
+|-----------|--------------|----------------|
+| **SharedCNNEncoder** | 4 Conv blocks (64→128→256→512 channels), each with Conv3×3 + BN + ReLU + MaxPool2×2 | `(B,T,3,16,48)` → `(B,T,512,4,12)` |
+| **SpatialTransformerNetwork** | Localization CNN + FC → 6 affine params, then `grid_sample` | `(B,T,512,4,12)` → Rectified `(B,T,512,4,12)` |
+| **CornerPredictor** | GAP + FC(512→256→8) with tanh activation | `(B,T,512,4,12)` → `(B,T,4,2)` corners |
+
+**STN Transformation Constraints (tanh-bounded):**
+| Parameter | Formula | Range | Purpose |
+|-----------|---------|-------|---------|
+| Scale | `1.0 + 0.5 × tanh(x)` | [0.5, 1.5] | Uniform for x and y (rectangular output) |
+| Shear | `0.1 × tanh(x)` | [-0.1, 0.1] | Minimal shear to prevent parallelogram |
+| Translation | `0.5 × tanh(x)` | [-0.5, 0.5] | Bounded to keep plate in frame |
+
+---
+
+#### Phase 2: Classification & Frame Fusion
+
+| Component | Architecture | Input → Output |
+|-----------|--------------|----------------|
+| **LayoutClassifier** | GAP + FC(512→256→2) with optional attention | `(B,T,512,4,12)` → `(B,2)` logits |
+| **QualityScorerFusion** | Per-frame quality MLP + softmax → weighted average | `(B,T,512,4,12)` → `(B,512,4,12)` |
+
+**Layout Classification:**
+- Predicts Brazilian (class 0) vs Mercosul (class 1)
+- Optional attention mechanism for difficult cases
+- Output probability determines which syntax mask to apply
+
+**Quality-Weighted Fusion:**
+```
+quality_score[t] = sigmoid(MLP(GAP(features[t])))
+weights = softmax(quality_scores)
+fused = Σ(weights[t] × features[t])
+```
+
+---
+
+#### Phase 3: Super-Resolution (SwinIR Generator)
+
+**Architecture Configuration:**
+```python
+SwinIRGenerator(
+    in_channels=512,        # From encoder (feature space SR)
+    out_channels=3,         # RGB output
+    embed_dim=180,          # Transformer embedding dimension
+    depths=[6,6,6,6,6,6],   # 6 RSTB blocks
+    num_heads=[6,6,6,6,6,6],# 6 attention heads per block
+    window_size=8,          # Swin Transformer window size
+    upscale=4,              # 4× upscaling (16×48 → 64×192)
+    use_shared_attention=True,   # PLTFAM-style attention
+    use_deformable=True          # Deformable conv in attention
+)
+```
+
+**RSTB Block Structure:**
+```
+Input (B, L, C)
+    │
+    ├──────────────────────────────────┐
+    │                                  │
+    ▼                                  │
+┌────────────────────────────┐         │
+│ Swin Transformer Layers    │         │
+│ (depth=6, window=8)        │         │
+└─────────────┬──────────────┘         │
+              │                        │
+              ▼                        │
+┌────────────────────────────┐         │
+│ Conv 3×3 (residual path)   │         │
+└─────────────┬──────────────┘         │
+              │                        │
+              ▼                        │
+┌────────────────────────────┐         │
+│ Shared Attention Module    │         │
+│ (Channel + Positional +    │         │
+│  Geometrical Attention)    │         │
+└─────────────┬──────────────┘         │
+              │                        │
+              └────────┬───────────────┘
+                       │ (Residual Add)
+                       ▼
+              Output (B, L, C)
+```
+
+**Shared Attention Module:**
+| Component | Architecture | Purpose |
+|-----------|--------------|---------|
+| Channel Attention | GAP → FC → sigmoid | Channel-wise recalibration |
+| Positional Attention | Conv → sigmoid | Spatial position weighting |
+| Geometrical Attention | 3×3 Deformable Conv + sigmoid | Adaptive spatial sampling |
+
+---
+
+#### Phase 4: Recognition & Neuro-Symbolic Decoding
+
+| Component | Architecture | Input → Output |
+|-----------|--------------|----------------|
+| **PretrainedPARSeq** | ViT encoder (12 layers, 384 dim) + Transformer decoder | `(B,3,64,192)` → `(B,7,39)` logits |
+| **SyntaxMaskLayer** | Dynamic masking based on layout + position | Masks invalid characters per position |
+
+**PARSeq OCR:**
+- Uses pretrained weights from [baudm/parseq](https://github.com/baudm/parseq)
+- Trained on scene text datasets (MJSynth, SynthText, etc.)
+- Charset adapted from pretrained → our 36-char vocabulary
+- Falls back to custom implementation if pytorch_lightning unavailable
+
+**Syntax Mask (Neuro-Symbolic Integration):**
+```
+Position:    0   1   2   3   4   5   6
+Brazilian:  [L] [L] [L] [N] [N] [N] [N]   (L=letter, N=number)
+Mercosul:   [L] [L] [L] [N] [L] [N] [N]
+```
+
+| Mode | Invalid Char Value | Use Case |
+|------|-------------------|----------|
+| Training | -100 | Soft masking for stable gradients |
+| Hard Inference | -∞ | Guarantees valid format output |
+| Soft Inference | -50 | Allows exceptions for damaged plates |
+
+---
+
+### GAN Training Architecture
+
+**Discriminators (Stage 2 & 3):**
+
+| Discriminator | Purpose | Loss Type |
+|---------------|---------|-----------|
+| **PatchDiscriminator** | Binary real/fake classification | LSGAN (MSE) |
+| **OCR Discriminator** | Recognition-based quality | Confidence + CE |
+
+**PatchDiscriminator Architecture:**
+```python
+PatchDiscriminator(
+    in_channels=3,
+    base_channels=64,
+    num_layers=3,     # 64 → 128 → 256 → 512
+    use_spectral_norm=True
+)
+# Output: (B, 1, H/8, W/8) patch scores
+```
+
+**OCR Discriminator:**
+- Uses the model's own PARSeq recognizer
+- Measures recognition confidence on generated images
+- Skipped when `ocr_real_conf < 10%` (untrained recognizer)
+
+---
+
+### Training Stages
+
+| Stage | Name | Modules Trained | Modules Frozen | Epochs |
+|-------|------|-----------------|----------------|--------|
+| 1 | STN | Encoder, STN, CornerPredictor | Generator, Recognizer | 50 |
+| 2 | Restoration | Generator, LayoutClassifier, Fusion | Encoder, STN, Recognizer | 100 |
+| 3 | Full | All modules | None | 50 |
+
+**Loss Functions per Stage:**
+
+| Stage | Losses | Formula |
+|-------|--------|---------|
+| **STN** | Self-supervised + Pixel | `L_identity + L_consistency + L_smoothness + L_pixel` |
+| **Restoration** | Pixel + GAN + Layout + OCR Guidance | `L_pixel + 0.1×L_GAN + 0.1×L_layout + L_ocr_guidance` |
+| **Full** | All | `L_pixel + 0.1×L_GAN + 0.5×L_OCR + 0.1×L_geo + 0.1×L_layout` |
+
+---
+
+### Data Flow Summary
+
+```
+Input:  (B, 5, 3, 16, 48)     # 5 LR frames, 16×48 RGB each
+          ↓
+Encoder:  (B, 5, 512, 4, 12)  # Feature maps
+          ↓
+STN:      (B, 5, 512, 4, 12)  # Rectified features
+          ↓
+Layout:   (B, 2)              # Brazilian/Mercosul logits
+          ↓
+Fusion:   (B, 512, 4, 12)     # Quality-weighted single feature
+          ↓
+SwinIR:   (B, 3, 64, 192)     # Super-resolved HR image (4× upscale)
+          ↓
+PARSeq:   (B, 7, 39)          # Raw logits (7 positions × 39 vocab)
+          ↓
+Mask:     (B, 7, 39)          # Valid chars only (position-constrained)
+          ↓
+Output:   ["ABC1234", ...]    # Decoded plate strings
+```
+
+
 
 ## Installation
 

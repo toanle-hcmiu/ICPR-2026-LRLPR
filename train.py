@@ -1184,6 +1184,68 @@ def train_stage(
                     writer.add_image('samples/all_ground_truth_HR', all_gt, epoch)
                     
                     logger.info(f"Logged {num_vis_samples} SR visualization samples to TensorBoard")
+                    
+                    # ============================================
+                    # Visualize STN Rectified Output
+                    # ============================================
+                    # Check if model has STN intermediates
+                    if 'rectified_features' in vis_outputs:
+                        # Get rectified features from model output
+                        # The rectified_features are in feature space (B, T, C, H, W)
+                        # We need to convert them to image space for visualization
+                        
+                        rectified = vis_outputs['rectified_features'][:num_vis_samples]
+                        # rectified shape: (B, T, C, H, W) - take first frame
+                        rectified_first = rectified[:, 0]  # (B, C, H, W)
+                        # Reduce channels to 3 for visualization
+                        if rectified_first.shape[1] > 3:
+                            # Take first 3 channels
+                            stn_output = rectified_first[:, :3]  # (B, 3, H, W)
+                        else:
+                            stn_output = rectified_first
+                        
+                        # Normalize for visualization
+                        stn_min = stn_output.min()
+                        stn_max = stn_output.max()
+                        if stn_max - stn_min > 1e-6:
+                            stn_normalized = (stn_output - stn_min) / (stn_max - stn_min)
+                        else:
+                            stn_normalized = stn_output
+                        stn_normalized = torch.clamp(stn_normalized, 0, 1)
+                        
+                        # Upsample to HR size for better visibility
+                        stn_upsampled = F_vis.interpolate(
+                            stn_normalized,
+                            size=(64, 192),
+                            mode='bilinear',
+                            align_corners=False
+                        )
+                        
+                        # Log STN output grid
+                        stn_grid = make_grid(stn_upsampled, nrow=num_vis_samples, padding=2)
+                        writer.add_image('samples/stn_rectified', stn_grid, epoch)
+                        logger.info(f"Logged STN rectified visualization to TensorBoard")
+                    
+                    # Also visualize input LR frames for comparison
+                    all_lr = make_grid(vis_lr_upsampled, nrow=num_vis_samples, padding=2)
+                    writer.add_image('samples/all_input_LR', all_lr, epoch)
+                    
+                    # Visualize lr_image (after feature_to_image, before SwinIR)
+                    # This is the actual input to the super-resolution
+                    if 'lr_image' in vis_outputs:
+                        lr_img = vis_outputs['lr_image'][:num_vis_samples]
+                        # Denormalize from [-1, 1] to [0, 1]
+                        lr_img_norm = (lr_img + 1) / 2
+                        lr_img_norm = torch.clamp(lr_img_norm, 0, 1)
+                        # Upsample for visibility
+                        lr_img_upsampled = F_vis.interpolate(
+                            lr_img_norm,
+                            size=(64, 192),
+                            mode='bilinear',
+                            align_corners=False
+                        )
+                        lr_img_grid = make_grid(lr_img_upsampled, nrow=num_vis_samples, padding=2)
+                        writer.add_image('samples/lr_image_before_SR', lr_img_grid, epoch)
             
             # Save best model
             if plate_acc > best_acc:
