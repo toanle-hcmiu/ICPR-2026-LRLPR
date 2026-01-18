@@ -320,10 +320,17 @@ class PerceptualLoss(nn.Module):
         """
         features = {}
         
-        for name, idx in self.layer_indices.items():
+        # Sort layer indices to process in order
+        sorted_layers = sorted(self.layer_indices.items(), key=lambda kv: kv[1])
+        
+        # Single forward pass collecting features at each layer
+        current_idx = 0
+        for name, target_idx in sorted_layers:
             if name in self.layer_weights:
-                x = self.vgg[:idx + 1](x)
+                # Process from current position to target layer
+                x = self.vgg[current_idx:target_idx + 1](x)
                 features[name] = x
+                current_idx = target_idx + 1
         
         return features
     
