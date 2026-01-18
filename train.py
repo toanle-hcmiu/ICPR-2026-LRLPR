@@ -1189,6 +1189,7 @@ def train_stage(
                     # Visualize STN Rectified Output
                     # ============================================
                     # Check if model has STN intermediates
+                    logger.info(f"vis_outputs keys: {list(vis_outputs.keys())}")
                     if 'rectified_features' in vis_outputs:
                         # Get rectified features from model output
                         # The rectified_features are in feature space (B, T, C, H, W)
