@@ -726,6 +726,18 @@ class CompositeLoss(nn.Module):
                     weighted_layout = 0.1 * l_layout
                     total_loss = weighted_layout if total_loss is None else total_loss + weighted_layout
             
+            # Perceptual loss for sharper images
+            if self.perceptual_loss is not None and 'hr_image' in outputs and 'hr_image' in targets:
+                if not (torch.isnan(outputs['hr_image']).any() or torch.isnan(targets['hr_image']).any()):
+                    # Denormalize from [-1, 1] to [0, 1] for VGG
+                    pred_for_vgg = (outputs['hr_image'] + 1) / 2
+                    target_for_vgg = (targets['hr_image'] + 1) / 2
+                    l_perceptual = self.perceptual_loss(pred_for_vgg, target_for_vgg)
+                    l_perceptual = self._clamp_loss(l_perceptual)
+                    loss_dict['perceptual'] = self._safe_loss_item(l_perceptual)
+                    weighted_perceptual = self.weights['perceptual'] * l_perceptual
+                    total_loss = weighted_perceptual if total_loss is None else total_loss + weighted_perceptual
+            
             # If no loss was computed, create zero loss with gradient
             if total_loss is None:
                 if ref_tensor is not None:

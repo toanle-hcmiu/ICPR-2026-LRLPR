@@ -1007,6 +1007,8 @@ def train_stage(
         weight_gan=config.training.weight_gan,
         weight_ocr=config.training.weight_ocr,
         weight_geometry=config.training.weight_geometry,
+        use_perceptual=True,  # Enable perceptual loss for sharper images
+        weight_perceptual=0.1,  # VGG feature matching weight
         gan_mode='lsgan'  # Use LSGAN (MSE loss) instead of vanilla (BCE) to prevent vanishing gradients when D is too strong
     )
     
@@ -1247,6 +1249,49 @@ def train_stage(
                         )
                         lr_img_grid = make_grid(lr_img_upsampled, nrow=num_vis_samples, padding=2)
                         writer.add_image('samples/lr_image_before_SR', lr_img_grid, epoch)
+                    
+                    # ============================================
+                    # Visualize OCR Predictions
+                    # ============================================
+                    # Decode predictions and compare to ground truth
+                    if 'masked_logits' in vis_outputs or 'raw_logits' in vis_outputs:
+                        # Get logits (prefer masked if available)
+                        logits_key = 'masked_logits' if 'masked_logits' in vis_outputs else 'raw_logits'
+                        vis_logits = vis_outputs[logits_key][:num_vis_samples]
+                        
+                        # Decode predictions
+                        pred_indices = vis_logits.argmax(dim=-1)  # (B, seq_len)
+                        
+                        # Get charset from config
+                        from config import CHARSET, CHAR_START_IDX
+                        
+                        # Convert indices to text
+                        ocr_results = []
+                        for i in range(min(num_vis_samples, pred_indices.size(0))):
+                            pred_text = ""
+                            for idx in pred_indices[i]:
+                                char_idx = idx.item() - CHAR_START_IDX
+                                if 0 <= char_idx < len(CHARSET):
+                                    pred_text += CHARSET[char_idx]
+                                # Skip padding/special tokens
+                            ocr_results.append(f"GT: {vis_text[i]} | Pred: {pred_text}")
+                        
+                        # Log as text to TensorBoard
+                        ocr_text = "\n".join(ocr_results)
+                        writer.add_text('samples/ocr_predictions', ocr_text, epoch)
+                        
+                        # Also log per-sample confidence if available
+                        if vis_logits.dim() == 3:
+                            # Softmax to get probabilities
+                            probs = torch.softmax(vis_logits, dim=-1)
+                            # Max probability per position
+                            max_probs = probs.max(dim=-1).values
+                            # Average confidence per sample
+                            avg_conf = max_probs.mean(dim=-1)
+                            for i in range(min(num_vis_samples, avg_conf.size(0))):
+                                writer.add_scalar(f'samples/ocr_conf_sample{i}', avg_conf[i].item(), epoch)
+                        
+                        logger.info(f"OCR predictions: {ocr_results}")
             
             # Save best model
             if plate_acc > best_acc:
