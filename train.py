@@ -1274,10 +1274,29 @@ def train_stage(
                                 if 0 <= char_idx < len(CHARSET):
                                     pred_text += CHARSET[char_idx]
                                 # Skip padding/special tokens
-                            ocr_results.append(f"GT: {vis_text[i]} | Pred: {pred_text}")
+                            ocr_results.append(f"GT: {vis_text[i]} | Pred (Generated): {pred_text}")
                         
-                        # Log as text to TensorBoard
-                        ocr_text = "\n".join(ocr_results)
+                        # ============================================
+                        # Also run OCR on Real HR images for comparison
+                        # ============================================
+                        # This helps diagnose if issues are from SR quality or OCR model itself
+                        with torch.no_grad():
+                            # Run OCR recognizer directly on ground truth HR images
+                            real_hr_logits = model.recognizer(vis_hr_gt_norm * 2 - 1)  # Convert back to [-1, 1]
+                            real_pred_indices = real_hr_logits.argmax(dim=-1)  # (B, seq_len)
+                            
+                            ocr_real_results = []
+                            for i in range(min(num_vis_samples, real_pred_indices.size(0))):
+                                real_pred_text = ""
+                                for idx in real_pred_indices[i]:
+                                    char_idx = idx.item() - CHAR_START_IDX
+                                    if 0 <= char_idx < len(CHARSET):
+                                        real_pred_text += CHARSET[char_idx]
+                                ocr_real_results.append(f"GT: {vis_text[i]} | Pred (Real HR): {real_pred_text}")
+                        
+                        # Log as text to TensorBoard - both generated and real HR predictions
+                        ocr_text = "=== OCR on Generated HR ===\n" + "\n".join(ocr_results)
+                        ocr_text += "\n\n=== OCR on Real HR (Ground Truth) ===\n" + "\n".join(ocr_real_results)
                         writer.add_text('samples/ocr_predictions', ocr_text, epoch)
                         
                         # Also log per-sample confidence if available
@@ -1289,9 +1308,17 @@ def train_stage(
                             # Average confidence per sample
                             avg_conf = max_probs.mean(dim=-1)
                             for i in range(min(num_vis_samples, avg_conf.size(0))):
-                                writer.add_scalar(f'samples/ocr_conf_sample{i}', avg_conf[i].item(), epoch)
+                                writer.add_scalar(f'samples/ocr_conf_generated_sample{i}', avg_conf[i].item(), epoch)
+                            
+                            # Log confidence for real HR too
+                            real_probs = torch.softmax(real_hr_logits[:num_vis_samples], dim=-1)
+                            real_max_probs = real_probs.max(dim=-1).values
+                            real_avg_conf = real_max_probs.mean(dim=-1)
+                            for i in range(min(num_vis_samples, real_avg_conf.size(0))):
+                                writer.add_scalar(f'samples/ocr_conf_real_sample{i}', real_avg_conf[i].item(), epoch)
                         
-                        logger.info(f"OCR predictions: {ocr_results}")
+                        logger.info(f"OCR on Generated HR: {ocr_results}")
+                        logger.info(f"OCR on Real HR: {ocr_real_results}")
             
             # Save best model
             if plate_acc > best_acc:
