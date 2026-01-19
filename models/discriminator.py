@@ -10,6 +10,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import List, Optional
 
+from .blur_pool import BlurPool2d, AntiAliasedConv2d
+
 
 class SpectralNorm(nn.Module):
     """Wrapper for spectral normalization."""
@@ -27,6 +29,7 @@ class DiscriminatorBlock(nn.Module):
     Basic discriminator block with optional spectral normalization.
     """
     
+    
     def __init__(
         self,
         in_channels: int,
@@ -36,16 +39,26 @@ class DiscriminatorBlock(nn.Module):
         padding: int = 1,
         use_spectral_norm: bool = True,
         use_bn: bool = True,
-        activation: str = 'leaky_relu'
+        activation: str = 'leaky_relu',
+        use_blur_pool: bool = False  # Anti-aliased downsampling
     ):
         super().__init__()
         
+        self.use_blur_pool = use_blur_pool and stride > 1
+        
+        # If using blur pool, conv has stride=1, then blur pool downsamples
+        actual_stride = 1 if self.use_blur_pool else stride
+        
         # Convolution
-        conv = nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding, bias=not use_bn)
+        conv = nn.Conv2d(in_channels, out_channels, kernel_size, actual_stride, padding, bias=not use_bn)
         if use_spectral_norm:
             conv = nn.utils.spectral_norm(conv)
         
         layers = [conv]
+        
+        # Anti-aliased downsampling: blur then subsample
+        if self.use_blur_pool:
+            layers.append(BlurPool2d(out_channels, stride=stride))
         
         # Batch normalization
         if use_bn:
@@ -77,7 +90,8 @@ class PatchDiscriminator(nn.Module):
         in_channels: int = 3,
         base_channels: int = 64,
         num_layers: int = 3,
-        use_spectral_norm: bool = True
+        use_spectral_norm: bool = True,
+        use_blur_pool: bool = True  # Enable anti-aliasing by default
     ):
         """
         Initialize the PatchGAN discriminator.
@@ -87,6 +101,7 @@ class PatchDiscriminator(nn.Module):
             base_channels: Number of channels in first layer.
             num_layers: Number of discriminator layers.
             use_spectral_norm: Whether to use spectral normalization.
+            use_blur_pool: Whether to use anti-aliased downsampling.
         """
         super().__init__()
         
@@ -98,7 +113,8 @@ class PatchDiscriminator(nn.Module):
                 in_channels, base_channels,
                 kernel_size=4, stride=2, padding=1,
                 use_spectral_norm=use_spectral_norm,
-                use_bn=False
+                use_bn=False,
+                use_blur_pool=use_blur_pool
             )
         ]
         
@@ -106,12 +122,14 @@ class PatchDiscriminator(nn.Module):
         channels = base_channels
         for i in range(1, num_layers):
             out_channels = min(channels * 2, 512)
+            # DiscriminatorBlock uses stride 2 by default
             layers.append(
                 DiscriminatorBlock(
                     channels, out_channels,
                     kernel_size=4, stride=2, padding=1,
                     use_spectral_norm=use_spectral_norm,
-                    use_bn=False  # Disabled: BN is incompatible with R1 gradient penalty
+                    use_bn=False,  # Disabled: BN is incompatible with R1 gradient penalty
+                    use_blur_pool=use_blur_pool
                 )
             )
             channels = out_channels
@@ -123,7 +141,8 @@ class PatchDiscriminator(nn.Module):
                 channels, out_channels,
                 kernel_size=4, stride=1, padding=1,
                 use_spectral_norm=use_spectral_norm,
-                use_bn=False  # Disabled: BN is incompatible with R1 gradient penalty
+                use_bn=False,  # Disabled: BN is incompatible with R1 gradient penalty
+                use_blur_pool=False  # No downsampling here
             )
         )
         channels = out_channels
@@ -151,10 +170,10 @@ class PatchDiscriminator(nn.Module):
 
 class MultiScaleDiscriminator(nn.Module):
     """
-    Multi-scale discriminator for more robust adversarial training.
+    Multi-scale discriminator for high-resolution images.
     
-    Uses multiple discriminators at different scales to provide
-    richer feedback to the generator.
+    Consists of multiple PatchGAN discriminators operating at different scales.
+    This allows capturing both global and local consistency.
     """
     
     def __init__(
@@ -163,10 +182,11 @@ class MultiScaleDiscriminator(nn.Module):
         base_channels: int = 64,
         num_layers: int = 3,
         num_scales: int = 3,
-        use_spectral_norm: bool = True
+        use_spectral_norm: bool = True,
+        use_blur_pool: bool = True  # Enable anti-aliased downsampling
     ):
         """
-        Initialize multi-scale discriminator.
+        Initialize the multi-scale discriminator.
         
         Args:
             in_channels: Number of input channels.
@@ -174,21 +194,27 @@ class MultiScaleDiscriminator(nn.Module):
             num_layers: Number of layers per discriminator.
             num_scales: Number of scales.
             use_spectral_norm: Whether to use spectral normalization.
+            use_blur_pool: Whether to use anti-aliased downsampling.
         """
         super().__init__()
         
         self.num_scales = num_scales
+        self.use_blur_pool = use_blur_pool
         
         # Create discriminators for each scale
         self.discriminators = nn.ModuleList([
             PatchDiscriminator(
-                in_channels, base_channels, num_layers, use_spectral_norm
+                in_channels, base_channels, num_layers, use_spectral_norm,
+                use_blur_pool=use_blur_pool
             )
             for _ in range(num_scales)
         ])
         
         # Downsampler for multi-scale input
-        self.downsample = nn.AvgPool2d(2, stride=2, count_include_pad=False)
+        if use_blur_pool:
+            self.downsample = BlurPool2d(in_channels, stride=2)
+        else:
+            self.downsample = nn.AvgPool2d(2, stride=2, count_include_pad=False)
     
     def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
         """
@@ -221,72 +247,92 @@ class UNetDiscriminator(nn.Module):
         self,
         in_channels: int = 3,
         num_features: int = 64,
-        skip_connections: bool = True
+        skip_connections: bool = True,
+        use_blur_pool: bool = True  # Enable anti-aliased downsampling
     ):
         super().__init__()
         
         self.skip_connections = skip_connections
+        self.use_blur_pool = use_blur_pool
+        
+        # Helper for conv layer type
+        def conv_layer(in_ch, out_ch):
+            if use_blur_pool:
+                return AntiAliasedConv2d(in_ch, out_ch, 3, stride=2, padding=1)
+            else:
+                return nn.Conv2d(in_ch, out_ch, 4, 2, 1)
         
         # Encoder
         self.enc1 = nn.Sequential(
-            nn.Conv2d(in_channels, num_features, 4, 2, 1),
+            conv_layer(in_channels, num_features),
             nn.LeakyReLU(0.2, inplace=True)
         )
         self.enc2 = nn.Sequential(
-            nn.Conv2d(num_features, num_features * 2, 4, 2, 1),
+            conv_layer(num_features, num_features * 2),
             nn.BatchNorm2d(num_features * 2),
             nn.LeakyReLU(0.2, inplace=True)
         )
         self.enc3 = nn.Sequential(
-            nn.Conv2d(num_features * 2, num_features * 4, 4, 2, 1),
+            conv_layer(num_features * 2, num_features * 4),
             nn.BatchNorm2d(num_features * 4),
             nn.LeakyReLU(0.2, inplace=True)
         )
         self.enc4 = nn.Sequential(
-            nn.Conv2d(num_features * 4, num_features * 8, 4, 2, 1),
+            conv_layer(num_features * 4, num_features * 8),
             nn.BatchNorm2d(num_features * 8),
             nn.LeakyReLU(0.2, inplace=True)
         )
         
-        # Decoder
+        # Decoder - Using resize-convolution instead of ConvTranspose2d
+        # to eliminate checkerboard artifacts that cause wavy distortions.
+        # Pattern: Upsample(nearest) + Conv2d instead of ConvTranspose2d
+        # Reference: Odena et al. "Deconvolution and Checkerboard Artifacts"
         dec_in = num_features * 8
         if skip_connections:
             self.dec4 = nn.Sequential(
-                nn.ConvTranspose2d(num_features * 8, num_features * 4, 4, 2, 1),
+                nn.Upsample(scale_factor=2, mode='nearest'),
+                nn.Conv2d(num_features * 8, num_features * 4, 3, 1, 1),
                 nn.BatchNorm2d(num_features * 4),
                 nn.ReLU(inplace=True)
             )
             self.dec3 = nn.Sequential(
-                nn.ConvTranspose2d(num_features * 8, num_features * 2, 4, 2, 1),
+                nn.Upsample(scale_factor=2, mode='nearest'),
+                nn.Conv2d(num_features * 8, num_features * 2, 3, 1, 1),
                 nn.BatchNorm2d(num_features * 2),
                 nn.ReLU(inplace=True)
             )
             self.dec2 = nn.Sequential(
-                nn.ConvTranspose2d(num_features * 4, num_features, 4, 2, 1),
+                nn.Upsample(scale_factor=2, mode='nearest'),
+                nn.Conv2d(num_features * 4, num_features, 3, 1, 1),
                 nn.BatchNorm2d(num_features),
                 nn.ReLU(inplace=True)
             )
             self.dec1 = nn.Sequential(
-                nn.ConvTranspose2d(num_features * 2, 1, 4, 2, 1)
+                nn.Upsample(scale_factor=2, mode='nearest'),
+                nn.Conv2d(num_features * 2, 1, 3, 1, 1)
             )
         else:
             self.dec4 = nn.Sequential(
-                nn.ConvTranspose2d(num_features * 8, num_features * 4, 4, 2, 1),
+                nn.Upsample(scale_factor=2, mode='nearest'),
+                nn.Conv2d(num_features * 8, num_features * 4, 3, 1, 1),
                 nn.BatchNorm2d(num_features * 4),
                 nn.ReLU(inplace=True)
             )
             self.dec3 = nn.Sequential(
-                nn.ConvTranspose2d(num_features * 4, num_features * 2, 4, 2, 1),
+                nn.Upsample(scale_factor=2, mode='nearest'),
+                nn.Conv2d(num_features * 4, num_features * 2, 3, 1, 1),
                 nn.BatchNorm2d(num_features * 2),
                 nn.ReLU(inplace=True)
             )
             self.dec2 = nn.Sequential(
-                nn.ConvTranspose2d(num_features * 2, num_features, 4, 2, 1),
+                nn.Upsample(scale_factor=2, mode='nearest'),
+                nn.Conv2d(num_features * 2, num_features, 3, 1, 1),
                 nn.BatchNorm2d(num_features),
                 nn.ReLU(inplace=True)
             )
             self.dec1 = nn.Sequential(
-                nn.ConvTranspose2d(num_features, 1, 4, 2, 1)
+                nn.Upsample(scale_factor=2, mode='nearest'),
+                nn.Conv2d(num_features, 1, 3, 1, 1)
             )
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:

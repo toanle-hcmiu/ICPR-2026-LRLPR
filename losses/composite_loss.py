@@ -16,6 +16,55 @@ from .gan_loss import GANLoss, PixelLoss, PerceptualLoss
 from .lcofl_loss import LCOFLLoss, SSIMLoss, ConfusionMatrixTracker
 
 
+class TotalVariationLoss(nn.Module):
+    """
+    Total Variation Loss for spatial smoothness.
+    
+    Penalizes high-frequency noise and "wavy" artifacts while preserving sharp edges.
+    Based on Rudin-Osher-Fatemi denoising model.
+    
+    This is the recommended fix for wavy distortions caused by:
+    - Gibbs phenomenon ringing near edges
+    - Aliasing from downsampling
+    - Checkerboard artifacts from upsampling
+    
+    Reference: Rudin, Osher, Fatemi "Nonlinear total variation based noise removal algorithms" (1992)
+    
+    Args:
+        weight: Loss weight (recommended: 1e-5 to 1e-4 for subtle smoothing).
+        reduction: Loss reduction mode ('mean' or 'sum').
+    """
+    
+    def __init__(self, weight: float = 1e-5, reduction: str = 'mean'):
+        super().__init__()
+        self.weight = weight
+        self.reduction = reduction
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Compute Total Variation loss.
+        
+        Args:
+            x: Input tensor of shape (B, C, H, W).
+            
+        Returns:
+            TV loss value (scalar).
+        """
+        # Compute horizontal differences (left-right gradients)
+        diff_h = torch.abs(x[:, :, 1:, :] - x[:, :, :-1, :])
+        
+        # Compute vertical differences (top-bottom gradients)
+        diff_w = torch.abs(x[:, :, :, 1:] - x[:, :, :, :-1])
+        
+        # Sum of absolute differences (L1 Total Variation)
+        # L1 preserves sharp edges better than L2 (allows jump discontinuities)
+        if self.reduction == 'mean':
+            tv_loss = diff_h.mean() + diff_w.mean()
+        else:
+            tv_loss = diff_h.sum() + diff_w.sum()
+        
+        return self.weight * tv_loss
+
 class SelfSupervisedSTNLoss(nn.Module):
     """
     Self-supervised loss for STN training when corner annotations are not available.
@@ -345,6 +394,7 @@ class CompositeLoss(nn.Module):
         weight_perceptual: float = 0.0,
         weight_lcofl: float = 0.0,
         weight_ssim: float = 0.0,
+        weight_tv: float = 0.0,  # Total Variation loss weight for wavy artifact suppression
         gan_mode: str = 'vanilla',
         ocr_loss_type: str = 'cross_entropy',
         use_perceptual: bool = False,
@@ -364,6 +414,7 @@ class CompositeLoss(nn.Module):
             weight_perceptual: Weight for perceptual loss.
             weight_lcofl: Weight for LCOFL loss (0 to disable).
             weight_ssim: Weight for SSIM loss (0 to disable).
+            weight_tv: Weight for Total Variation loss (0 to disable, 1e-5 recommended for wavy suppression).
             gan_mode: Type of GAN loss.
             ocr_loss_type: Type of OCR loss.
             use_perceptual: Whether to use perceptual loss.
@@ -381,7 +432,8 @@ class CompositeLoss(nn.Module):
             'layout': weight_layout,
             'perceptual': weight_perceptual,
             'lcofl': weight_lcofl,
-            'ssim': weight_ssim
+            'ssim': weight_ssim,
+            'tv': weight_tv  # Total Variation for wavy artifact suppression
         }
         
         # Individual losses
@@ -413,6 +465,13 @@ class CompositeLoss(nn.Module):
             self.ssim_loss = SSIMLoss()
         else:
             self.ssim_loss = None
+        
+        # Total Variation loss for suppressing wavy/checkerboard artifacts
+        # Recommended weight: 1e-5 to 1e-4 for subtle smoothing without blur
+        if weight_tv > 0:
+            self.tv_loss = TotalVariationLoss(weight=1.0)  # Weight applied via self.weights
+        else:
+            self.tv_loss = None
     
     def forward(
         self,
@@ -538,6 +597,15 @@ class CompositeLoss(nn.Module):
                 l_ssim = self._clamp_loss(l_ssim)
                 loss_dict['ssim'] = self._safe_loss_item(l_ssim)
                 weighted = self.weights['ssim'] * l_ssim
+                total_loss = weighted if total_loss is None else total_loss + weighted
+        
+        # Total Variation loss for suppressing wavy/checkerboard artifacts
+        if self.tv_loss is not None and 'hr_image' in outputs:
+            if not torch.isnan(outputs['hr_image']).any():
+                l_tv = self.tv_loss(outputs['hr_image'])
+                l_tv = self._clamp_loss(l_tv)
+                loss_dict['tv'] = self._safe_loss_item(l_tv)
+                weighted = self.weights['tv'] * l_tv
                 total_loss = weighted if total_loss is None else total_loss + weighted
         
         # If no loss computed, create zero loss with gradient

@@ -19,6 +19,7 @@ from .shared_attention import (
     SubPixelConvolutionBlock,
     create_shared_attention_network,
 )
+from .blur_pool import BlurPool2d, MaxBlurPool2d, AntiAliasedConv2d
 
 __all__ = [
     'NeuroSymbolicLPR',
@@ -50,5 +51,9 @@ __all__ = [
     'GeometricalPerceptionUnit',
     'SubPixelConvolutionBlock',
     'create_shared_attention_network',
+    # Anti-aliased downsampling for preventing wavy artifacts
+    'BlurPool2d',
+    'MaxBlurPool2d',
+    'AntiAliasedConv2d',
 ]
 

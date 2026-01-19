@@ -195,6 +195,10 @@ class TrainingConfig:
     lcofl_alpha: float = 1.0  # Penalty increment for confused character pairs
     lcofl_beta: float = 2.0  # Layout violation penalty
     
+    # Total Variation Loss for suppressing wavy/checkerboard artifacts
+    # Recommended: 1e-5 to 1e-4 for subtle smoothing without blur
+    weight_tv: float = 1e-5  # Enable TV loss to reduce wavy distortions
+    
     # Shared Attention and Deformable Convolutions (from same paper)
     use_shared_attention: bool = True  # Enable shared attention module
     use_deformable_conv: bool = True  # Enable deformable convolutions

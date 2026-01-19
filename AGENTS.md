@@ -199,6 +199,15 @@ def _clamp_loss(self, loss, max_val=100.0):
 **File**: `train.py`, `losses/composite_loss.py`  
 **Details**: See commit history or walkthrough artifact for full list
 
+### 9. Wavy/Checkerboard Artifact Prevention (FIXED)
+**Issue 1**: UNetDiscriminator used `ConvTranspose2d` causing checkerboard artifacts  
+**Solution**: Replaced with resize-convolution (`Upsample + Conv2d`) in `models/discriminator.py`  
+**Issue 2**: Missing anti-aliased downsampling caused aliasing  
+**Solution**: Created `models/blur_pool.py` with `BlurPool2d`, `MaxBlurPool2d`, `AntiAliasedConv2d`  
+**Issue 3**: No explicit penalty for high-frequency wavy noise  
+**Solution**: Added `TotalVariationLoss` to `losses/composite_loss.py` with `weight_tv` in config  
+**Usage**: Set `config.training.weight_tv = 1e-5` to enable TV denoising
+
 ### 7. PARSeq Pretrained Model Issues (FIXED)
 **Issue 1**: Model loaded in training mode → random outputs due to dropout  
 **Solution**: Added `.eval()` in `models/parseq.py:_load_model()` after loading  

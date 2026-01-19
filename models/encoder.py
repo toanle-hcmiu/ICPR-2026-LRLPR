@@ -3,6 +3,8 @@ Shared CNN Encoder for Multi-Frame Feature Extraction.
 
 This module implements the shared CNN encoder that processes multiple
 low-resolution frames to extract features for the STN and downstream modules.
+
+Now with anti-aliased downsampling to prevent aliasing artifacts.
 """
 
 import torch
@@ -10,9 +12,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import List, Optional
 
+from .blur_pool import BlurPool2d
+
 
 class ConvBlock(nn.Module):
-    """Convolutional block with BatchNorm and ReLU."""
+    """
+    Convolutional block with BatchNorm and ReLU.
+    
+    Optionally uses anti-aliased downsampling (BlurPool) to prevent
+    aliasing artifacts when stride > 1.
+    """
     
     def __init__(
         self,
@@ -22,13 +31,23 @@ class ConvBlock(nn.Module):
         stride: int = 1,
         padding: int = 1,
         use_bn: bool = True,
-        activation: str = 'relu'
+        activation: str = 'relu',
+        use_blur_pool: bool = False  # Anti-aliased downsampling
     ):
         super().__init__()
         
+        self.use_blur_pool = use_blur_pool and stride > 1
+        
+        # If using blur pool, conv has stride=1, then blur pool downsamples
+        actual_stride = 1 if self.use_blur_pool else stride
+        
         layers = [
-            nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding, bias=not use_bn)
+            nn.Conv2d(in_channels, out_channels, kernel_size, actual_stride, padding, bias=not use_bn)
         ]
+        
+        # Anti-aliased downsampling: blur then subsample
+        if self.use_blur_pool:
+            layers.append(BlurPool2d(out_channels, stride=stride))
         
         if use_bn:
             layers.append(nn.BatchNorm2d(out_channels))
@@ -57,7 +76,10 @@ class SharedCNNEncoder(nn.Module):
     Architecture:
         - 4 convolutional blocks with increasing channels
         - Each block: Conv -> BatchNorm -> ReLU
-        - Downsampling via stride-2 convolutions
+        - Downsampling via anti-aliased stride-2 convolutions (BlurPool)
+    
+    Anti-aliasing prevents high-frequency content from causing aliasing
+    artifacts (wavy distortions) during downsampling.
     """
     
     def __init__(
@@ -65,7 +87,8 @@ class SharedCNNEncoder(nn.Module):
         in_channels: int = 3,
         base_channels: int = 64,
         num_blocks: int = 4,
-        channel_multipliers: Optional[List[int]] = None
+        channel_multipliers: Optional[List[int]] = None,
+        use_blur_pool: bool = True  # Enable anti-aliased downsampling
     ):
         """
         Initialize the shared CNN encoder.
@@ -75,6 +98,7 @@ class SharedCNNEncoder(nn.Module):
             base_channels: Number of channels in the first block.
             num_blocks: Number of convolutional blocks.
             channel_multipliers: Channel multipliers for each block.
+            use_blur_pool: Whether to use anti-aliased downsampling (recommended: True).
         """
         super().__init__()
         
@@ -87,6 +111,7 @@ class SharedCNNEncoder(nn.Module):
         self.in_channels = in_channels
         self.base_channels = base_channels
         self.num_blocks = num_blocks
+        self.use_blur_pool = use_blur_pool
         
         # Build encoder blocks
         blocks = []
@@ -96,9 +121,11 @@ class SharedCNNEncoder(nn.Module):
             out_channels = base_channels * mult
             stride = 2 if i > 0 else 1  # First block keeps resolution
             
+            # Use anti-aliased downsampling for stride-2 convolutions
             blocks.append(ConvBlock(
                 prev_channels, out_channels, 
-                kernel_size=3, stride=stride, padding=1
+                kernel_size=3, stride=stride, padding=1,
+                use_blur_pool=use_blur_pool  # Anti-aliased downsampling
             ))
             
             # Add a second conv in each block for more capacity
@@ -190,15 +217,19 @@ class ResidualCNNEncoder(nn.Module):
     Deeper CNN encoder with residual connections.
     
     Alternative to SharedCNNEncoder with more capacity for complex tasks.
+    Now with anti-aliased downsampling to prevent aliasing artifacts.
     """
     
     def __init__(
         self,
         in_channels: int = 3,
         base_channels: int = 64,
-        num_res_blocks: int = 4
+        num_res_blocks: int = 4,
+        use_blur_pool: bool = True  # Enable anti-aliased downsampling
     ):
         super().__init__()
+        
+        self.use_blur_pool = use_blur_pool
         
         # Initial convolution
         self.init_conv = nn.Sequential(
@@ -207,24 +238,48 @@ class ResidualCNNEncoder(nn.Module):
             nn.ReLU(inplace=True)
         )
         
-        # Downsampling stages
-        self.down1 = nn.Sequential(
-            nn.Conv2d(base_channels, base_channels * 2, 3, 2, 1, bias=False),
-            nn.BatchNorm2d(base_channels * 2),
-            nn.ReLU(inplace=True)
-        )
-        
-        self.down2 = nn.Sequential(
-            nn.Conv2d(base_channels * 2, base_channels * 4, 3, 2, 1, bias=False),
-            nn.BatchNorm2d(base_channels * 4),
-            nn.ReLU(inplace=True)
-        )
-        
-        self.down3 = nn.Sequential(
-            nn.Conv2d(base_channels * 4, base_channels * 8, 3, 2, 1, bias=False),
-            nn.BatchNorm2d(base_channels * 8),
-            nn.ReLU(inplace=True)
-        )
+        # Downsampling stages with optional anti-aliasing
+        # Anti-aliased: Conv(stride=1) -> BlurPool(stride=2)
+        # Standard: Conv(stride=2)
+        if use_blur_pool:
+            self.down1 = nn.Sequential(
+                nn.Conv2d(base_channels, base_channels * 2, 3, 1, 1, bias=False),
+                BlurPool2d(base_channels * 2, stride=2),
+                nn.BatchNorm2d(base_channels * 2),
+                nn.ReLU(inplace=True)
+            )
+            
+            self.down2 = nn.Sequential(
+                nn.Conv2d(base_channels * 2, base_channels * 4, 3, 1, 1, bias=False),
+                BlurPool2d(base_channels * 4, stride=2),
+                nn.BatchNorm2d(base_channels * 4),
+                nn.ReLU(inplace=True)
+            )
+            
+            self.down3 = nn.Sequential(
+                nn.Conv2d(base_channels * 4, base_channels * 8, 3, 1, 1, bias=False),
+                BlurPool2d(base_channels * 8, stride=2),
+                nn.BatchNorm2d(base_channels * 8),
+                nn.ReLU(inplace=True)
+            )
+        else:
+            self.down1 = nn.Sequential(
+                nn.Conv2d(base_channels, base_channels * 2, 3, 2, 1, bias=False),
+                nn.BatchNorm2d(base_channels * 2),
+                nn.ReLU(inplace=True)
+            )
+            
+            self.down2 = nn.Sequential(
+                nn.Conv2d(base_channels * 2, base_channels * 4, 3, 2, 1, bias=False),
+                nn.BatchNorm2d(base_channels * 4),
+                nn.ReLU(inplace=True)
+            )
+            
+            self.down3 = nn.Sequential(
+                nn.Conv2d(base_channels * 4, base_channels * 8, 3, 2, 1, bias=False),
+                nn.BatchNorm2d(base_channels * 8),
+                nn.ReLU(inplace=True)
+            )
         
         # Residual blocks
         self.res_blocks = nn.Sequential(
