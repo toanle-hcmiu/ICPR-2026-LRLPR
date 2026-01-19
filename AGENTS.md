@@ -199,6 +199,21 @@ def _clamp_loss(self, loss, max_val=100.0):
 **File**: `train.py`, `losses/composite_loss.py`  
 **Details**: See commit history or walkthrough artifact for full list
 
+### 7. PARSeq Pretrained Model Issues (FIXED)
+**Issue 1**: Model loaded in training mode → random outputs due to dropout  
+**Solution**: Added `.eval()` in `models/parseq.py:_load_model()` after loading  
+**Issue 2**: Charset adapter overwrote lowercase logits with uppercase  
+**Solution**: Use `logsumexp` to properly combine both in `_adapt_logits()`  
+**File**: `models/parseq.py`
+
+### 8. Perceptual Loss Not Working (FIXED)
+**Issue 1**: VGG feature extraction fed wrong shapes (reused `x` across layers)  
+**Solution**: Single forward pass with incremental layer extraction in `losses/gan_loss.py`  
+**Issue 2**: Perceptual loss not computed in restoration stage  
+**Solution**: Added perceptual loss to `composite_loss.py:get_stage_loss()` for restoration  
+**Issue 3**: Perceptual loss not enabled in training  
+**Solution**: Added `use_perceptual=True, weight_perceptual=0.1` in `train.py`
+
 ## LCOFL Paper Features (Nascimento et al.)
 
 > **INTEGRATED**: These features from "Enhancing License Plate Super-Resolution: A Layout-Aware and Character-Driven Approach" are now fully integrated.

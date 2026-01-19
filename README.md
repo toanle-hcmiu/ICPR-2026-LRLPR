@@ -690,6 +690,19 @@ Annotations format:
 - ✅ `CharacterFocusLoss`
 - ✅ `MultiScaleOCRLoss`
 
+### v1.1.1 (2026-01-19)
+
+**Bug Fixes:**
+- Fixed PARSeq pretrained model staying in training mode → random outputs
+- Fixed PARSeq charset adapter overwriting lowercase with uppercase logits
+- Fixed VGG perceptual loss feature extraction feeding wrong shapes
+- Fixed perceptual loss not being computed in restoration stage
+- Enabled perceptual loss in Stage 2 training (weight=0.1)
+
+**Improvements:**
+- Added TensorBoard visualizations for STN, LR images, and OCR predictions
+- Added OCR confidence logging per sample
+
 ### v1.0.0
 
 - Initial implementation of the Neuro-Symbolic LPR system
