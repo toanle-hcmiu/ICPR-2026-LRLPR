@@ -413,12 +413,31 @@ class NeuroSymbolicLPR(nn.Module):
         for param in self.stn.parameters():
             param.requires_grad = True
     
+    def freeze_all_except_recognizer(self):
+        """Freeze all modules except the recognizer (for pretrain stage)."""
+        for param in self.encoder.parameters():
+            param.requires_grad = False
+        for param in self.stn.parameters():
+            param.requires_grad = False
+        for param in self.layout_classifier.parameters():
+            param.requires_grad = False
+        for param in self.quality_fusion.parameters():
+            param.requires_grad = False
+        for param in self.feature_to_image.parameters():
+            param.requires_grad = False
+        for param in self.generator.parameters():
+            param.requires_grad = False
+        # Leave recognizer trainable
+        for param in self.recognizer.parameters():
+            param.requires_grad = True
+    
     def get_trainable_params(self, stage: str) -> list:
         """
         Get trainable parameters for a specific training stage.
         
         Args:
             stage: Training stage name.
+                'pretrain': Only recognizer parameters (OCR pre-training)
                 'stn': Only STN parameters
                 'restoration': Generator and layout classifier
                 'full': All parameters
@@ -426,7 +445,12 @@ class NeuroSymbolicLPR(nn.Module):
         Returns:
             List of parameter groups.
         """
-        if stage == 'stn':
+        if stage == 'pretrain':
+            # Pretrain: only train the recognizer (PARSeq) on OCR task
+            return [
+                {'params': self.recognizer.parameters()}
+            ]
+        elif stage == 'stn':
             return [
                 {'params': self.encoder.parameters()},
                 {'params': self.stn.parameters()}
@@ -434,13 +458,13 @@ class NeuroSymbolicLPR(nn.Module):
         elif stage == 'restoration':
             # Train generator + OCR together so OCR learns as image quality improves
             # This prevents 0% plate accuracy during restoration stage
+            # Note: syntax_mask has no parameters (only buffers), so it's not included
             return [
                 {'params': self.generator.parameters()},
                 {'params': self.layout_classifier.parameters()},
                 {'params': self.quality_fusion.parameters()},
                 {'params': self.feature_to_image.parameters()},
                 {'params': self.recognizer.parameters(), 'lr_scale': 0.5},  # Joint OCR training
-                {'params': self.syntax_mask.parameters(), 'lr_scale': 0.5} if hasattr(self.syntax_mask, 'parameters') else None
             ]
         elif stage == 'full':
             return [

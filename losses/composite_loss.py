@@ -653,7 +653,7 @@ class CompositeLoss(nn.Module):
         Get loss for a specific training stage.
         
         Args:
-            stage: Training stage ('stn', 'restoration', 'full').
+            stage: Training stage ('pretrain', 'stn', 'restoration', 'full').
             outputs: Model outputs.
             targets: Ground-truth targets.
             discriminator: Discriminator for GAN loss.
@@ -661,7 +661,42 @@ class CompositeLoss(nn.Module):
         Returns:
             Tuple of (loss, loss_dict).
         """
-        if stage == 'stn':
+        if stage == 'pretrain':
+            # Pretrain stage: OCR loss only (train recognizer on synthetic data)
+            loss_dict = {}
+            total_loss = None
+            
+            # OCR loss - the only loss used during pretrain
+            if 'masked_logits' in outputs and 'text_indices' in targets:
+                logits = outputs['masked_logits']
+                text_targets = targets['text_indices']
+                
+                # Check for NaN inputs
+                if not (torch.isnan(logits).any() or torch.isnan(text_targets.float()).any()):
+                    l_ocr = self.ocr_loss(logits, text_targets)
+                    l_ocr = self._clamp_loss(l_ocr)
+                    loss_dict['ocr'] = self._safe_loss_item(l_ocr)
+                    total_loss = l_ocr
+            
+            # Fallback if no loss was computed
+            if total_loss is None:
+                # Create zero loss with gradient connection
+                # Use nan_to_num to handle NaN values and ensure finite fallback loss
+                if 'masked_logits' in outputs:
+                    sanitized = torch.nan_to_num(outputs['masked_logits'], nan=0.0, posinf=0.0, neginf=0.0)
+                    total_loss = sanitized.sum() * 0.0
+                elif 'raw_logits' in outputs:
+                    sanitized = torch.nan_to_num(outputs['raw_logits'], nan=0.0, posinf=0.0, neginf=0.0)
+                    total_loss = sanitized.sum() * 0.0
+                else:
+                    any_output = next(iter(outputs.values()))
+                    sanitized = torch.nan_to_num(any_output, nan=0.0, posinf=0.0, neginf=0.0)
+                    total_loss = sanitized.sum() * 0.0
+            
+            loss_dict['total'] = self._safe_loss_item(total_loss)
+            return total_loss, loss_dict
+        
+        elif stage == 'stn':
             loss_dict = {}
             total_loss = None
             has_corner_supervision = False

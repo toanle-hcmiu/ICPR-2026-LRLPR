@@ -438,20 +438,12 @@ class RodoSolDataset(LPRDataset):
                 indices = list(range(num_available)) * (self.num_frames // num_available + 1)
                 indices = indices[:self.num_frames]
             
-            # Load LR frames
-            lr_frames = []
+            # Load raw LR frames (no augmentation yet)
+            lr_frames_raw = []
             for i in indices:
                 lr_path = lr_files[min(i, len(lr_files) - 1)]
                 lr_image = self._load_image(lr_path)
-                if self.transform is not None:
-                    # Pass plate style to transform for style-aware augmentation
-                    if hasattr(self.transform, 'set_plate_style'):
-                        self.transform.set_plate_style(plate_style)
-                    lr_image = self.transform(lr_image)
-                lr_frame = self._preprocess_image(lr_image, self.lr_size)
-                lr_frames.append(lr_frame)
-            
-            lr_frames = torch.stack(lr_frames, dim=0)  # (T, C, H, W)
+                lr_frames_raw.append(lr_image)
             
             # Load HR image (use middle frame or first available)
             hr_idx = len(hr_files) // 2 if hr_files else 0
@@ -461,26 +453,71 @@ class RodoSolDataset(LPRDataset):
             # Store original HR image size before transform
             original_hr_size = (hr_image_raw.shape[1], hr_image_raw.shape[0])  # (width, height)
             
-            if self.transform is not None:
-                # Pass plate style to transform for style-aware augmentation
+            # Get corners for this sample if available (for paired augmentation)
+            corners_for_aug = self._extract_corners_for_sample(sample, hr_path)
+            
+            # Apply PAIRED augmentation (LR and HR stay aligned)
+            if self.transform is not None and hasattr(self.transform, 'augment_pair'):
+                # Set plate style for style-aware augmentation
                 if hasattr(self.transform, 'set_plate_style'):
                     self.transform.set_plate_style(plate_style)
-                hr_image_raw = self.transform(hr_image_raw)
                 
-                # Get the transform matrix for corner transformation
+                # Apply paired augmentation: same geometric/photometric to all,
+                # degradation only to LR frames
+                lr_frames_aug, hr_image_aug, corners_aug, hr_transform_matrix = \
+                    self.transform.augment_pair(lr_frames_raw, hr_image_raw, corners_for_aug)
+                
+                # Preprocess augmented images
+                lr_frames = []
+                for lr_img in lr_frames_aug:
+                    lr_frame = self._preprocess_image(lr_img, self.lr_size)
+                    lr_frames.append(lr_frame)
+                lr_frames = torch.stack(lr_frames, dim=0)
+                
+                hr_image = self._preprocess_image(hr_image_aug, self.hr_size)
+                hr_image_shape = hr_image_aug.shape[:2]  # (H, W)
+                
+                # Use augmented corners if available
+                if corners_aug is not None:
+                    corners_for_aug = corners_aug
+            elif self.transform is not None:
+                # Fallback: old behavior (independent augmentation - NOT RECOMMENDED)
+                # This path is kept for backward compatibility but should be avoided
+                lr_frames = []
+                for lr_img in lr_frames_raw:
+                    if hasattr(self.transform, 'set_plate_style'):
+                        self.transform.set_plate_style(plate_style)
+                    lr_img_aug = self.transform(lr_img)
+                    lr_frame = self._preprocess_image(lr_img_aug, self.lr_size)
+                    lr_frames.append(lr_frame)
+                lr_frames = torch.stack(lr_frames, dim=0)
+                
+                if hasattr(self.transform, 'set_plate_style'):
+                    self.transform.set_plate_style(plate_style)
+                hr_image_aug = self.transform(hr_image_raw)
                 if hasattr(self.transform, 'get_last_transform_matrix'):
                     hr_transform_matrix = self.transform.get_last_transform_matrix()
-            
-            hr_image = self._preprocess_image(hr_image_raw, self.hr_size)
-            
-            # Store transformed HR image dimensions for corner normalization
-            hr_image_shape = hr_image_raw.shape[:2]  # (H, W)
+                hr_image = self._preprocess_image(hr_image_aug, self.hr_size)
+                hr_image_shape = hr_image_aug.shape[:2]
+            else:
+                # No augmentation
+                lr_frames = []
+                for lr_img in lr_frames_raw:
+                    lr_frame = self._preprocess_image(lr_img, self.lr_size)
+                    lr_frames.append(lr_frame)
+                lr_frames = torch.stack(lr_frames, dim=0)
+                
+                hr_image = self._preprocess_image(hr_image_raw, self.hr_size)
+                hr_image_shape = hr_image_raw.shape[:2]
         else:
             # Single image sample (old format)
             image = self._load_image(sample['image_path'])
             
             # Store original image size before transform
             original_hr_size = (image.shape[1], image.shape[0])  # (width, height)
+            
+            # Get corners for this sample
+            corners_for_aug = self._extract_corners_for_sample(sample, None)
             
             # Apply transforms if provided
             if self.transform is not None:
@@ -492,6 +529,11 @@ class RodoSolDataset(LPRDataset):
                 # Get the transform matrix for corner transformation
                 if hasattr(self.transform, 'get_last_transform_matrix'):
                     hr_transform_matrix = self.transform.get_last_transform_matrix()
+                    # Transform corners if we have them
+                    if corners_for_aug is not None and hasattr(self.transform, 'transform_corners'):
+                        corners_for_aug = self.transform.transform_corners(
+                            corners_for_aug, original_hr_size
+                        )
             
             # Create HR image
             hr_image = self._preprocess_image(image, self.hr_size)
@@ -529,74 +571,19 @@ class RodoSolDataset(LPRDataset):
             'plate_style': plate_style  # Add plate style for potential style-aware processing
         }
         
-        # Add corners if available
-        corners_data = sample.get('corners', None)
-        if corners_data is not None:
-            # Handle different corner formats
-            if isinstance(corners_data, dict):
-                # Empty dict - skip
-                if len(corners_data) == 0:
-                    corners_data = None
-                else:
-                    # Per-frame corner format: {"lr-001.png": {"top-left": [x, y], ...}, ...}
-                    # Try to extract corners from the HR image we're using
-                    if 'track_dir' in sample:
-                        # Get the HR filename we used
-                        hr_filename = Path(hr_path).name
-                        if hr_filename in corners_data:
-                            parsed = self._parse_frame_corners(corners_data[hr_filename])
-                            if parsed is not None:
-                                corners_data = parsed
-                            else:
-                                corners_data = None
-                        else:
-                            # Try to find any HR corner data
-                            for key in corners_data:
-                                if key.startswith('hr-'):
-                                    parsed = self._parse_frame_corners(corners_data[key])
-                                    if parsed is not None:
-                                        corners_data = parsed
-                                        break
-                            else:
-                                # No HR corners found, try LR corners as fallback
-                                for key in corners_data:
-                                    parsed = self._parse_frame_corners(corners_data[key])
-                                    if parsed is not None:
-                                        corners_data = parsed
-                                        break
-                                else:
-                                    corners_data = None
-                    else:
-                        # Single image format - try any available corners
-                        for key in corners_data:
-                            parsed = self._parse_frame_corners(corners_data[key])
-                            if parsed is not None:
-                                corners_data = parsed
-                                break
-                        else:
-                            corners_data = None
-            
-            # Now process corners_data if it's a valid array
-            if isinstance(corners_data, (list, tuple, np.ndarray)):
-                # Convert to numpy array first
-                corners_array = np.array(corners_data, dtype=np.float32)
-                if corners_array.shape == (4, 2):  # Valid corner format
-                    # Apply geometric transform to corners if transform was applied
-                    if hr_transform_matrix is not None and self.transform is not None:
-                        if hasattr(self.transform, 'transform_corners'):
-                            corners_array = self.transform.transform_corners(
-                                corners_array, original_hr_size
-                            )
-                    
-                    corners = torch.from_numpy(corners_array)
-                    # Normalize corners to [-1, 1] using transformed image dimensions
-                    h, w = hr_image_shape
-                    corners[:, 0] = corners[:, 0] / w * 2 - 1
-                    corners[:, 1] = corners[:, 1] / h * 2 - 1
-                    
-                    # Clamp to valid range (in case transform pushed corners outside)
-                    corners = torch.clamp(corners, -1.0, 1.0)
-                    result['corners'] = corners
+        # Add corners if available (corners_for_aug was already extracted and transformed)
+        if corners_for_aug is not None:
+            corners_array = np.array(corners_for_aug, dtype=np.float32)
+            if corners_array.shape == (4, 2):  # Valid corner format
+                corners = torch.from_numpy(corners_array)
+                # Normalize corners to [-1, 1] using transformed image dimensions
+                h, w = hr_image_shape
+                corners[:, 0] = corners[:, 0] / w * 2 - 1
+                corners[:, 1] = corners[:, 1] / h * 2 - 1
+                
+                # Clamp to valid range (in case transform pushed corners outside)
+                corners = torch.clamp(corners, -1.0, 1.0)
+                result['corners'] = corners
         
         if self.return_path:
             if 'track_dir' in sample:
@@ -605,6 +592,69 @@ class RodoSolDataset(LPRDataset):
                 result['path'] = sample.get('image_path', '')
         
         return result
+    
+    def _extract_corners_for_sample(
+        self,
+        sample: Dict,
+        hr_path: Optional[str],
+    ) -> Optional[np.ndarray]:
+        """
+        Extract corner coordinates from a sample's annotation.
+        
+        Args:
+            sample: Sample dictionary from _load_annotations.
+            hr_path: Path to the HR image being used (for per-frame corner lookup).
+            
+        Returns:
+            Corners as numpy array of shape (4, 2), or None if not available.
+        """
+        corners_data = sample.get('corners', None)
+        if corners_data is None:
+            return None
+        
+        # Handle different corner formats
+        if isinstance(corners_data, dict):
+            # Empty dict - skip
+            if len(corners_data) == 0:
+                return None
+            
+            # Per-frame corner format: {"lr-001.png": {"top-left": [x, y], ...}, ...}
+            if hr_path is not None:
+                # Try to extract corners from the HR image we're using
+                hr_filename = Path(hr_path).name
+                if hr_filename in corners_data:
+                    parsed = self._parse_frame_corners(corners_data[hr_filename])
+                    if parsed is not None:
+                        return parsed
+                
+                # Try to find any HR corner data
+                for key in corners_data:
+                    if key.startswith('hr-'):
+                        parsed = self._parse_frame_corners(corners_data[key])
+                        if parsed is not None:
+                            return parsed
+                
+                # No HR corners found, try LR corners as fallback
+                for key in corners_data:
+                    parsed = self._parse_frame_corners(corners_data[key])
+                    if parsed is not None:
+                        return parsed
+            else:
+                # Single image format - try any available corners
+                for key in corners_data:
+                    parsed = self._parse_frame_corners(corners_data[key])
+                    if parsed is not None:
+                        return parsed
+            
+            return None
+        
+        # Direct array format
+        if isinstance(corners_data, (list, tuple, np.ndarray)):
+            corners_array = np.array(corners_data, dtype=np.float32)
+            if corners_array.shape == (4, 2):
+                return corners_array
+        
+        return None
 
 
 class SyntheticLPRDataset(Dataset):

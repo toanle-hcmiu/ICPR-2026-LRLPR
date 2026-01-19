@@ -16,12 +16,14 @@ Usage:
 import os
 import argparse
 import logging
+import random
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Optional, Tuple
 from copy import deepcopy
 import math
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -38,6 +40,73 @@ from losses import CompositeLoss, CornerLoss, GANLoss, ConfusionMatrixTracker
 from losses.composite_loss import StagedTrainingManager
 from losses.ocr_discriminator import create_ocr_discriminator, OCRDiscriminatorLoss
 from data import RodoSolDataset, SyntheticLPRDataset, LPRAugmentation, lpr_collate_fn
+
+
+# =============================================================================
+# Reproducibility Helpers
+# =============================================================================
+
+def seed_everything(seed: int, strict_determinism: bool = True):
+    """
+    Set seeds for Python, NumPy, and PyTorch for reproducibility.
+    
+    By default, enables strict determinism for exact reproducibility across runs.
+    This may have a performance impact (typically 5-15% slower training).
+    
+    Args:
+        seed: Random seed to use.
+        strict_determinism: If True (default), enables cuDNN deterministic mode,
+            torch.use_deterministic_algorithms(), and disables TF32.
+            Set to False for faster but non-reproducible training.
+    """
+    # Set environment variable for hash seed (must be done before other imports in practice)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    
+    # Seed Python's random module
+    random.seed(seed)
+    
+    # Seed NumPy
+    np.random.seed(seed)
+    
+    # Seed PyTorch CPU
+    torch.manual_seed(seed)
+    
+    # Seed PyTorch CUDA (all GPUs)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    
+    if strict_determinism:
+        # Enable cuDNN deterministic mode
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        
+        # Enable PyTorch's deterministic algorithms
+        # This will raise an error if a non-deterministic operation is used
+        torch.use_deterministic_algorithms(True, warn_only=False)
+        
+        # Set CUBLAS workspace config for deterministic cuBLAS operations
+        os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
+        
+        # Disable TF32 for exact reproducibility (TF32 trades precision for speed)
+        if torch.cuda.is_available():
+            torch.backends.cuda.matmul.allow_tf32 = False
+            torch.backends.cudnn.allow_tf32 = False
+
+
+def worker_init_fn(worker_id: int):
+    """
+    Initialize worker with a deterministic seed based on the global seed.
+    
+    Called by DataLoader for each worker process to ensure reproducible
+    data loading across workers.
+    
+    Args:
+        worker_id: Worker process index.
+    """
+    # Get the initial seed from torch and combine with worker_id
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 
 # =============================================================================
@@ -99,6 +168,60 @@ class EarlyStopping:
         return self.should_stop
 
 
+def apply_config_overrides(config: Config, overrides: dict, logger: Optional[logging.Logger] = None) -> Config:
+    """
+    Apply YAML config overrides to a Config object.
+    
+    Supports nested keys via section.key structure (e.g., training.lr_stn).
+    Unknown keys are logged as warnings but do not cause errors.
+    
+    Args:
+        config: Base Config object to modify.
+        overrides: Dictionary from YAML config file.
+        logger: Optional logger for warnings about unknown keys.
+        
+    Returns:
+        Modified Config object (same instance, mutated in-place).
+    """
+    if overrides is None:
+        return config
+    
+    def _warn(msg: str):
+        if logger:
+            logger.warning(msg)
+        else:
+            print(f"Warning: {msg}")
+    
+    for section_name, section_values in overrides.items():
+        # Check if the section exists in Config
+        if not hasattr(config, section_name):
+            _warn(f"Unknown config section '{section_name}', ignoring")
+            continue
+        
+        subconfig = getattr(config, section_name)
+        
+        # Handle non-dict values at top level (e.g., experiment_name)
+        if not isinstance(section_values, dict):
+            if hasattr(config, section_name):
+                setattr(config, section_name, section_values)
+            else:
+                _warn(f"Unknown config key '{section_name}', ignoring")
+            continue
+        
+        # Apply nested key-value pairs
+        for key, value in section_values.items():
+            if hasattr(subconfig, key):
+                old_value = getattr(subconfig, key)
+                setattr(subconfig, key, value)
+                # Log the override for debugging
+                if logger:
+                    logger.debug(f"Config override: {section_name}.{key} = {value} (was {old_value})")
+            else:
+                _warn(f"Unknown config key '{section_name}.{key}', ignoring")
+    
+    return config
+
+
 def log_model_info(model: nn.Module, logger: logging.Logger):
     """Log model architecture and parameter counts."""
     total_params = sum(p.numel() for p in model.parameters())
@@ -151,8 +274,28 @@ def create_optimizer(
     # Filter out None param groups (e.g., from optional modules)
     param_groups = [g for g in param_groups if g is not None]
     
+    # Filter out empty param groups and groups with no trainable params
+    # This prevents "optimizer got an empty parameter list" errors
+    filtered_groups = []
+    for group in param_groups:
+        # Convert generator to list to check if it has any parameters
+        params = list(group['params'])
+        if not params:
+            continue  # Skip empty groups
+        # Check if at least one param requires grad
+        has_trainable = any(p.requires_grad for p in params)
+        if not has_trainable:
+            continue  # Skip groups where all params are frozen
+        # Re-create the group with the list (generator was exhausted)
+        new_group = {k: v for k, v in group.items() if k != 'params'}
+        new_group['params'] = params
+        filtered_groups.append(new_group)
+    
+    param_groups = filtered_groups
+    
     # Adjust learning rates based on lr_scale if present
     base_lr = {
+        'pretrain': config.training.lr_pretrain,
         'stn': config.training.lr_stn,
         'restoration': config.training.lr_restoration,
         'full': config.training.lr_finetune
@@ -370,7 +513,9 @@ def train_epoch(
                 current_discriminator = None  # Pass None to skip GAN loss computation
             
             # Compute generator loss
-            if stage == 'stn':
+            if stage == 'pretrain':
+                loss_g, loss_dict = criterion.get_stage_loss('pretrain', outputs, targets)
+            elif stage == 'stn':
                 loss_g, loss_dict = criterion.get_stage_loss('stn', outputs, targets)
             elif stage == 'restoration':
                 loss_g, loss_dict = criterion.get_stage_loss('restoration', outputs, targets, current_discriminator)
@@ -416,9 +561,9 @@ def train_epoch(
                 logger.warning(f"Epoch {epoch}, Batch {batch_idx}: NaN loss detected, skipping batch ({nan_batch_count}/{max_nan_batches})")
             
             # Clear gradients and skip this batch
-            optimizer_g.zero_grad()
+            optimizer_g.zero_grad(set_to_none=True)
             if optimizer_d is not None:
-                optimizer_d.zero_grad()
+                optimizer_d.zero_grad(set_to_none=True)
             
             if nan_batch_count >= max_nan_batches:
                 if logger is not None:
@@ -427,7 +572,7 @@ def train_epoch(
             continue
         
         # Update generator with gradient scaling for mixed precision
-        optimizer_g.zero_grad()
+        optimizer_g.zero_grad(set_to_none=True)
         
         if use_amp:
             scaler.scale(loss_g).backward()
@@ -594,7 +739,7 @@ def train_epoch(
                 
                 # Check for NaN discriminator loss and update if valid
                 if loss_d is not None and not check_for_nan(loss_d, "loss_d") and should_update_d:
-                    optimizer_d.zero_grad()
+                    optimizer_d.zero_grad(set_to_none=True)
                     
                     # R1 gradient penalty on real images (every 16 batches to save compute)
                     r1_penalty = torch.tensor(0.0, device=device)
@@ -751,7 +896,9 @@ def validate(
             
             # Compute loss - use stage-specific loss to avoid NaN from OCR
             # during early training stages (STN stage especially)
-            if stage == 'stn':
+            if stage == 'pretrain':
+                _, loss_dict = criterion.get_stage_loss('pretrain', outputs, targets)
+            elif stage == 'stn':
                 _, loss_dict = criterion.get_stage_loss('stn', outputs, targets)
             elif stage == 'restoration':
                 _, loss_dict = criterion.get_stage_loss('restoration', outputs, targets)
@@ -874,8 +1021,29 @@ def load_checkpoint(
     Uses strict=False to allow loading checkpoints from older model versions
     that may not have new components (e.g., shared attention module).
     Missing weights will be randomly initialized.
+    
+    Security Note:
+        torch.load() uses pickle which can execute arbitrary code.
+        Only load checkpoints from trusted sources.
     """
-    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    # Security: Validate checkpoint path is a local file
+    checkpoint_file = Path(checkpoint_path)
+    if not checkpoint_file.is_file():
+        raise FileNotFoundError(
+            f"Checkpoint not found or not a local file: {checkpoint_path}. "
+            "For security reasons, only local file paths are accepted."
+        )
+    
+    # Security warning for users
+    import warnings
+    warnings.warn(
+        f"Loading checkpoint from '{checkpoint_path}'. "
+        "torch.load() uses pickle which can execute arbitrary code. "
+        "Only load checkpoints from trusted sources.",
+        UserWarning
+    )
+    
+    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
     
     # Use strict=False for backward compatibility with older checkpoints
     # This allows loading checkpoints that don't have shared attention weights
@@ -1001,14 +1169,20 @@ def train_stage(
     logger.info(f"  Early stopping patience: {early_stopping_patience}")
     logger.info(f"  Gradient clip norm: {grad_clip_norm}")
     
-    # Create criterion
+    # Create criterion with all config-driven weights and options
     criterion = CompositeLoss(
         weight_pixel=config.training.weight_pixel,
         weight_gan=config.training.weight_gan,
         weight_ocr=config.training.weight_ocr,
         weight_geometry=config.training.weight_geometry,
-        use_perceptual=True,  # Enable perceptual loss for sharper images
         weight_perceptual=0.1,  # VGG feature matching weight
+        weight_lcofl=config.training.weight_lcofl if config.training.use_lcofl else 0.0,
+        weight_ssim=config.training.weight_ssim if config.training.use_lcofl else 0.0,
+        weight_tv=config.training.weight_tv,  # Total Variation for wavy artifact suppression
+        use_perceptual=True,  # Enable perceptual loss for sharper images
+        use_lcofl=config.training.use_lcofl,
+        lcofl_alpha=config.training.lcofl_alpha,
+        lcofl_beta=config.training.lcofl_beta,
         gan_mode='lsgan'  # Use LSGAN (MSE loss) instead of vanilla (BCE) to prevent vanishing gradients when D is too strong
     )
     
@@ -1409,13 +1583,15 @@ def main():
     args = parser.parse_args()
     
     # Load config
+    config = get_default_config()
     if args.config is not None:
         with open(args.config, 'r') as f:
             config_dict = yaml.safe_load(f)
-        # TODO: Parse config_dict into Config object
-        config = get_default_config()
-    else:
-        config = get_default_config()
+        # Apply YAML overrides to default config (logger not yet available)
+        config = apply_config_overrides(config, config_dict, logger=None)
+    
+    # Set random seeds for reproducibility
+    seed_everything(config.training.seed)
     
     # Setup directories
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -1444,6 +1620,10 @@ def main():
     except Exception as e:
         logger.warning(f"Could not start TensorBoard: {e}")
         logger.info(f"TensorBoard logs directory: {log_dir}")
+    
+    # Log config file usage
+    if args.config is not None:
+        logger.info(f"Loaded config overrides from: {args.config}")
     
     # Setup device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -1677,7 +1857,10 @@ def main():
     # Train each stage
     for stage_name, num_epochs in stages:
         # Prepare model for stage
-        if stage_name == 'stn':
+        if stage_name == 'pretrain':
+            # Pretrain: freeze all except recognizer (train OCR only)
+            model.freeze_all_except_recognizer()
+        elif stage_name == 'stn':
             model.freeze_recognizer()
         elif stage_name == 'restoration':
             model.freeze_stn()
@@ -1695,7 +1878,11 @@ def main():
         }
         batch_size = batch_size_map.get(stage_name, config.training.batch_size_finetune)
         
-        # Create data loaders with stage-specific batch size and custom collate
+        # Create data loaders with stage-specific batch size, custom collate, and deterministic seeding
+        # Use a generator seeded from config for reproducible shuffling
+        g = torch.Generator()
+        g.manual_seed(config.training.seed)
+        
         train_loader = DataLoader(
             train_dataset,
             batch_size=batch_size,
@@ -1703,7 +1890,9 @@ def main():
             num_workers=config.training.num_workers,
             pin_memory=True,
             drop_last=True,
-            collate_fn=lpr_collate_fn
+            collate_fn=lpr_collate_fn,
+            worker_init_fn=worker_init_fn,
+            generator=g
         )
         
         val_loader = DataLoader(
@@ -1712,7 +1901,8 @@ def main():
             shuffle=False,
             num_workers=config.training.num_workers,
             pin_memory=True,
-            collate_fn=lpr_collate_fn
+            collate_fn=lpr_collate_fn,
+            worker_init_fn=worker_init_fn
         )
         
         logger.info(f"Stage {stage_name}: Using batch size {batch_size}")

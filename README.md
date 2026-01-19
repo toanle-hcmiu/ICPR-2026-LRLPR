@@ -363,7 +363,7 @@ python train.py --stage 3 --resume checkpoints/restoration_best.pth
 | Stage | Modules Trained | Loss Functions | Batch Size |
 |-------|-----------------|----------------|------------|
 | STN | Encoder, STN | Self-supervised, Pixel, Corner | 32 |
-| Restoration | Generator, Layout, Fusion | Pixel, GAN, Layout | 16 |
+| Restoration | Generator, Layout, Fusion | Pixel, GAN, Layout | 32 |
 | Full | All | Pixel, GAN, OCR, Geometry, Layout | 8 |
 
 #### Metrics Tracked
@@ -610,6 +610,66 @@ Annotations format:
   }
 }
 ```
+
+## Reproducibility & Determinism
+
+By default, this codebase enables **strict determinism** for exact reproducibility across training runs. This is controlled by `seed_everything()` in `train.py`.
+
+### What's Enabled by Default
+
+| Setting | Value | Purpose |
+|---------|-------|---------|
+| `torch.backends.cudnn.deterministic` | `True` | Force deterministic cuDNN algorithms |
+| `torch.backends.cudnn.benchmark` | `False` | Disable cuDNN autotuning |
+| `torch.use_deterministic_algorithms` | `True` | Error on non-deterministic ops |
+| `CUBLAS_WORKSPACE_CONFIG` | `:4096:8` | Deterministic cuBLAS |
+| TF32 | Disabled | Exact float32 precision |
+| `PYTHONHASHSEED` | Set to seed | Deterministic Python hashing |
+
+### Performance Impact
+
+Strict determinism typically has a **5-15% performance overhead** compared to non-deterministic training. This is the tradeoff for exact reproducibility.
+
+To disable strict determinism for faster training (at the cost of reproducibility):
+
+```python
+# In your training script
+seed_everything(42, strict_determinism=False)
+```
+
+### Deterministic Inference
+
+Inference is deterministic by default. The `--frame-noise-std` flag (default: `0.0`) controls whether extra frames have random noise added:
+
+```bash
+# Deterministic inference (default)
+python inference.py --model checkpoint.pth --input image.jpg
+
+# With frame augmentation (non-deterministic)
+python inference.py --model checkpoint.pth --input image.jpg --frame-noise-std 0.01
+```
+
+## Checkpoint Security
+
+**Warning:** This codebase uses `torch.load()` for checkpoint loading, which internally uses Python's `pickle` module. Pickle can execute arbitrary code during deserialization.
+
+### Security Guidelines
+
+1. **Only load checkpoints from trusted sources** - Never load `.pth` files from untrusted origins
+2. **Verify checkpoint integrity** - Use checksums (SHA-256) when downloading checkpoints
+3. **Local files only** - The loading functions reject non-file paths (e.g., URLs)
+
+When loading a checkpoint, you'll see a security warning:
+
+```
+UserWarning: Loading checkpoint from 'path/to/model.pth'. 
+torch.load() uses pickle which can execute arbitrary code. 
+Only load checkpoints from trusted sources.
+```
+
+### Future Improvements
+
+For enhanced security, consider migrating to [safetensors](https://github.com/huggingface/safetensors) format, which is a safe-by-design serialization format that doesn't support code execution.
 
 ## Known Issues & Solutions
 

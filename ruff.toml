@@ -1,0 +1,68 @@
+# Ruff configuration for ICPR-2026-LRLPR
+# https://docs.astral.sh/ruff/configuration/
+
+# Target Python 3.10+
+target-version = "py310"
+
+# Line length (match black default)
+line-length = 120
+
+# Exclude common directories
+exclude = [
+    ".git",
+    ".venv",
+    "venv",
+    "__pycache__",
+    "*.egg-info",
+    "build",
+    "dist",
+    "outputs",
+    "checkpoints",
+    "data",
+    "wandb",
+    "runs",
+]
+
+[lint]
+# Enable a minimal, non-disruptive rule set
+# E: pycodestyle errors
+# F: pyflakes (unused imports, undefined names, etc.)
+# I: isort (import sorting)
+# W: pycodestyle warnings
+select = ["E", "F", "I", "W"]
+
+# Ignore specific rules that are too disruptive for existing codebase
+ignore = [
+    "E501",  # Line too long (handled by formatter, not linter)
+    "E731",  # Do not assign a lambda expression
+    "F401",  # Unused imports (can be intentional re-exports)
+    "W503",  # Line break before binary operator (conflicts with black)
+]
+
+# Allow unused variables when underscore-prefixed
+dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
+
+[lint.per-file-ignores]
+# Allow unused imports in __init__.py files (common for re-exports)
+"__init__.py" = ["F401", "F403"]
+# Tests may have unused imports for fixtures
+"tests/*" = ["F401"]
+
+[lint.isort]
+# Match existing import style
+known-first-party = ["models", "losses", "data", "utils", "config"]
+force-single-line = false
+combine-as-imports = true
+
+[format]
+# Use double quotes
+quote-style = "double"
+
+# Indent with spaces
+indent-style = "space"
+
+# Respect magic trailing commas
+skip-magic-trailing-comma = false
+
+# Unix-style line endings
+line-ending = "auto"

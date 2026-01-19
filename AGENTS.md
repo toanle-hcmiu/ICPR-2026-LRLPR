@@ -249,6 +249,77 @@ def _clamp_loss(self, loss, max_val=100.0):
 - **Usage**: Set `config.training.use_deformable_conv = True` (requires `use_shared_attention = True`)
 
 
+## Reproducibility & Determinism
+
+### Strict Determinism (Default)
+
+The codebase enables strict determinism by default via `seed_everything()` in `train.py`. This ensures exact reproducibility across runs but has a 5-15% performance overhead.
+
+**DO NOT disable strict determinism** unless you have a specific reason and document it.
+
+```python
+# Default - strict determinism enabled
+seed_everything(42)
+
+# Only if you need faster training and don't need reproducibility
+seed_everything(42, strict_determinism=False)
+```
+
+### What Strict Determinism Enables
+
+- `torch.backends.cudnn.deterministic = True`
+- `torch.backends.cudnn.benchmark = False`
+- `torch.use_deterministic_algorithms(True)`
+- `CUBLAS_WORKSPACE_CONFIG = ':4096:8'`
+- TF32 disabled (exact float32)
+- `PYTHONHASHSEED` set to seed
+
+### Non-Deterministic Operations
+
+If you encounter a `RuntimeError` about non-deterministic operations:
+
+1. First, try to find a deterministic alternative
+2. If unavoidable, document the exception clearly
+3. Consider using `torch.use_deterministic_algorithms(True, warn_only=True)` locally
+
+## Checkpoint Security
+
+### Critical Security Rules
+
+1. **NEVER load checkpoints from untrusted sources** - `torch.load()` uses pickle which can execute arbitrary code
+2. **NEVER accept checkpoint paths from user input without validation**
+3. **Always validate checkpoint paths are local files** - The `load_checkpoint()` function enforces this
+
+### Adding New Checkpoint Loading Code
+
+If you need to add new checkpoint loading functionality:
+
+```python
+from pathlib import Path
+import warnings
+
+def load_something(checkpoint_path: str):
+    # REQUIRED: Validate path is a local file
+    checkpoint_file = Path(checkpoint_path)
+    if not checkpoint_file.is_file():
+        raise FileNotFoundError(
+            f"Checkpoint not found or not a local file: {checkpoint_path}. "
+            "For security reasons, only local file paths are accepted."
+        )
+    
+    # REQUIRED: Emit security warning
+    warnings.warn(
+        f"Loading checkpoint from '{checkpoint_path}'. "
+        "torch.load() uses pickle which can execute arbitrary code. "
+        "Only load checkpoints from trusted sources.",
+        UserWarning
+    )
+    
+    # Load with weights_only=False (we need optimizer state, etc.)
+    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+    return checkpoint
+```
+
 ## Testing Changes
 
 ### Quick Validation
@@ -290,6 +361,35 @@ When modifying key files, ensure consistency:
 - [ ] `losses/__init__.py` - Export new losses
 - [ ] `README.md` - Update documentation
 - [ ] Test with `python train.py --stage 1` (quick smoke test)
+- [ ] Run `ruff check .` and `ruff format --check .` before committing
+- [ ] Run `pytest` to verify no regressions
+
+## CI/CD
+
+This project uses GitHub Actions for continuous integration:
+
+- **Lint**: Ruff formatting and linting checks
+- **Test**: pytest on Python 3.10 and 3.11
+- **Smoke Test**: Quick training pipeline validation
+
+See `.github/workflows/ci.yml` for details.
+
+### Running CI Checks Locally
+
+```bash
+# Install dev dependencies
+pip install ruff pytest
+
+# Linting
+ruff check .
+ruff format --check .
+
+# Testing
+pytest -v
+
+# Smoke tests only
+pytest -v -m smoke
+```
 
 ## Contact
 

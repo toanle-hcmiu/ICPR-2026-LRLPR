@@ -1,0 +1,159 @@
+{
+  "audit_meta": {
+    "timestamp": "2026-01-19T23:54:00Z",
+    "auditor": "AI Forensic Audit",
+    "target_files": [
+      "train.py",
+      "config.py",
+      "inference.py",
+      "README.md",
+      "AGENTS.md"
+    ],
+    "overall_health_score": "78/100",
+    "compliance_standards": [
+      "PyTorch Best Practices",
+      "ML Reproducibility Checklist",
+      "OWASP ML Security"
+    ]
+  },
+  "findings": [
+    {
+      "id": "REPRO-001",
+      "category": "Reproducibility",
+      "severity": "medium",
+      "title": "Strict determinism not enabled by default",
+      "file": "train.py",
+      "line": "49-66",
+      "description": "seed_everything() sets basic RNG seeds but does not enable cuDNN deterministic mode, torch.use_deterministic_algorithms(), or disable TF32.",
+      "status": "open",
+      "remediation": "Extend seed_everything() to set cudnn.deterministic=True, cudnn.benchmark=False, use_deterministic_algorithms(True), and disable TF32."
+    },
+    {
+      "id": "REPRO-002",
+      "category": "Reproducibility",
+      "severity": "low",
+      "title": "Inference adds random noise to frames",
+      "file": "inference.py",
+      "line": "94-101",
+      "description": "preprocess_image() adds torch.randn_like() noise to synthetic extra frames, making inference non-deterministic.",
+      "status": "open",
+      "remediation": "Remove random noise by default; add opt-in --frame-noise-std flag."
+    },
+    {
+      "id": "SEC-001",
+      "category": "Security",
+      "severity": "medium",
+      "title": "Unrestricted torch.load() in training",
+      "file": "train.py",
+      "line": "978",
+      "description": "load_checkpoint() calls torch.load() without path validation or safety warnings. torch.load() uses pickle which can execute arbitrary code.",
+      "status": "open",
+      "remediation": "Add path validation, emit security warning, document risk."
+    },
+    {
+      "id": "SEC-002",
+      "category": "Security",
+      "severity": "medium",
+      "title": "Unrestricted torch.load() in inference",
+      "file": "inference.py",
+      "line": "57",
+      "description": "load_model() calls torch.load() without path validation or safety warnings.",
+      "status": "open",
+      "remediation": "Add path validation, emit security warning, document risk."
+    },
+    {
+      "id": "PERF-001",
+      "category": "Performance",
+      "severity": "low",
+      "title": "zero_grad() without set_to_none optimization",
+      "file": "train.py",
+      "line": "528, 695",
+      "description": "optimizer.zero_grad() is called without set_to_none=True, which could reduce memory bandwidth.",
+      "status": "open",
+      "remediation": "Change to zero_grad(set_to_none=True)."
+    },
+    {
+      "id": "TEST-001",
+      "category": "Testing",
+      "severity": "low",
+      "title": "No reproducibility regression tests",
+      "file": "tests/",
+      "line": "N/A",
+      "description": "No tests verify that seeding produces deterministic results or that inference is reproducible.",
+      "status": "open",
+      "remediation": "Add tests/test_reproducibility.py with determinism checks."
+    },
+    {
+      "id": "CI-001",
+      "category": "DevOps",
+      "severity": "low",
+      "title": "No CI/CD pipeline",
+      "file": ".github/workflows/",
+      "line": "N/A",
+      "description": "No GitHub Actions workflow for automated linting or testing.",
+      "status": "open",
+      "remediation": "Add .github/workflows/ci.yml with ruff + pytest."
+    }
+  ],
+  "verified_correct": [
+    {
+      "id": "CORRECT-001",
+      "title": "Gradient zeroing is correct",
+      "file": "train.py",
+      "line": "528",
+      "description": "optimizer_g.zero_grad() is called inside the batch loop before loss.backward(), which is correct."
+    },
+    {
+      "id": "CORRECT-002",
+      "title": "Model mode switching is correct",
+      "file": "train.py",
+      "line": "391, 816",
+      "description": "model.train() is called at start of train_epoch(), model.eval() at start of validate()."
+    },
+    {
+      "id": "CORRECT-003",
+      "title": "Basic RNG seeding exists",
+      "file": "train.py",
+      "line": "49-66",
+      "description": "seed_everything() seeds random, numpy, torch CPU/CUDA RNGs."
+    },
+    {
+      "id": "CORRECT-004",
+      "title": "DataLoader worker seeding exists",
+      "file": "train.py",
+      "line": "68-81",
+      "description": "worker_init_fn() re-seeds numpy/random per worker using torch.initial_seed()."
+    },
+    {
+      "id": "CORRECT-005",
+      "title": "DataLoader generator seeding exists",
+      "file": "train.py",
+      "line": "1809-1821",
+      "description": "DataLoader is created with a seeded torch.Generator() for reproducible shuffling."
+    },
+    {
+      "id": "CORRECT-006",
+      "title": "YAML loading uses safe_load",
+      "file": "train.py",
+      "line": "1515",
+      "description": "Config YAML is loaded with yaml.safe_load(), preventing arbitrary code execution."
+    }
+  ],
+  "recommendations": {
+    "immediate": [
+      "Enable strict determinism in seed_everything()",
+      "Add checkpoint loading guardrails and warnings",
+      "Fix inference nondeterminism"
+    ],
+    "short_term": [
+      "Add CI/CD pipeline with linting and testing",
+      "Add reproducibility regression tests",
+      "Apply zero_grad(set_to_none=True) optimization"
+    ],
+    "long_term": [
+      "Consider migrating to safetensors for checkpoint security",
+      "Add type hints throughout codebase",
+      "Implement distributed training support"
+    ]
+  }
+}

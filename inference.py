@@ -41,21 +41,59 @@ def load_model(
         
     Returns:
         Loaded model in evaluation mode.
+        
+    Security Note:
+        torch.load() uses pickle which can execute arbitrary code.
+        Only load checkpoints from trusted sources.
     """
     if config is None:
         config = get_default_config()
     
-    # Create model
+    # Security: Validate checkpoint path is a local file
+    checkpoint_file = Path(checkpoint_path)
+    if not checkpoint_file.is_file():
+        raise FileNotFoundError(
+            f"Checkpoint not found or not a local file: {checkpoint_path}. "
+            "For security reasons, only local file paths are accepted."
+        )
+    
+    # Security warning for users
+    import warnings
+    warnings.warn(
+        f"Loading checkpoint from '{checkpoint_path}'. "
+        "torch.load() uses pickle which can execute arbitrary code. "
+        "Only load checkpoints from trusted sources.",
+        UserWarning
+    )
+    
+    # Create model with same args as train.py to ensure architecture compatibility
     model = NeuroSymbolicLPR(
         num_frames=config.model.num_frames,
         lr_size=(config.data.lr_height, config.data.lr_width),
         hr_size=(config.data.hr_height, config.data.hr_width),
-        use_lightweight_sr=True
+        use_shared_attention=config.training.use_shared_attention,
+        use_deformable_conv=config.training.use_deformable_conv,
     )
     
-    # Load checkpoint
-    checkpoint = torch.load(checkpoint_path, map_location='cpu')
-    model.load_state_dict(checkpoint['model_state_dict'])
+    # Load checkpoint with strict=False for backward compatibility
+    # This allows loading checkpoints from older model versions that may not
+    # have all the new components (e.g., shared attention module)
+    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+    missing_keys, unexpected_keys = model.load_state_dict(
+        checkpoint['model_state_dict'],
+        strict=False
+    )
+    
+    # Log any missing or unexpected keys for debugging
+    if missing_keys:
+        shared_attn_keys = [k for k in missing_keys if 'shared_attention' in k]
+        other_keys = [k for k in missing_keys if 'shared_attention' not in k]
+        if shared_attn_keys:
+            print(f"[INFO] Checkpoint missing {len(shared_attn_keys)} shared_attention weights (randomly initialized)")
+        if other_keys:
+            print(f"[WARNING] Checkpoint missing {len(other_keys)} other weights: {other_keys[:5]}...")
+    if unexpected_keys:
+        print(f"[WARNING] Checkpoint has {len(unexpected_keys)} unexpected keys: {unexpected_keys[:5]}...")
     
     model = model.to(device)
     model.eval()
@@ -66,7 +104,8 @@ def load_model(
 def preprocess_image(
     image: np.ndarray,
     target_size: Tuple[int, int],
-    num_frames: int = 5
+    num_frames: int = 5,
+    frame_noise_std: float = 0.0
 ) -> torch.Tensor:
     """
     Preprocess image for model input.
@@ -75,6 +114,9 @@ def preprocess_image(
         image: Input image as numpy array (H, W, C).
         target_size: Target size (H, W).
         num_frames: Number of frames to generate.
+        frame_noise_std: Standard deviation of noise to add to extra frames.
+            Default is 0.0 (deterministic). Set to small value like 0.01
+            for multi-frame augmentation during inference.
         
     Returns:
         Preprocessed tensor of shape (1, num_frames, C, H, W).
@@ -90,14 +132,15 @@ def preprocess_image(
     # Convert to CHW format
     img_tensor = torch.from_numpy(img_array).permute(2, 0, 1)
     
-    # Create multiple frames (duplicate with slight variations)
+    # Create multiple frames (duplicate, optionally with slight variations)
     frames = []
     for i in range(num_frames):
-        if i == 0:
-            frames.append(img_tensor)
+        if i == 0 or frame_noise_std <= 0.0:
+            # First frame is always clean; others are clean if noise disabled
+            frames.append(img_tensor.clone())
         else:
-            # Add slight noise for variation
-            noise = torch.randn_like(img_tensor) * 0.01
+            # Add slight noise for variation (opt-in only)
+            noise = torch.randn_like(img_tensor) * frame_noise_std
             frames.append(img_tensor + noise)
     
     # Stack frames and add batch dimension
@@ -329,6 +372,8 @@ def main():
     parser.add_argument('--output', type=str, default='output', help='Output directory')
     parser.add_argument('--device', type=str, default='cuda', help='Device (cuda or cpu)')
     parser.add_argument('--batch-size', type=int, default=16, help='Batch size for folder processing')
+    parser.add_argument('--frame-noise-std', type=float, default=0.0,
+                        help='Noise std for extra frames (0.0=deterministic, 0.01=slight variation)')
     args = parser.parse_args()
     
     # Setup device
