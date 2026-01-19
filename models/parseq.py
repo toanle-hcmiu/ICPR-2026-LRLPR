@@ -188,14 +188,32 @@ class PretrainedPARSeq(nn.Module):
         adapted = torch.full(
             (B, PLATE_LENGTH, VOCAB_SIZE), 
             fill_value=-100.0, 
-            device=device
+            device=device,
+            dtype=logits.dtype
         )
         
-        # Map pretrained indices to our indices
+        # Track which indices have been set (to handle lowercase+uppercase -> same target)
+        # We'll use a counter to know if we need to sum or just assign
+        assigned = {}  # Maps our_idx -> list of pretrained_idx
+        
+        # Group pretrained indices by target index
         for pretrained_idx, our_idx in self._pretrained_to_ours.items():
-            if pretrained_idx < V_pretrained:
-                # Take first PLATE_LENGTH positions
-                adapted[:, :, our_idx] = logits[:, :PLATE_LENGTH, pretrained_idx]
+            if our_idx not in assigned:
+                assigned[our_idx] = []
+            assigned[our_idx].append(pretrained_idx)
+        
+        # Map pretrained indices to our indices, summing when multiple sources
+        for our_idx, pretrained_indices in assigned.items():
+            valid_indices = [idx for idx in pretrained_indices if idx < V_pretrained]
+            if len(valid_indices) == 1:
+                # Single source - just assign
+                adapted[:, :, our_idx] = logits[:, :PLATE_LENGTH, valid_indices[0]]
+            elif len(valid_indices) > 1:
+                # Multiple sources (e.g., 'a' and 'A' both map to 'A')
+                # Sum the logits in log-space (equivalent to multiplying probabilities)
+                # Or use logsumexp for numerical stability
+                stacked = torch.stack([logits[:, :PLATE_LENGTH, idx] for idx in valid_indices], dim=-1)
+                adapted[:, :, our_idx] = torch.logsumexp(stacked, dim=-1)
         
         return adapted
     
