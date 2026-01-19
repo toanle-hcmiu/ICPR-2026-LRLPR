@@ -105,6 +105,10 @@ class PretrainedPARSeq(nn.Module):
             if device is not None:
                 self._model = self._model.to(device)
             
+            # CRITICAL: Set to eval mode to disable dropout!
+            # This prevents random outputs during inference
+            self._model.eval()
+            
             self._loaded = True
             self._use_fallback = False
             print(f"[OK] Loaded pretrained PARSeq ({self.model_name})")
