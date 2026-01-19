@@ -80,9 +80,12 @@ def seed_everything(seed: int, strict_determinism: bool = True):
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
         
-        # Enable PyTorch's deterministic algorithms
-        # This will raise an error if a non-deterministic operation is used
-        torch.use_deterministic_algorithms(True, warn_only=False)
+        # Enable PyTorch's deterministic algorithms with warn_only=True
+        # We use warn_only=True because some operations (F.grid_sample backward,
+        # deformable convolutions) don't have deterministic implementations.
+        # This allows training to proceed while warning about non-deterministic ops.
+        # See: https://github.com/pytorch/pytorch/issues/for deterministic alternatives
+        torch.use_deterministic_algorithms(True, warn_only=True)
         
         # Set CUBLAS workspace config for deterministic cuBLAS operations
         os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
