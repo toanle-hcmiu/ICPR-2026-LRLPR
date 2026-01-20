@@ -497,7 +497,28 @@ def train_epoch(
         scaler = scaler_g  # Use generator scaler for main forward pass
         
         with autocast('cuda', enabled=use_amp_for_batch):
-            outputs = model(lr_frames, return_intermediates=True)
+            # SPECIAL CASE: parseq_warmup stage - bypass generator, use GT HR directly
+            # This trains PARSeq on clean GT images, not noisy generated ones
+            if stage == 'parseq_warmup':
+                # Directly feed GT HR to recognizer
+                hr_image = targets['hr_image']
+                raw_logits = model.recognizer.forward_parallel(hr_image)
+                
+                # Get layout from first frame (simplified)
+                B = hr_image.shape[0]
+                is_mercosul = torch.zeros(B, device=hr_image.device)  # Placeholder
+                
+                # Apply syntax mask
+                masked_logits = model.syntax_mask(raw_logits, is_mercosul, training=True)
+                
+                # Create minimal outputs dict for loss computation
+                outputs = {
+                    'raw_logits': raw_logits,
+                    'masked_logits': masked_logits,
+                    'hr_image': hr_image,  # Use GT HR for logging purposes
+                }
+            else:
+                outputs = model(lr_frames, return_intermediates=True)
             
             # Validate generator output isn't producing extreme values
             # This catches cases where the generator is collapsing before it causes NaN
@@ -897,11 +918,23 @@ def validate(
             if corners is not None:
                 targets['corners'] = corners
             
-            outputs = model(lr_frames, return_intermediates=True)
+            # SPECIAL CASE: parseq_warmup stage - bypass generator, use GT HR directly
+            if stage == 'parseq_warmup':
+                raw_logits = model.recognizer.forward_parallel(hr_image)
+                B = hr_image.shape[0]
+                is_mercosul = torch.zeros(B, device=hr_image.device)
+                masked_logits = model.syntax_mask(raw_logits, is_mercosul, training=False)
+                outputs = {
+                    'raw_logits': raw_logits,
+                    'masked_logits': masked_logits,
+                    'hr_image': hr_image,
+                }
+            else:
+                outputs = model(lr_frames, return_intermediates=True)
             
             # Compute loss - use stage-specific loss to avoid NaN from OCR
             # during early training stages (STN stage especially)
-            if stage == 'pretrain':
+            if stage == 'pretrain' or stage == 'parseq_warmup':
                 _, loss_dict = criterion.get_stage_loss('pretrain', outputs, targets)
             elif stage == 'stn':
                 _, loss_dict = criterion.get_stage_loss('stn', outputs, targets)

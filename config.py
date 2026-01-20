@@ -172,7 +172,7 @@ class TrainingConfig:
     # to learning rate - grid sampling gradients can explode with large parameter updates.
     lr_pretrain: float = 1e-4
     lr_stn: float = 1e-5  # Further reduced for stability - STN is extremely sensitive to large LR
-    lr_parseq_warmup: float = 1e-5  # Conservative LR for pretrained PARSeq on GT HR
+    lr_parseq_warmup: float = 5e-5  # Higher LR for faster warm-up on GT HR
     lr_restoration: float = 5e-5  # Reduced from 2e-4 to fix GAN instability (discriminator collapse)
     lr_finetune: float = 2e-5  # Increased for faster convergence
     lr_parseq_finetune: float = 1e-6  # Lower LR for pre-trained OCR
