@@ -162,6 +162,7 @@ class TrainingConfig:
     # Batch sizes for each training stage
     batch_size_pretrain: int = 128
     batch_size_stn: int = 32
+    batch_size_parseq_warmup: int = 64  # Larger batch for OCR-only training on GT HR
     batch_size_restoration: int = 32  # Increased from 16 to stabilize BatchNorm in Discriminator
     batch_size_finetune: int = 8
     
@@ -171,6 +172,7 @@ class TrainingConfig:
     # to learning rate - grid sampling gradients can explode with large parameter updates.
     lr_pretrain: float = 1e-4
     lr_stn: float = 1e-5  # Further reduced for stability - STN is extremely sensitive to large LR
+    lr_parseq_warmup: float = 1e-5  # Conservative LR for pretrained PARSeq on GT HR
     lr_restoration: float = 5e-5  # Reduced from 2e-4 to fix GAN instability (discriminator collapse)
     lr_finetune: float = 2e-5  # Increased for faster convergence
     lr_parseq_finetune: float = 1e-6  # Lower LR for pre-trained OCR
@@ -178,6 +180,7 @@ class TrainingConfig:
     # Training epochs for each stage
     epochs_pretrain: int = 50
     epochs_stn: int = 50
+    epochs_parseq_warmup: int = 30  # PARSeq warm-up on GT HR before restoration
     epochs_restoration: int = 500
     epochs_finetune: int = 500  # Increased from 100 for better convergence
     

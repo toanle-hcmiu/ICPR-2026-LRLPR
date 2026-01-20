@@ -445,8 +445,9 @@ class NeuroSymbolicLPR(nn.Module):
         Returns:
             List of parameter groups.
         """
-        if stage == 'pretrain':
-            # Pretrain: only train the recognizer (PARSeq) on OCR task
+        if stage == 'pretrain' or stage == 'parseq_warmup':
+            # Pretrain/parseq_warmup: only train the recognizer (PARSeq) on OCR task
+            # parseq_warmup specifically trains on GT HR to learn Brazilian plate fonts
             return [
                 {'params': self.recognizer.parameters()}
             ]

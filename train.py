@@ -300,6 +300,7 @@ def create_optimizer(
     base_lr = {
         'pretrain': config.training.lr_pretrain,
         'stn': config.training.lr_stn,
+        'parseq_warmup': config.training.lr_parseq_warmup,
         'restoration': config.training.lr_restoration,
         'full': config.training.lr_finetune
     }.get(stage, 1e-4)
@@ -516,7 +517,7 @@ def train_epoch(
                 current_discriminator = None  # Pass None to skip GAN loss computation
             
             # Compute generator loss
-            if stage == 'pretrain':
+            if stage == 'pretrain' or stage == 'parseq_warmup':
                 loss_g, loss_dict = criterion.get_stage_loss('pretrain', outputs, targets)
             elif stage == 'stn':
                 loss_g, loss_dict = criterion.get_stage_loss('stn', outputs, targets)
@@ -1845,6 +1846,7 @@ def main():
     if args.stage == 'all':
         stages = [
             ('stn', config.training.epochs_stn),
+            ('parseq_warmup', config.training.epochs_parseq_warmup),
             ('restoration', config.training.epochs_restoration),
             ('full', config.training.epochs_finetune)
         ]
@@ -1852,6 +1854,7 @@ def main():
         stage_map = {
             '0': ('pretrain', config.training.epochs_pretrain),
             '1': ('stn', config.training.epochs_stn),
+            '1.5': ('parseq_warmup', config.training.epochs_parseq_warmup),
             '2': ('restoration', config.training.epochs_restoration),
             '3': ('full', config.training.epochs_finetune)
         }
@@ -1865,6 +1868,9 @@ def main():
             model.freeze_all_except_recognizer()
         elif stage_name == 'stn':
             model.freeze_recognizer()
+        elif stage_name == 'parseq_warmup':
+            # PARSeq warm-up: train only recognizer on GT HR images
+            model.freeze_all_except_recognizer()
         elif stage_name == 'restoration':
             model.freeze_stn()
             model.freeze_recognizer()
@@ -1876,6 +1882,7 @@ def main():
         batch_size_map = {
             'pretrain': config.training.batch_size_pretrain,
             'stn': config.training.batch_size_stn,
+            'parseq_warmup': config.training.batch_size_parseq_warmup,
             'restoration': config.training.batch_size_restoration,
             'full': config.training.batch_size_finetune
         }

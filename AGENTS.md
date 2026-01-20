@@ -69,6 +69,7 @@ HR_SIZE = (64, 192)  # High-resolution output (4× upscale)
 ```
 Stage 0: Pretrain (SKIPPED with pretrained PARSeq)
 Stage 1: STN - Geometry warm-up (encoder + STN)
+Stage 1.5: PARSeq Warm-up - Train recognizer on GT HR images
 Stage 2: Restoration - SwinIR + Layout + Fusion
 Stage 3: Full - End-to-end fine-tuning
 ```
@@ -78,6 +79,7 @@ Stage 3: Full - End-to-end fine-tuning
 | Stage | Frozen Modules | Loss Functions |
 |-------|----------------|----------------|
 | STN | Recognizer | Self-supervised, Pixel, Corner |
+| PARSeq Warm-up | All except Recognizer | OCR only |
 | Restoration | Encoder, STN, Recognizer | Pixel, GAN, Layout |
 | Full | None | All losses |
 
