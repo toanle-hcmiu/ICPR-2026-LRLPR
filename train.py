@@ -492,7 +492,8 @@ def train_epoch(
         # CRITICAL: Disable AMP for STN stage to prevent FP16 precision issues
         # STN grid generation and affine transformations are highly sensitive to
         # precision loss in FP16, causing NaN/Inf gradients and training collapse
-        use_amp_for_batch = use_amp and (stage != 'stn')
+        # Also disable for parseq_warmup since pretrained PARSeq has FP32 weights
+        use_amp_for_batch = use_amp and (stage not in ['stn', 'parseq_warmup'])
         scaler = scaler_g  # Use generator scaler for main forward pass
         
         with autocast('cuda', enabled=use_amp_for_batch):
