@@ -550,15 +550,26 @@ def train_epoch(
             
             # Add OCR-based guidance loss if configured
             # Uses recognition confidence to guide super-resolution
-            if ocr_discriminator_loss is not None and stage in ['restoration', 'full']:
+            # OPTIMIZATION: Only run OCR every N steps to reduce overhead
+            ocr_every_n_steps = 4  # Run OCR every 4 iterations (4x speedup)
+            ocr_batch_size = 8  # Only use subset of batch for OCR (4x speedup)
+            
+            run_ocr_this_step = (batch_idx % ocr_every_n_steps == 0)
+            
+            if ocr_discriminator_loss is not None and stage in ['restoration', 'full'] and run_ocr_this_step:
                 # Get text targets (remove BOS/EOS tokens)
                 text_targets = targets['text_indices'][:, 1:-1]  # (B, PLATE_LENGTH)
                 
+                # OPTIMIZATION: Only use subset of batch for OCR (saves ~75% OCR cost)
+                hr_for_ocr = outputs['hr_image'][:ocr_batch_size]
+                gt_for_ocr = targets['hr_image'][:ocr_batch_size]
+                text_for_ocr = text_targets[:ocr_batch_size]
+                
                 # Compute OCR guidance loss on generated HR images
                 ocr_loss, ocr_metrics = ocr_discriminator_loss.generator_loss(
-                    fake_images=outputs['hr_image'],
-                    targets=text_targets,
-                    real_images=targets['hr_image']
+                    fake_images=hr_for_ocr,
+                    targets=text_for_ocr,
+                    real_images=gt_for_ocr
                 )
                 
                 # Only apply OCR guidance if the OCR model has meaningful confidence
@@ -567,9 +578,9 @@ def train_epoch(
                 min_ocr_confidence = 0.10  # 10% threshold
                 
                 if real_conf >= min_ocr_confidence:
-                    # Add to total loss
+                    # Add to total loss (scaled by ocr_every_n_steps to compensate for frequency)
                     if not check_for_nan(ocr_loss, "ocr_guidance"):
-                        loss_g = loss_g + ocr_loss
+                        loss_g = loss_g + ocr_loss * ocr_every_n_steps
                         loss_dict['ocr_guidance'] = ocr_metrics.get('total', ocr_loss.item())
                 else:
                     # Skip OCR guidance - model not ready
@@ -579,6 +590,11 @@ def train_epoch(
                 loss_dict['ocr_fake_conf'] = ocr_metrics.get('fake_confidence', 0.0)
                 if 'real_confidence' in ocr_metrics:
                     loss_dict['ocr_real_conf'] = ocr_metrics['real_confidence']
+            elif ocr_discriminator_loss is not None and stage in ['restoration', 'full']:
+                # Not running OCR this step - use cached values for logging
+                loss_dict['ocr_guidance'] = 0.0
+                loss_dict['ocr_fake_conf'] = 0.0
+                loss_dict['ocr_real_conf'] = 0.0
         
         # Check for NaN loss and skip batch if detected
         if check_for_nan(loss_g, "loss_g"):

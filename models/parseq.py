@@ -265,8 +265,10 @@ class PretrainedPARSeq(nn.Module):
             )
         
         # Get predictions from pretrained model
+        # Disable autocast AND explicitly cast to FP32 to avoid type mismatch
         with torch.amp.autocast('cuda', enabled=False):
-            logits = self._model(x_normalized)
+            x_fp32 = x_normalized.float()  # Ensure FP32 for pretrained weights
+            logits = self._model(x_fp32)
         
         # Adapt to our charset
         adapted_logits = self._adapt_logits(logits)
