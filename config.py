@@ -209,7 +209,7 @@ class TrainingConfig:
     # OCR-as-Discriminator (from LCOFL paper)
     # Replaces binary discriminator with OCR-based guidance for more stable training
     use_ocr_discriminator: bool = True  # Enabled: Uses OCR confidence as discriminator (more stable than binary GAN)
-    weight_ocr_guidance: float = 1.0  # Restored to default (3.0 caused mode collapse)
+    weight_ocr_guidance: float = 0.0  # DISABLED - causes mode collapse (maximizes ANY confidence, not correct chars)
     freeze_ocr_discriminator: bool = True  # Keep OCR frozen during training
     ocr_confidence_mode: str = 'mean'  # 'mean', 'min', or 'product'
     
