@@ -2051,13 +2051,26 @@ def main():
         
         logger.info(f"Stage {stage_name}: Using batch size {batch_size}")
         
+        # Determine Stage 2 anchor path (for Stage 3 anti-collapse)
+        # 1. Use explicit argument if provided
+        # 2. Or infer from resume path if provided
+        stage2_anchor_path = args.stage2_anchor
+        if stage2_anchor_path is None and args.resume is not None:
+            # Try to find restoration_best.pth in same directory as resume checkpoint
+            resume_dir = os.path.dirname(args.resume)
+            potential_path = os.path.join(resume_dir, 'restoration_best.pth')
+            if os.path.exists(potential_path):
+                stage2_anchor_path = potential_path
+                logger.info(f"Auto-inferred Stage 2 anchor path: {stage2_anchor_path}")
+        
         best_acc = train_stage(
             model, discriminator, train_loader, val_loader,
             config, stage_name, num_epochs, device,
             checkpoint_dir, writer, logger, start_epoch,
             use_amp=not args.no_amp,
             use_ema=not args.no_ema,
-            early_stopping_patience=args.early_stopping
+            early_stopping_patience=args.early_stopping,
+            stage2_anchor_path=stage2_anchor_path
         )
         
         logger.info(f"Stage {stage_name} completed with best accuracy: {best_acc:.4f}")
