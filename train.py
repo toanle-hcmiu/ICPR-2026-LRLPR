@@ -1280,6 +1280,25 @@ def train_stage(
     max_consecutive_nan_epochs = 3  # Stop stage if too many consecutive NaN epochs
     
     for epoch in range(start_epoch, num_epochs):
+        # Curriculum learning for Stage 3: gradually increase OCR weight
+        # This prevents early collapse by letting generator stabilize first
+        if stage == 'full' and hasattr(criterion, 'weights'):
+            # Ramp OCR weight from initial (0.5) to target (1.5) over warmup_epochs
+            ocr_warmup_epochs = 20
+            initial_ocr_weight = config.training.weight_ocr  # 0.5
+            target_ocr_weight = 1.5  # Final target
+            
+            if epoch < ocr_warmup_epochs:
+                # Linear ramp: 0.5 -> 1.5 over 20 epochs
+                progress = epoch / ocr_warmup_epochs
+                current_ocr_weight = initial_ocr_weight + (target_ocr_weight - initial_ocr_weight) * progress
+            else:
+                current_ocr_weight = target_ocr_weight
+            
+            criterion.weights['ocr'] = current_ocr_weight
+            if epoch % 5 == 0:  # Log every 5 epochs
+                logger.info(f"Curriculum: OCR weight = {current_ocr_weight:.3f}")
+        
         # Train
         train_losses = train_epoch(
             model, discriminator, train_loader, criterion,

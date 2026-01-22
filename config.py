@@ -174,7 +174,7 @@ class TrainingConfig:
     lr_stn: float = 1e-5  # Further reduced for stability - STN is extremely sensitive to large LR
     lr_parseq_warmup: float = 5e-5  # Higher LR for faster warm-up on GT HR
     lr_restoration: float = 5e-5  # Reduced from 2e-4 to fix GAN instability (discriminator collapse)
-    lr_finetune: float = 2e-5  # Increased for faster convergence
+    lr_finetune: float = 1e-5  # Reduced from 2e-5 for Stage 3 stability
     lr_parseq_finetune: float = 1e-6  # Lower LR for pre-trained OCR
     
     # Training epochs for each stage
@@ -186,8 +186,8 @@ class TrainingConfig:
     
     # Loss weights (for L_total = L_pixel + w1*L_GAN + w2*L_OCR + w3*L_geo)
     weight_pixel: float = 1.0  # Primary anchor - prevents mode collapse
-    weight_gan: float = 0.05  # Increased from 0.001 - provides meaningful adversarial signal to generator
-    weight_ocr: float = 1.5  # Moderate OCR guidance (was 5.0 - caused mode collapse)
+    weight_gan: float = 0.01  # Reduced for stability (was 0.05 - too aggressive)
+    weight_ocr: float = 0.5  # Start low to prevent collapse (curriculum: ramp up after stable)
     weight_geometry: float = 0.1
     
     # LCOFL Loss (from Nascimento et al. "Enhancing LP Super-Resolution" paper)
