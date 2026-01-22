@@ -186,7 +186,7 @@ class TrainingConfig:
     
     # Loss weights (for L_total = L_pixel + w1*L_GAN + w2*L_OCR + w3*L_geo)
     weight_pixel: float = 1.0  # Primary anchor - prevents mode collapse
-    weight_gan: float = 0.01  # Reduced for stability (was 0.05 - too aggressive)
+    weight_gan: float = 0.005  # Reduced for stability (was 0.01 - too aggressive)
     weight_ocr: float = 0.5  # Start low to prevent collapse (curriculum: ramp up after stable)
     weight_geometry: float = 0.1
     
@@ -200,7 +200,7 @@ class TrainingConfig:
     
     # Total Variation Loss for suppressing wavy/checkerboard artifacts
     # Recommended: 1e-5 to 1e-4 for subtle smoothing without blur
-    weight_tv: float = 1e-5  # Enable TV loss to reduce wavy distortions
+    weight_tv: float = 2e-4  # Increased to 2e-4 to suppress strong wavy artifacts in Stage 3
     
     # Shared Attention and Deformable Convolutions (from same paper)
     use_shared_attention: bool = True  # Enable shared attention module
