@@ -869,8 +869,184 @@ class CompositeLoss(nn.Module):
             loss_dict['total'] = self._safe_loss_item(total_loss)
             return total_loss, loss_dict
         
-        else:  # 'full'
-            return self.forward(outputs, targets, discriminator)
+        else:  # 'full' - Stage 3 with anti-collapse mechanisms
+            return self.get_stage3_loss(
+                outputs, targets, discriminator,
+                global_step=0,  # Default, should be passed from train.py
+                sr_stage2=None,  # Default, should be passed from train.py
+                ocr_baseline=None  # Default OCR loss from Stage 2
+            )
+    
+    def get_stage3_loss(
+        self,
+        outputs: Dict[str, torch.Tensor],
+        targets: Dict[str, torch.Tensor],
+        discriminator: Optional[nn.Module] = None,
+        global_step: int = 0,
+        sr_stage2: Optional[torch.Tensor] = None,
+        ocr_baseline: Optional[float] = None,
+        config: Optional['TrainingConfig'] = None
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """
+        Stage 3 loss with anti-collapse mechanisms.
+        
+        Prevents OCR gradients from dominating and causing visual quality degradation.
+        
+        Anti-collapse mechanisms:
+        1. SR Anchor Loss: Anchors Stage 3 SR output to Stage 2 SR output
+        2. OCR Warmup: Gates OCR loss for first N steps, then ramps up gradually
+        3. Hinge-Style OCR: Only penalizes if OCR gets worse than Stage 2 baseline
+        
+        Args:
+            outputs: Model outputs (hr_image, masked_logits, etc.)
+            targets: Ground truth targets
+            discriminator: Optional discriminator for GAN loss
+            global_step: Current training step (for OCR warmup scheduling)
+            sr_stage2: Detached SR output from Stage 2 model (for anchoring)
+            ocr_baseline: OCR loss value from Stage 2 (for hinge constraint)
+            config: Training config with Stage 3 parameters
+        """
+        loss_dict = {}
+        total_loss = None
+        
+        # Default Stage 3 parameters (can be overridden by config)
+        sr_anchor_weight = 1.0
+        ocr_warmup_steps = 3000
+        ocr_ramp_steps = 3000
+        ocr_max_weight = 0.1
+        use_ocr_hinge = True
+        
+        if config is not None:
+            sr_anchor_weight = getattr(config, 'stage3_sr_anchor_weight', 1.0)
+            ocr_warmup_steps = getattr(config, 'stage3_ocr_warmup_steps', 3000)
+            ocr_ramp_steps = getattr(config, 'stage3_ocr_ramp_steps', 3000)
+            ocr_max_weight = getattr(config, 'stage3_ocr_max_weight', 0.1)
+            use_ocr_hinge = getattr(config, 'stage3_use_ocr_hinge', True)
+        
+        # =================================================================
+        # 1. PIXEL LOSS (Primary anchor - prevents mode collapse)
+        # =================================================================
+        if 'hr_image' in outputs and 'hr_image' in targets:
+            if not (torch.isnan(outputs['hr_image']).any() or torch.isnan(targets['hr_image']).any()):
+                l_pixel = self.pixel_loss(outputs['hr_image'], targets['hr_image'])
+                l_pixel = self._clamp_loss(l_pixel)
+                loss_dict['pixel'] = self._safe_loss_item(l_pixel)
+                weighted = self.weights['pixel'] * l_pixel
+                total_loss = weighted if total_loss is None else total_loss + weighted
+        
+        # =================================================================
+        # 2. SR ANCHOR LOSS (Anchors to Stage 2 output - prevents drift)
+        # =================================================================
+        if sr_stage2 is not None and 'hr_image' in outputs:
+            if not (torch.isnan(outputs['hr_image']).any() or torch.isnan(sr_stage2).any()):
+                # L1 distance from Stage 2 output (detached)
+                l_sr_anchor = F.l1_loss(outputs['hr_image'], sr_stage2.detach())
+                l_sr_anchor = self._clamp_loss(l_sr_anchor)
+                loss_dict['sr_anchor'] = self._safe_loss_item(l_sr_anchor)
+                weighted = sr_anchor_weight * l_sr_anchor
+                total_loss = weighted if total_loss is None else total_loss + weighted
+        
+        # =================================================================
+        # 3. PERCEPTUAL LOSS (Increased weight for Stage 3)
+        # =================================================================
+        if self.perceptual_loss is not None and 'hr_image' in outputs and 'hr_image' in targets:
+            if not (torch.isnan(outputs['hr_image']).any() or torch.isnan(targets['hr_image']).any()):
+                l_perceptual = self.perceptual_loss(outputs['hr_image'], targets['hr_image'])
+                l_perceptual = self._clamp_loss(l_perceptual)
+                loss_dict['perceptual'] = self._safe_loss_item(l_perceptual)
+                # Increase perceptual weight in Stage 3 to counterbalance OCR
+                perceptual_weight = max(self.weights['perceptual'], 0.3)
+                weighted = perceptual_weight * l_perceptual
+                total_loss = weighted if total_loss is None else total_loss + weighted
+        
+        # =================================================================
+        # 4. GAN LOSS (Generator side, with warm-up)
+        # =================================================================
+        if discriminator is not None and 'hr_image' in outputs:
+            if not torch.isnan(outputs['hr_image']).any():
+                pred_fake = discriminator(outputs['hr_image'])
+                if not torch.isnan(pred_fake).any():
+                    l_gan = self.gan_loss(pred_fake, target_is_real=True)
+                    l_gan = self._clamp_loss(l_gan)
+                    loss_dict['gan'] = self._safe_loss_item(l_gan)
+                    weighted = self.weights['gan'] * l_gan
+                    total_loss = weighted if total_loss is None else total_loss + weighted
+        
+        # =================================================================
+        # 5. OCR LOSS with WARMUP and HINGE CONSTRAINT
+        # =================================================================
+        if 'masked_logits' in outputs and 'text_indices' in targets:
+            if not (torch.isnan(outputs['masked_logits']).any() or torch.isnan(targets['text_indices'].float()).any()):
+                # Compute raw OCR loss
+                l_ocr_raw = self.ocr_loss(outputs['masked_logits'], targets['text_indices'])
+                l_ocr_raw = self._clamp_loss(l_ocr_raw)
+                loss_dict['ocr_raw'] = self._safe_loss_item(l_ocr_raw)
+                
+                # OCR Warmup: Gate OCR loss for first N steps
+                if global_step < ocr_warmup_steps:
+                    ocr_weight = 0.0
+                else:
+                    # Ramp up OCR weight gradually
+                    ramp_progress = min(1.0, (global_step - ocr_warmup_steps) / max(1, ocr_ramp_steps))
+                    ocr_weight = ramp_progress * ocr_max_weight
+                
+                loss_dict['ocr_weight'] = ocr_weight
+                
+                # Apply OCR loss (optionally with hinge constraint)
+                if ocr_weight > 0:
+                    if use_ocr_hinge and ocr_baseline is not None:
+                        # Hinge constraint: only penalize if worse than Stage 2
+                        # relu(ocr_current - ocr_baseline) -> 0 if better, positive if worse
+                        l_ocr = F.relu(l_ocr_raw - ocr_baseline)
+                        loss_dict['ocr_hinge'] = self._safe_loss_item(l_ocr)
+                    else:
+                        # Standard OCR loss (scaled by warmup weight)
+                        l_ocr = l_ocr_raw
+                    
+                    loss_dict['ocr'] = self._safe_loss_item(l_ocr)
+                    weighted = ocr_weight * l_ocr
+                    total_loss = weighted if total_loss is None else total_loss + weighted
+                else:
+                    loss_dict['ocr'] = 0.0
+        
+        # =================================================================
+        # 6. LAYOUT LOSS
+        # =================================================================
+        if 'layout_logits' in outputs and 'layout' in targets:
+            if not torch.isnan(outputs['layout_logits']).any():
+                l_layout = self.layout_loss(outputs['layout_logits'], targets['layout'])
+                l_layout = self._clamp_loss(l_layout)
+                loss_dict['layout'] = self._safe_loss_item(l_layout)
+                weighted = self.weights['layout'] * l_layout
+                total_loss = weighted if total_loss is None else total_loss + weighted
+        
+        # =================================================================
+        # 7. TOTAL VARIATION LOSS (for artifact suppression)
+        # =================================================================
+        if self.tv_loss is not None and 'hr_image' in outputs:
+            if not torch.isnan(outputs['hr_image']).any():
+                l_tv = self.tv_loss(outputs['hr_image'])
+                l_tv = self._clamp_loss(l_tv)
+                loss_dict['tv'] = self._safe_loss_item(l_tv)
+                weighted = self.weights['tv'] * l_tv
+                total_loss = weighted if total_loss is None else total_loss + weighted
+        
+        # =================================================================
+        # Fallback if no loss was computed
+        # =================================================================
+        if total_loss is None:
+            if 'hr_image' in outputs:
+                total_loss = outputs['hr_image'].sum() * 0.0
+            else:
+                any_output = next(iter(outputs.values()))
+                total_loss = any_output.sum() * 0.0
+        
+        # Final clamp
+        total_loss = self._clamp_loss(total_loss, max_val=100.0)
+        
+        loss_dict['total'] = self._safe_loss_item(total_loss)
+        
+        return total_loss, loss_dict
 
 
 class StagedTrainingManager:

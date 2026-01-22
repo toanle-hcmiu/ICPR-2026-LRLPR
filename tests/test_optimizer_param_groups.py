@@ -67,6 +67,7 @@ class TestCreateOptimizer:
             betas = (0.9, 0.999)
             lr_pretrain = 1e-4
             lr_stn = 1e-5
+            lr_parseq_warmup = 5e-5
             lr_restoration = 5e-5
             lr_finetune = 2e-5
         

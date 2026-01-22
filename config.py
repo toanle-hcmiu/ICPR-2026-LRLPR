@@ -213,6 +213,16 @@ class TrainingConfig:
     freeze_ocr_discriminator: bool = True  # Keep OCR frozen during training
     ocr_confidence_mode: str = 'mean'  # 'mean', 'min', or 'product'
     
+    # Stage 3 Anti-Collapse Parameters
+    # These prevent OCR gradients from dominating and causing visual quality degradation
+    # Problem: Stage 2 output is already good, Stage 3 over-optimizes for OCR confidence
+    # Solution: Anchor to Stage 2 + delay OCR influence + use hinge constraint
+    stage3_sr_anchor_weight: float = 1.0      # Weight for SR anchoring to Stage 2 output
+    stage3_ocr_warmup_steps: int = 3000       # Steps before OCR loss starts ramping
+    stage3_ocr_ramp_steps: int = 3000         # Steps to ramp OCR from 0 to max weight
+    stage3_ocr_max_weight: float = 0.1        # Max OCR weight (much lower than default 0.5)
+    stage3_use_ocr_hinge: bool = True         # Use hinge constraint (only penalize if worse than Stage 2)
+    
     # Optimizer
     optimizer: str = 'adamw'
     weight_decay: float = 0.01

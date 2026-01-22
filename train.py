@@ -413,7 +413,9 @@ def train_epoch(
     ema: Optional[EMA] = None,
     grad_clip_norm: float = 1.0,
     total_epochs: int = 20,
-    ocr_discriminator_loss: Optional['OCRDiscriminatorLoss'] = None
+    ocr_discriminator_loss: Optional['OCRDiscriminatorLoss'] = None,
+    model_stage2: Optional[nn.Module] = None,  # Stage 2 model for anchor generation
+    config: Optional[Config] = None            # For Stage 3 parameters
 ) -> Dict[str, float]:
     """
     Train for one epoch with optional mixed precision.
@@ -546,7 +548,33 @@ def train_epoch(
             elif stage == 'restoration':
                 loss_g, loss_dict = criterion.get_stage_loss('restoration', outputs, targets, current_discriminator)
             else:
-                loss_g, loss_dict = criterion(outputs, targets, current_discriminator)
+                # Stage 3 ('full'): Use anti-collapse loss with OCR warmup
+                # Compute global_step for OCR warmup scheduling
+                global_step = epoch * num_batches + batch_idx
+                
+                # Generate Stage 2 anchor signals if model is available
+                sr_stage2 = None
+                ocr_baseline = None
+                
+                if model_stage2 is not None:
+                    with torch.no_grad():
+                        # Run Stage 2 model on same input
+                        # Note: We must enable mixed precision if used, but gradients are disabled
+                        with autocast('cuda', enabled=use_amp_for_batch):
+                            out_stage2 = model_stage2(lr_frames)
+                            sr_stage2 = out_stage2['hr_image'].detach()
+                            
+                            # Optional: Compute OCR baseline from Stage 2 model
+                            # If Stage 2 model yielded masked_logits, we could compute its loss
+                            # For now, we rely on SR anchoring which is the most critical part
+                
+                loss_g, loss_dict = criterion.get_stage3_loss(
+                    outputs, targets, current_discriminator,
+                    global_step=global_step,
+                    sr_stage2=sr_stage2,  # Detached Stage 2 output
+                    ocr_baseline=ocr_baseline,  # Validated Stage 2 OCR loss
+                    config=config.training if config else None
+                )
             
             # Add OCR-based guidance loss if configured
             # Uses recognition confidence to guide super-resolution
@@ -556,7 +584,7 @@ def train_epoch(
             
             run_ocr_this_step = (batch_idx % ocr_every_n_steps == 0)
             
-            if ocr_discriminator_loss is not None and stage in ['restoration', 'full'] and run_ocr_this_step:
+            if ocr_discriminator_loss is not None and stage == 'restoration' and run_ocr_this_step:
                 # Get text targets (remove BOS/EOS tokens)
                 text_targets = targets['text_indices'][:, 1:-1]  # (B, PLATE_LENGTH)
                 
@@ -590,7 +618,7 @@ def train_epoch(
                 loss_dict['ocr_fake_conf'] = ocr_metrics.get('fake_confidence', 0.0)
                 if 'real_confidence' in ocr_metrics:
                     loss_dict['ocr_real_conf'] = ocr_metrics['real_confidence']
-            elif ocr_discriminator_loss is not None and stage in ['restoration', 'full']:
+            elif ocr_discriminator_loss is not None and stage == 'restoration':
                 # Not running OCR this step - use cached values for logging
                 loss_dict['ocr_guidance'] = 0.0
                 loss_dict['ocr_fake_conf'] = 0.0
@@ -858,6 +886,19 @@ def train_epoch(
             for key, value in loss_dict.items():
                 if not (isinstance(value, float) and (math.isnan(value) or math.isinf(value))):
                     writer.add_scalar(f'train/{key}', value, global_step)
+            
+            # Per-module gradient norm logging for Stage 3 debugging
+            if stage == 'full' and batch_idx % 100 == 0:
+                for name, module in model.named_children():
+                    try:
+                        grad_norm_module = sum(
+                            p.grad.data.norm(2).item() ** 2 
+                            for p in module.parameters() 
+                            if p.grad is not None
+                        ) ** 0.5
+                        writer.add_scalar(f'grad_norm/{name}', grad_norm_module, global_step)
+                    except Exception:
+                        pass  # Skip if module has no gradients
     
     # Average losses (accounting for skipped batches)
     valid_batches = num_batches - nan_batch_count
@@ -1265,7 +1306,9 @@ def train_stage(
     optimizer_g = create_optimizer(model, stage, config)
     optimizer_d = None
     
-    if discriminator is not None and stage in ['restoration', 'full']:
+    # DISABLE GAN for Stage 3 (full) - GAN causes mode collapse
+    # Stage 3 uses only pixel + OCR loss for stability
+    if discriminator is not None and stage == 'restoration':  # Changed: removed 'full'
         # TTUR (Two-Timescale Update Rule): Use same LR as G (reduced from 4x)
         # High D LR was causing instability and mode collapse
         base_lr = config.training.lr_restoration if stage == 'restoration' else config.training.lr_finetune
@@ -1291,6 +1334,24 @@ def train_stage(
     # Create early stopping
     early_stopper = EarlyStopping(patience=early_stopping_patience) if early_stopping_patience > 0 else None
     
+    # Stage 3 Anti-Collapse: Load Stage 2 model as anchor
+    model_stage2 = None
+    if stage == 'full':
+        stage2_checkpoint = os.path.join(checkpoint_dir, 'restoration_best.pth')
+        if os.path.exists(stage2_checkpoint):
+            logger.info(f"Stage 3 Anti-Collapse: Loading Stage 2 anchor from {stage2_checkpoint}")
+            # Clone model architecture
+            model_stage2 = deepcopy(model)
+            # Load Stage 2 weights
+            load_checkpoint(model_stage2, stage2_checkpoint)
+            # Freeze and set to eval
+            for param in model_stage2.parameters():
+                param.requires_grad = False
+            model_stage2.eval()
+            model_stage2.to(device)
+        else:
+            logger.warning(f"Stage 3 Warning: Stage 2 checkpoint not found at {stage2_checkpoint}. Anchoring disabled!")
+
     best_acc = 0.0
     consecutive_nan_epochs = 0
     max_consecutive_nan_epochs = 3  # Stop stage if too many consecutive NaN epochs
@@ -1320,7 +1381,8 @@ def train_stage(
             model, discriminator, train_loader, criterion,
             optimizer_g, optimizer_d, device, epoch, stage, writer, logger,
             scaler_g=scaler_g, scaler_d=scaler_d, ema=ema, grad_clip_norm=grad_clip_norm,
-            total_epochs=num_epochs, ocr_discriminator_loss=ocr_discriminator_loss
+            total_epochs=num_epochs, ocr_discriminator_loss=ocr_discriminator_loss,
+            model_stage2=model_stage2, config=config
         )
         
         # Log training losses
