@@ -1532,9 +1532,10 @@ def train_stage(
                         logger.info(f"OCR on Generated HR: {ocr_results}")
                         logger.info(f"OCR on Real HR: {ocr_real_results}")
             
-            # Save best model
-            if plate_acc > best_acc:
-                best_acc = plate_acc
+            # Save best model - use char_accuracy as metric (more reliable than plate_acc
+            # which stays 0 until all 7 chars are correct)
+            if char_acc > best_acc:
+                best_acc = char_acc
                 save_checkpoint(
                     model, discriminator, optimizer_g, optimizer_d,
                     epoch, stage,
@@ -1549,9 +1550,9 @@ def train_stage(
                         os.path.join(checkpoint_dir, f'{stage}_best_ema.pth')
                     )
             
-            # Check early stopping
+            # Check early stopping - use char_accuracy for better gradual improvement tracking
             if early_stopper is not None:
-                if early_stopper(plate_acc):
+                if early_stopper(char_acc):
                     logger.info(f"Early stopping triggered at epoch {epoch}")
                     break
         

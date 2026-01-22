@@ -164,7 +164,7 @@ class TrainingConfig:
     batch_size_stn: int = 32
     batch_size_parseq_warmup: int = 64  # Larger batch for OCR-only training on GT HR
     batch_size_restoration: int = 32  # Increased from 16 to stabilize BatchNorm in Discriminator
-    batch_size_finetune: int = 8
+    batch_size_finetune: int = 32  # Increased from 8 for faster training
     
     # Learning rates
     # Note: STN learning rate further reduced from 5e-5 to 1e-5 to prevent gradient explosion
@@ -185,9 +185,9 @@ class TrainingConfig:
     epochs_finetune: int = 500  # Increased from 100 for better convergence
     
     # Loss weights (for L_total = L_pixel + w1*L_GAN + w2*L_OCR + w3*L_geo)
-    weight_pixel: float = 1.0
+    weight_pixel: float = 0.5  # Reduced to prioritize OCR in Stage 3
     weight_gan: float = 0.05  # Increased from 0.001 - provides meaningful adversarial signal to generator
-    weight_ocr: float = 1.0  # Increased from 0.5 - OCR is the main objective
+    weight_ocr: float = 5.0  # Increased significantly - force character correctness
     weight_geometry: float = 0.1
     
     # LCOFL Loss (from Nascimento et al. "Enhancing LP Super-Resolution" paper)
@@ -209,7 +209,7 @@ class TrainingConfig:
     # OCR-as-Discriminator (from LCOFL paper)
     # Replaces binary discriminator with OCR-based guidance for more stable training
     use_ocr_discriminator: bool = True  # Enabled: Uses OCR confidence as discriminator (more stable than binary GAN)
-    weight_ocr_guidance: float = 1.0  # Weight for OCR guidance loss
+    weight_ocr_guidance: float = 3.0  # Increased for stronger OCR discriminator signal
     freeze_ocr_discriminator: bool = True  # Keep OCR frozen during training
     ocr_confidence_mode: str = 'mean'  # 'mean', 'min', or 'product'
     
