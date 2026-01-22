@@ -1226,7 +1226,8 @@ def train_stage(
     start_epoch: int = 0,
     use_amp: bool = True,
     use_ema: bool = True,
-    early_stopping_patience: int = 0
+    early_stopping_patience: int = 0,
+    stage2_anchor_path: Optional[str] = None
 ):
     """
     Train for a specific stage with full feature support.
@@ -1337,7 +1338,9 @@ def train_stage(
     # Stage 3 Anti-Collapse: Load Stage 2 model as anchor
     model_stage2 = None
     if stage == 'full':
-        stage2_checkpoint = os.path.join(checkpoint_dir, 'restoration_best.pth')
+        # Use provided anchor path or fallback to default
+        stage2_checkpoint = stage2_anchor_path if stage2_anchor_path else os.path.join(checkpoint_dir, 'restoration_best.pth')
+        
         if os.path.exists(stage2_checkpoint):
             logger.info(f"Stage 3 Anti-Collapse: Loading Stage 2 anchor from {stage2_checkpoint}")
             # Clone model architecture
