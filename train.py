@@ -1716,6 +1716,8 @@ def main():
                         help='Test split ratio when using single data folder (default: 0.1)')
     parser.add_argument('--reset-epoch', action='store_true',
                         help='Reset epoch to 0 when resuming (use when loading weights from different stage)')
+    parser.add_argument('--stage2-anchor', type=str, default=None, 
+                        help='Path to Stage 2 checkpoint for anchoring (Stage 3 anti-collapse)')
     args = parser.parse_args()
     
     # Load config
