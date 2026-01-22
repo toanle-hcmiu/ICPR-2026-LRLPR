@@ -1946,7 +1946,9 @@ def main():
             model.freeze_recognizer()
         else:  # full
             model.unfreeze_stn()
-            model.unfreeze_recognizer()
+            # KEEP RECOGNIZER FROZEN to prevent collapse
+            # PARSeq adapting to blurry outputs creates feedback loop
+            model.freeze_recognizer()
         
         # Get appropriate batch size for this stage
         batch_size_map = {
