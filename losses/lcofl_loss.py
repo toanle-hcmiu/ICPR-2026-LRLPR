@@ -525,7 +525,7 @@ class LCOFLLoss(nn.Module):
         # 1. Classification Loss (LC) with dynamic weights
         # Reshape for cross-entropy: (B*L, V) and (B*L,)
         logits_flat = logits.view(-1, V)
-        targets_flat = targets.view(-1)
+        targets_flat = targets.reshape(-1)
         
         # Compute per-element cross-entropy
         ce_per_element = self.ce_loss(logits_flat, targets_flat)  # (B*L,)
