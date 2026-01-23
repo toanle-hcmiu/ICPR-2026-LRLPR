@@ -1363,6 +1363,19 @@ def train_stage(
             generator_loss_type='combined',
             lambda_conf=config.training.weight_ocr_guidance
         )
+        
+        # Stage 3 FIX: The OCR discriminator above freezes the recognizer when
+        # freeze_ocr=True, but Stage 3 requires the recognizer to be trainable
+        # for end-to-end fine-tuning. We unfreeze it here AFTER creating the
+        # discriminator so the discriminator still uses the frozen reference
+        # for stable discrimination, but gradients can flow through for training.
+        if stage == 'full':
+            logger.info("Stage 3: Re-unfreezing recognizer after OCR discriminator creation")
+            model.unfreeze_recognizer()
+            for param in model.recognizer.parameters():
+                param.requires_grad = True
+            recognizer_param_count = sum(1 for _ in model.recognizer.parameters())
+            logger.info(f"  Set requires_grad=True on {recognizer_param_count} recognizer parameters")
     
     # Create optimizers
     optimizer_g = create_optimizer(model, stage, config)
