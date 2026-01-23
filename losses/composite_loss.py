@@ -573,9 +573,15 @@ class CompositeLoss(nn.Module):
                 # Get layout info for LCOFL
                 is_mercosul = targets.get('layout', torch.zeros(outputs['masked_logits'].size(0), device=outputs['masked_logits'].device))
                 
+                # Strip BOS/EOS from targets to match masked_logits shape
+                # text_indices: (B, PLATE_LENGTH+2) with [BOS, char1, ..., char7, EOS]
+                # masked_logits: (B, PLATE_LENGTH, V)
+                plate_length = outputs['masked_logits'].size(1)
+                lcofl_targets = targets['text_indices'][:, 1:plate_length+1]  # (B, PLATE_LENGTH)
+                
                 l_lcofl, lcofl_dict = self.lcofl_loss(
                     logits=outputs['masked_logits'],
-                    targets=targets['text_indices'],
+                    targets=lcofl_targets,
                     is_mercosul=is_mercosul,
                     generated_hr=outputs.get('hr_image'),
                     gt_hr=targets.get('hr_image'),

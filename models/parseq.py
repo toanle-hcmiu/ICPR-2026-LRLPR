@@ -91,12 +91,17 @@ class PretrainedPARSeq(nn.Module):
         
         try:
             # Load from torch.hub
-            self._model = torch.hub.load(
+            hub_model = torch.hub.load(
                 'baudm/parseq', 
                 self.model_name,
                 pretrained=self._pretrained,
                 trust_repo=True
             )
+            
+            # Register as proper submodule so requires_grad changes propagate
+            # Using add_module ensures it's tracked by PyTorch
+            self.add_module('_hub_model', hub_model)
+            self._model = self._hub_model  # Keep reference for compatibility
             
             # Freeze backbone if requested
             if self._freeze_backbone:
@@ -124,13 +129,16 @@ class PretrainedPARSeq(nn.Module):
                 f"Failed to load pretrained PARSeq: {e}. "
                 f"Using custom implementation instead."
             )
-            # Create fallback custom implementation
-            self._fallback_model = PARSeqRecognizer(
+            # Create fallback custom implementation and register as submodule
+            fallback = PARSeqRecognizer(
                 img_size=self._img_size,
                 embed_dim=384,
                 num_heads=6,
                 encoder_depth=12
             )
+            self.add_module('_fallback_submodule', fallback)
+            self._fallback_model = self._fallback_submodule  # Keep reference
+            
             # Move to device
             if device is not None:
                 self._fallback_model = self._fallback_model.to(device)
