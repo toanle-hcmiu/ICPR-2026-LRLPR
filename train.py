@@ -2067,6 +2067,12 @@ def main():
             if os.path.exists(potential_path):
                 stage2_anchor_path = potential_path
                 logger.info(f"Auto-inferred Stage 2 anchor path: {stage2_anchor_path}")
+            else:
+                # Fallback: Use the resume checkpoint itself as anchor
+                # This handles cases where we start training from a specific checkpoint
+                # and want to anchor to it (e.g., when restoration_best doesn't exist)
+                stage2_anchor_path = args.resume
+                logger.info(f"Using resume checkpoint as Stage 2 anchor: {stage2_anchor_path}")
         
         best_acc = train_stage(
             model, discriminator, train_loader, val_loader,
