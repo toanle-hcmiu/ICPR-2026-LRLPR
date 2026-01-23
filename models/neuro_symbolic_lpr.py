@@ -468,14 +468,16 @@ class NeuroSymbolicLPR(nn.Module):
                 {'params': self.recognizer.parameters(), 'lr_scale': 0.5},  # Joint OCR training
             ]
         elif stage == 'full':
+            # Stage 3: End-to-end fine-tuning with lower LR for pretrained components
+            # lr_scale=0.1 means PARSeq uses lr_finetune*0.1 = lr_parseq_finetune
             return [
-                {'params': self.encoder.parameters(), 'lr_scale': 0.1},
-                {'params': self.stn.parameters(), 'lr_scale': 0.1},
-                {'params': self.layout_classifier.parameters()},
-                {'params': self.quality_fusion.parameters()},
-                {'params': self.feature_to_image.parameters()},
-                {'params': self.generator.parameters()},
-                {'params': self.recognizer.parameters(), 'lr_scale': 0.1}
+                {'params': self.encoder.parameters(), 'lr_scale': 0.1, 'name': 'encoder'},
+                {'params': self.stn.parameters(), 'lr_scale': 0.1, 'name': 'stn'},
+                {'params': self.layout_classifier.parameters(), 'name': 'layout'},
+                {'params': self.quality_fusion.parameters(), 'name': 'fusion'},
+                {'params': self.feature_to_image.parameters(), 'name': 'feat_to_img'},
+                {'params': self.generator.parameters(), 'name': 'generator'},
+                {'params': self.recognizer.parameters(), 'lr_scale': 0.1, 'name': 'recognizer'}
             ]
         else:
             raise ValueError(f"Unknown training stage: {stage}")

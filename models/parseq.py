@@ -45,7 +45,8 @@ class PretrainedPARSeq(nn.Module):
         model_name: str = 'parseq',  # Options: 'parseq', 'parseq_tiny'
         freeze_backbone: bool = False,
         output_raw_logits: bool = True,
-        img_size: tuple = (64, 192)  # For fallback custom implementation
+        img_size: tuple = (64, 192),  # For fallback custom implementation
+        keep_eval_mode: bool = True   # Keep hub model in eval mode (dropout off) during training
     ):
         """
         Initialize pretrained PARSeq wrapper.
@@ -56,6 +57,10 @@ class PretrainedPARSeq(nn.Module):
             freeze_backbone: Whether to freeze the backbone encoder.
             output_raw_logits: Whether to output raw logits for syntax masking.
             img_size: Image size for fallback custom implementation.
+            keep_eval_mode: If True (default), the pretrained hub model stays in eval mode
+                           even during training. This disables dropout for stable gradients
+                           while still allowing weight updates via requires_grad=True.
+                           Set to False to enable dropout during fine-tuning.
         """
         super().__init__()
         
@@ -65,6 +70,7 @@ class PretrainedPARSeq(nn.Module):
         self._fallback_model = None  # Custom implementation fallback
         self._charset_adapter = None
         self._img_size = img_size
+        self._keep_eval_mode = keep_eval_mode  # Control dropout behavior during training
         
         # Lazy loading to avoid import errors if torch.hub fails
         self._pretrained = pretrained
@@ -290,12 +296,26 @@ class PretrainedPARSeq(nn.Module):
             return iter([])  # Empty iterator
     
     def train(self, mode: bool = True):
-        """Set training mode."""
+        """
+        Set training mode.
+        
+        When keep_eval_mode=True (default), the pretrained hub model stays in
+        eval mode even during training. This disables dropout for stable OCR
+        gradients in GAN/SR training, while still allowing weight updates
+        (requires_grad=True does not depend on train/eval mode).
+        
+        The fallback custom model always follows the requested mode.
+        """
         super().train(mode)
         if self._use_fallback and self._fallback_model is not None:
             self._fallback_model.train(mode)
         elif self._model is not None:
-            self._model.train(mode)
+            if self._keep_eval_mode:
+                # Keep hub model in eval mode (dropout off) for stable gradients
+                # Gradients still flow because requires_grad is independent of train/eval
+                self._model.eval()
+            else:
+                self._model.train(mode)
         return self
     
     def eval(self):

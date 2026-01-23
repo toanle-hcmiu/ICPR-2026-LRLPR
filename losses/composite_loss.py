@@ -999,6 +999,7 @@ class CompositeLoss(nn.Module):
                         # relu(ocr_current - ocr_baseline) -> 0 if better, positive if worse
                         l_ocr = F.relu(l_ocr_raw - ocr_baseline)
                         loss_dict['ocr_hinge'] = self._safe_loss_item(l_ocr)
+                        loss_dict['ocr_baseline'] = ocr_baseline  # Log Stage-2 baseline for diagnostics
                     else:
                         # Standard OCR loss (scaled by warmup weight)
                         l_ocr = l_ocr_raw

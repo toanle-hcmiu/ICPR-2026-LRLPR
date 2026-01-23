@@ -192,7 +192,8 @@ class TrainingConfig:
     
     # LCOFL Loss (from Nascimento et al. "Enhancing LP Super-Resolution" paper)
     # Set use_lcofl=True to enable Layout and Character Oriented Focal Loss
-    use_lcofl: bool = False  # Enable LCOFL loss
+    # LCOFL helps prevent character collapse by penalizing confused character pairs
+    use_lcofl: bool = True   # Enable LCOFL loss to prevent character collapse
     weight_lcofl: float = 0.5  # Weight for LCOFL loss
     weight_ssim: float = 0.3  # Weight for SSIM structural similarity loss
     lcofl_alpha: float = 1.0  # Penalty increment for confused character pairs
@@ -200,7 +201,8 @@ class TrainingConfig:
     
     # Total Variation Loss for suppressing wavy/checkerboard artifacts
     # Recommended: 1e-5 to 1e-4 for subtle smoothing without blur
-    weight_tv: float = 2e-4  # Increased to 2e-4 to suppress strong wavy artifacts in Stage 3
+    # Note: High TV causes oversmoothing and "round" characters - keep low
+    weight_tv: float = 1e-5  # Reduced from 2e-4 to prevent character smoothing
     
     # Shared Attention and Deformable Convolutions (from same paper)
     use_shared_attention: bool = True  # Enable shared attention module
@@ -217,10 +219,11 @@ class TrainingConfig:
     # These prevent OCR gradients from dominating and causing visual quality degradation
     # Problem: Stage 2 output is already good, Stage 3 over-optimizes for OCR confidence
     # Solution: Anchor to Stage 2 + delay OCR influence + use hinge constraint
+    # Note: PARSeq is now trainable in Stage 3, with dropout disabled for stable gradients
     stage3_sr_anchor_weight: float = 1.0      # Weight for SR anchoring to Stage 2 output
-    stage3_ocr_warmup_steps: int = 3000       # Steps before OCR loss starts ramping
-    stage3_ocr_ramp_steps: int = 3000         # Steps to ramp OCR from 0 to max weight
-    stage3_ocr_max_weight: float = 0.1        # Max OCR weight (much lower than default 0.5)
+    stage3_ocr_warmup_steps: int = 6000       # Steps before OCR loss starts ramping (increased for stability)
+    stage3_ocr_ramp_steps: int = 6000         # Steps to ramp OCR from 0 to max weight (slower ramp)
+    stage3_ocr_max_weight: float = 0.3        # Max OCR weight after warmup (conservative to prevent collapse)
     stage3_use_ocr_hinge: bool = True         # Use hinge constraint (only penalize if worse than Stage 2)
     
     # Optimizer

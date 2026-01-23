@@ -308,6 +308,7 @@ def create_optimizer(
     for group in param_groups:
         lr_scale = group.pop('lr_scale', 1.0)
         group['lr'] = base_lr * lr_scale
+        # Keep 'name' for logging (AdamW ignores unknown keys in param groups)
     
     if config.training.optimizer == 'adamw':
         optimizer = optim.AdamW(
@@ -564,9 +565,15 @@ def train_epoch(
                             out_stage2 = model_stage2(lr_frames)
                             sr_stage2 = out_stage2['hr_image'].detach()
                             
-                            # Optional: Compute OCR baseline from Stage 2 model
-                            # If Stage 2 model yielded masked_logits, we could compute its loss
-                            # For now, we rely on SR anchoring which is the most critical part
+                            # Compute OCR baseline from Stage 2 model for hinge constraint
+                            # This ensures Stage 3 OCR loss only activates when SR makes OCR worse
+                            if 'masked_logits' in out_stage2:
+                                stage2_logits = out_stage2['masked_logits'].detach()
+                                # Compute OCR loss on Stage-2 SR output as baseline
+                                ocr_baseline = criterion.ocr_loss(
+                                    stage2_logits, 
+                                    targets['text_indices']
+                                ).detach().item()  # Scalar baseline
                 
                 loss_g, loss_dict = criterion.get_stage3_loss(
                     outputs, targets, current_discriminator,
@@ -953,6 +960,13 @@ def validate(
     total_chars = 0
     valid_layout_samples = 0  # Count samples with valid layout labels
     
+    # Stage 3 SR-vs-GT OCR diagnostics: track OCR accuracy on GT HR for comparison
+    # This helps detect SR distribution shift vs PARSeq degradation
+    correct_chars_gt_hr = 0  # OCR accuracy on ground truth HR images
+    correct_plates_gt_hr = 0
+    total_chars_gt_hr = 0
+    total_plates_gt_hr = 0
+    
     # Confusion matrix tracking for LCOFL weight updates
     # Check if criterion has LCOFL loss with confusion tracker
     has_lcofl = hasattr(criterion, 'lcofl_loss') and criterion.lcofl_loss is not None
@@ -1044,6 +1058,33 @@ def validate(
             # Update confusion matrix for LCOFL (tracks confused character pairs)
             if has_lcofl:
                 criterion.lcofl_loss.update_confusion_matrix(predictions, target_chars)
+            
+            # Stage 3 diagnostic: OCR accuracy on GT HR images
+            # This distinguishes "PARSeq degraded" from "SR distribution shift"
+            if stage == 'full' and 'hr_image' in targets:
+                # Run recognizer on ground truth HR (not generated SR)
+                gt_hr = targets['hr_image']
+                gt_logits = model.recognizer.forward_parallel(gt_hr)
+                
+                # Apply syntax mask
+                if 'layout_logits' in outputs:
+                    is_mercosul_gt = torch.sigmoid(outputs['layout_logits']).squeeze(-1)
+                else:
+                    is_mercosul_gt = torch.zeros(gt_hr.size(0), device=gt_hr.device)
+                gt_masked_logits = model.syntax_mask(gt_logits, is_mercosul_gt, training=False)
+                gt_predictions = gt_masked_logits.argmax(dim=-1)
+                
+                # Compute GT HR accuracy
+                for i in range(batch_size):
+                    sample_mask = char_mask[i]
+                    if sample_mask.any():
+                        gt_correct = (gt_predictions[i][sample_mask] == target_chars[i][sample_mask]).all().item()
+                        correct_plates_gt_hr += int(gt_correct)
+                        total_plates_gt_hr += 1
+                
+                if char_mask.any():
+                    correct_chars_gt_hr += (gt_predictions[char_mask] == target_chars[char_mask]).sum().item()
+                    total_chars_gt_hr += char_mask.sum().item()
     
     # Average losses
     num_batches = len(dataloader)
@@ -1056,6 +1097,13 @@ def validate(
         'char_accuracy': correct_chars / total_chars if total_chars > 0 else 0.0,
         'layout_accuracy': correct_layout / valid_layout_samples if valid_layout_samples > 0 else 0.0,
     }
+    
+    # Stage 3 diagnostic: add GT HR OCR metrics for SR distribution shift detection
+    if total_chars_gt_hr > 0:
+        metrics['char_accuracy_gt_hr'] = correct_chars_gt_hr / total_chars_gt_hr
+        metrics['plate_accuracy_gt_hr'] = correct_plates_gt_hr / total_plates_gt_hr if total_plates_gt_hr > 0 else 0.0
+        # SR distribution shift = GT HR good but SR bad
+        metrics['sr_distribution_gap'] = metrics['char_accuracy_gt_hr'] - metrics['char_accuracy']
     
     # Finalize LCOFL confusion matrix weights for next epoch
     # and add confused pairs to metrics for logging
@@ -1305,6 +1353,14 @@ def train_stage(
     
     # Create optimizers
     optimizer_g = create_optimizer(model, stage, config)
+    
+    # Log optimizer param groups for debugging (especially Stage 3 recognizer LR)
+    logger.info(f"Optimizer param groups for stage '{stage}':")
+    for i, group in enumerate(optimizer_g.param_groups):
+        group_name = group.get('name', f'group_{i}')
+        num_params = sum(p.numel() for p in group['params'])
+        logger.info(f"  {group_name}: lr={group['lr']:.2e}, params={num_params:,}")
+    
     optimizer_d = None
     
     # DISABLE GAN for Stage 3 (full) - GAN causes mode collapse
@@ -1432,6 +1488,27 @@ def train_stage(
             writer.add_scalar('val/layout_accuracy', layout_acc, epoch)
             for key, value in val_losses.items():
                 writer.add_scalar(f'val/{key}', value, epoch)
+            
+            # Stage 3 diagnostic: Log GT HR OCR metrics and SR distribution gap
+            if 'char_accuracy_gt_hr' in val_metrics:
+                gt_hr_char_acc = val_metrics['char_accuracy_gt_hr']
+                gt_hr_plate_acc = val_metrics['plate_accuracy_gt_hr']
+                sr_gap = val_metrics['sr_distribution_gap']
+                writer.add_scalar('val/char_accuracy_gt_hr', gt_hr_char_acc, epoch)
+                writer.add_scalar('val/plate_accuracy_gt_hr', gt_hr_plate_acc, epoch)
+                writer.add_scalar('val/sr_distribution_gap', sr_gap, epoch)
+                logger.info(
+                    f"  GT HR OCR: Char={gt_hr_char_acc:.4f}, Plate={gt_hr_plate_acc:.4f}, "
+                    f"SR Gap={sr_gap:+.4f} (positive = SR worse than GT)"
+                )
+            
+            # Log confused character pairs from LCOFL (helps diagnose character collapse)
+            if 'confused_pairs' in val_metrics:
+                pairs = val_metrics['confused_pairs']
+                pairs_str = ', '.join([f"{p[0]}->{p[1]}({p[2]:.2f})" for p in pairs])
+                logger.info(f"  Most confused chars: {pairs_str}")
+                # Log as text to TensorBoard
+                writer.add_text('val/confused_pairs', pairs_str, epoch)
             
             # ============================================
             # Visualize Super-Resolution Samples
@@ -2013,9 +2090,10 @@ def main():
             model.freeze_recognizer()
         else:  # full
             model.unfreeze_stn()
-            # KEEP RECOGNIZER FROZEN to prevent collapse
-            # PARSeq adapting to blurry outputs creates feedback loop
-            model.freeze_recognizer()
+            # Stage 3: Train recognizer end-to-end with SR
+            # PARSeq stays in eval mode (dropout off) to stabilize gradients
+            # while still allowing weight updates via requires_grad=True
+            model.unfreeze_recognizer()
         
         # Get appropriate batch size for this stage
         batch_size_map = {
