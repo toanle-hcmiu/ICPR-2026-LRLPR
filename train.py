@@ -1388,11 +1388,26 @@ def train_stage(
             logger.info(f"  LCOFL weight: {config.training.weight_lcofl}")
         
         # Verify recognizer is unfrozen
-        recognizer_trainable = sum(1 for p in model.recognizer.parameters() if p.requires_grad)
-        recognizer_total = sum(1 for p in model.recognizer.parameters())
-        logger.info(f"  Recognizer trainable: {recognizer_trainable}/{recognizer_total} params")
-        if recognizer_trainable == 0:
+        # Ensure recognizer model is loaded (for lazy-loaded models)
+        if hasattr(model.recognizer, '_load_model'):
+            model.recognizer._load_model()
+        
+        # Convert to list to avoid iterator consumption issues
+        recognizer_params_list = list(model.recognizer.parameters())
+        recognizer_trainable = sum(1 for p in recognizer_params_list if p.requires_grad)
+        recognizer_total = len(recognizer_params_list)
+        recognizer_total_params = sum(p.numel() for p in recognizer_params_list)
+        recognizer_trainable_params = sum(p.numel() for p in recognizer_params_list if p.requires_grad)
+        
+        logger.info(f"  Recognizer trainable: {recognizer_trainable}/{recognizer_total} param groups")
+        logger.info(f"  Recognizer trainable: {recognizer_trainable_params:,}/{recognizer_total_params:,} total params")
+        if recognizer_trainable == 0 or recognizer_trainable_params == 0:
             logger.warning("  WARNING: Recognizer is frozen! This may cause OCR collapse.")
+            # Try to unfreeze again as a safety measure
+            model.unfreeze_recognizer()
+            for param in model.recognizer.parameters():
+                param.requires_grad = True
+            logger.info("  Attempted to unfreeze recognizer again.")
     
     optimizer_d = None
     
@@ -2147,6 +2162,13 @@ def main():
             # PARSeq stays in eval mode (dropout off) to stabilize gradients
             # while still allowing weight updates via requires_grad=True
             model.unfreeze_recognizer()
+            
+            # Force recognizer to be trainable (checkpoint may have restored frozen state)
+            # Ensure all recognizer parameters have requires_grad=True
+            recognizer_params = list(model.recognizer.parameters())
+            for param in recognizer_params:
+                param.requires_grad = True
+            logger.info(f"  Explicitly set requires_grad=True on {len(recognizer_params)} recognizer parameters")
         
         # Get appropriate batch size for this stage
         batch_size_map = {
