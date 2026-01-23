@@ -906,6 +906,19 @@ def train_epoch(
                         writer.add_scalar(f'grad_norm/{name}', grad_norm_module, global_step)
                     except Exception:
                         pass  # Skip if module has no gradients
+                
+                # Log learning rates per param group
+                for i, group in enumerate(optimizer_g.param_groups):
+                    group_name = group.get('name', f'group_{i}')
+                    writer.add_scalar(f'lr/{group_name}', group['lr'], global_step)
+                
+                # Log recognizer trainability status (should be True in Stage 3)
+                recognizer_trainable = any(p.requires_grad for p in model.recognizer.parameters())
+                writer.add_scalar('debug/recognizer_requires_grad', float(recognizer_trainable), global_step)
+                
+                # Log OCR curriculum weight if present in loss_dict
+                if 'ocr_weight' in loss_dict:
+                    writer.add_scalar('train/ocr_curriculum_weight', loss_dict['ocr_weight'], global_step)
     
     # Average losses (accounting for skipped batches)
     valid_batches = num_batches - nan_batch_count
@@ -1361,6 +1374,26 @@ def train_stage(
         num_params = sum(p.numel() for p in group['params'])
         logger.info(f"  {group_name}: lr={group['lr']:.2e}, params={num_params:,}")
     
+    # Stage 3: Log key hyperparameters for diagnosing OCR collapse
+    if stage == 'full':
+        logger.info("Stage 3 Key Hyperparameters:")
+        logger.info(f"  OCR warmup steps: {config.training.stage3_ocr_warmup_steps}")
+        logger.info(f"  OCR ramp steps: {config.training.stage3_ocr_ramp_steps}")
+        logger.info(f"  OCR max weight: {config.training.stage3_ocr_max_weight}")
+        logger.info(f"  OCR hinge enabled: {config.training.stage3_use_ocr_hinge}")
+        logger.info(f"  SR anchor weight: {config.training.stage3_sr_anchor_weight}")
+        logger.info(f"  TV weight: {config.training.weight_tv}")
+        logger.info(f"  LCOFL enabled: {config.training.use_lcofl}")
+        if config.training.use_lcofl:
+            logger.info(f"  LCOFL weight: {config.training.weight_lcofl}")
+        
+        # Verify recognizer is unfrozen
+        recognizer_trainable = sum(1 for p in model.recognizer.parameters() if p.requires_grad)
+        recognizer_total = sum(1 for p in model.recognizer.parameters())
+        logger.info(f"  Recognizer trainable: {recognizer_trainable}/{recognizer_total} params")
+        if recognizer_trainable == 0:
+            logger.warning("  WARNING: Recognizer is frozen! This may cause OCR collapse.")
+    
     optimizer_d = None
     
     # DISABLE GAN for Stage 3 (full) - GAN causes mode collapse
@@ -1489,6 +1522,19 @@ def train_stage(
             for key, value in val_losses.items():
                 writer.add_scalar(f'val/{key}', value, epoch)
             
+            # Log epoch-level learning rates
+            for i, group in enumerate(optimizer_g.param_groups):
+                group_name = group.get('name', f'group_{i}')
+                writer.add_scalar(f'lr_epoch/{group_name}', group['lr'], epoch)
+            
+            # Stage 3: Log key training diagnostics
+            if stage == 'full':
+                # Recognizer trainability
+                recognizer_trainable = sum(1 for p in model.recognizer.parameters() if p.requires_grad)
+                recognizer_total = sum(1 for p in model.recognizer.parameters())
+                writer.add_scalar('debug/recognizer_trainable_params', recognizer_trainable, epoch)
+                logger.info(f"  Recognizer: {recognizer_trainable}/{recognizer_total} params trainable")
+            
             # Stage 3 diagnostic: Log GT HR OCR metrics and SR distribution gap
             if 'char_accuracy_gt_hr' in val_metrics:
                 gt_hr_char_acc = val_metrics['char_accuracy_gt_hr']
@@ -1509,6 +1555,13 @@ def train_stage(
                 logger.info(f"  Most confused chars: {pairs_str}")
                 # Log as text to TensorBoard
                 writer.add_text('val/confused_pairs', pairs_str, epoch)
+            
+            # Log LCOFL confusion matrix heatmap (every 5 epochs to save space)
+            if hasattr(criterion, 'lcofl_loss') and criterion.lcofl_loss is not None:
+                if epoch % 5 == 0 or epoch == 0:
+                    confusion_img = criterion.lcofl_loss.get_confusion_matrix_image()
+                    if confusion_img is not None:
+                        writer.add_image('val/confusion_matrix', confusion_img, epoch)
             
             # ============================================
             # Visualize Super-Resolution Samples

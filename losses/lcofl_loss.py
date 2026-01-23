@@ -257,6 +257,70 @@ class ConfusionMatrixTracker:
     def get_weight_tensor(self, device: torch.device) -> torch.Tensor:
         """Get character weights as a tensor."""
         return torch.from_numpy(self.char_weights).to(device)
+    
+    def get_confusion_matrix_image(self) -> Optional[torch.Tensor]:
+        """
+        Generate a confusion matrix heatmap image for TensorBoard visualization.
+        
+        Returns:
+            Tensor of shape (3, H, W) suitable for TensorBoard add_image, or None if empty.
+        """
+        import matplotlib
+        matplotlib.use('Agg')  # Non-interactive backend
+        import matplotlib.pyplot as plt
+        
+        # Check if we have any data
+        if self.confusion_matrix.sum() == 0:
+            return None
+        
+        # Normalize each row to show confusion rates (not counts)
+        row_sums = self.confusion_matrix.sum(axis=1, keepdims=True)
+        row_sums[row_sums == 0] = 1  # Avoid division by zero
+        normalized = self.confusion_matrix / row_sums
+        
+        # Create figure
+        fig, ax = plt.subplots(figsize=(12, 10))
+        
+        # Plot heatmap
+        im = ax.imshow(normalized, cmap='Blues', vmin=0, vmax=1)
+        
+        # Add colorbar
+        cbar = ax.figure.colorbar(im, ax=ax)
+        cbar.ax.set_ylabel('Confusion Rate', rotation=-90, va="bottom")
+        
+        # Set ticks and labels
+        ax.set_xticks(np.arange(self.charset_size))
+        ax.set_yticks(np.arange(self.charset_size))
+        ax.set_xticklabels(list(CHARSET), fontsize=8)
+        ax.set_yticklabels(list(CHARSET), fontsize=8)
+        
+        # Rotate x labels
+        plt.setp(ax.get_xticklabels(), rotation=45, ha="right", rotation_mode="anchor")
+        
+        # Labels
+        ax.set_xlabel('Predicted')
+        ax.set_ylabel('Ground Truth')
+        ax.set_title('Character Confusion Matrix (Row-Normalized)')
+        
+        # Highlight off-diagonal confusions > 5%
+        for i in range(self.charset_size):
+            for j in range(self.charset_size):
+                if i != j and normalized[i, j] > 0.05:
+                    text = ax.text(j, i, f'{normalized[i, j]:.0%}',
+                                   ha="center", va="center", color="red", fontsize=6)
+        
+        fig.tight_layout()
+        
+        # Convert to tensor
+        fig.canvas.draw()
+        img_array = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+        img_array = img_array.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+        
+        plt.close(fig)
+        
+        # Convert to CHW format for TensorBoard (0-1 range)
+        img_tensor = torch.from_numpy(img_array).permute(2, 0, 1).float() / 255.0
+        return img_tensor
 
 
 class LayoutPenalty(nn.Module):
@@ -420,6 +484,10 @@ class LCOFLLoss(nn.Module):
     def get_confused_pairs(self, threshold: float = 0.1) -> List[Tuple[str, str, float]]:
         """Get frequently confused character pairs for logging."""
         return self.confusion_tracker.get_confused_pairs(threshold)
+    
+    def get_confusion_matrix_image(self) -> Optional[torch.Tensor]:
+        """Get confusion matrix heatmap for TensorBoard visualization."""
+        return self.confusion_tracker.get_confusion_matrix_image()
     
     def forward(
         self,
