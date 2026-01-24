@@ -721,7 +721,10 @@ def train_epoch(
             else:
                 # Skip D update based on frequency control and warm-up
                 # Delay D training for first few epochs to let G produce reasonable outputs
-                should_update_d = (epoch >= d_warmup_epochs) and (batch_idx % d_update_freq == 0)
+                # Also skip during PSNR-only phase (first 5 epochs of Stage 3 when GAN is disabled)
+                psnr_only_epochs = 5  # Must match curriculum setting in train_stage
+                effective_warmup = max(d_warmup_epochs, psnr_only_epochs) if stage == 'full' else d_warmup_epochs
+                should_update_d = (epoch >= effective_warmup) and (batch_idx % d_update_freq == 0)
                 
                 # Apply D learning rate warmup after warm-up epochs
                 if epoch >= d_warmup_epochs and optimizer_d is not None:
@@ -1348,7 +1351,7 @@ def train_stage(
         weight_gan=config.training.weight_gan,
         weight_ocr=config.training.weight_ocr,
         weight_geometry=config.training.weight_geometry,
-        weight_perceptual=0.1,  # VGG feature matching weight
+        weight_perceptual=config.training.weight_perceptual,  # VGG feature matching (Real-ESRGAN: 1.0)
         weight_lcofl=config.training.weight_lcofl if config.training.use_lcofl else 0.0,
         weight_ssim=config.training.weight_ssim if config.training.use_lcofl else 0.0,
         weight_tv=config.training.weight_tv,  # Total Variation for wavy artifact suppression
@@ -1493,32 +1496,63 @@ def train_stage(
     max_consecutive_nan_epochs = 3  # Stop stage if too many consecutive NaN epochs
     
     for epoch in range(start_epoch, num_epochs):
-        # Curriculum learning for Stage 3: gradually increase OCR weight
-        # CRITICAL: Start at 0 and delay OCR to let generator stabilize with pixel loss first
-        # Otherwise OCR gradients cause mode collapse (characters fade to minimize OCR confusion)
+        # =====================================================================
+        # Stage 3 Curriculum Learning - 3 Phase Approach (Based on Real-ESRGAN)
+        # =====================================================================
+        # Phase 1 (epochs 0-4): PSNR-only warmup
+        #   - Pixel + Perceptual + SSIM + TV + Layout penalty ONLY
+        #   - NO GAN, NO OCR, NO LCOFL classification
+        #   - Generator learns stable reconstruction before adversarial training
+        #
+        # Phase 2 (epochs 5-19): GAN + Classification ramp-up
+        #   - Enable GAN loss (allows generator to produce sharper outputs)
+        #   - Ramp LCOFL classification from 0 to 1.0 (gradual OCR learning)
+        #   - SSIM/Layout stay active for stability
+        #
+        # Phase 3 (epochs 20+): Full training
+        #   - All losses at full weight
+        # =====================================================================
+        
         if stage == 'full' and hasattr(criterion, 'weights'):
-            # OCR curriculum: 0 for first N epochs (dead zone), then ramp to target
-            ocr_dead_epochs = 5        # No OCR for first 5 epochs - generator must learn colors/shapes first
-            ocr_ramp_epochs = 15       # Ramp from 0 to target over next 15 epochs
-            target_ocr_weight = 0.3    # Reduced target - OCR is secondary to visual quality
+            # Phase boundaries
+            psnr_only_epochs = 5       # Phase 1: PSNR-only (no adversarial)
+            classification_ramp_epochs = 15  # Phase 2: ramp classification
             
-            if epoch < ocr_dead_epochs:
-                # Dead zone: no OCR loss at all
-                current_ocr_weight = 0.0
-            elif epoch < ocr_dead_epochs + ocr_ramp_epochs:
-                # Ramp zone: linear ramp from 0 to target
-                progress = (epoch - ocr_dead_epochs) / ocr_ramp_epochs
-                current_ocr_weight = target_ocr_weight * progress
+            # OCR is permanently disabled (replaced by LCOFL)
+            criterion.weights['ocr'] = 0.0
+            
+            if epoch < psnr_only_epochs:
+                # ============ PHASE 1: PSNR-Only Warmup ============
+                # Disable GAN and all character-oriented losses
+                # This lets generator learn stable reconstruction first
+                criterion.weights['gan'] = 0.0
+                lcofl_classification_weight = 0.0
+                phase_name = "PSNR-only"
+                
+            elif epoch < psnr_only_epochs + classification_ramp_epochs:
+                # ============ PHASE 2: GAN + Classification Ramp ============
+                # Enable GAN loss for sharper outputs
+                criterion.weights['gan'] = config.training.weight_gan  # 0.1
+                
+                # Ramp LCOFL classification from 0 to 1.0
+                progress = (epoch - psnr_only_epochs) / classification_ramp_epochs
+                lcofl_classification_weight = 1.0 * progress
+                phase_name = f"Ramp (GAN on, class={lcofl_classification_weight:.2f})"
+                
             else:
-                # Stable zone: full OCR weight
-                current_ocr_weight = target_ocr_weight
+                # ============ PHASE 3: Full Training ============
+                criterion.weights['gan'] = config.training.weight_gan  # 0.1
+                lcofl_classification_weight = 1.0
+                phase_name = "Full"
             
-            criterion.weights['ocr'] = current_ocr_weight
-            # DEBUG: Verify the weight was set correctly
-            assert criterion.weights['ocr'] == current_ocr_weight, \
-                f"Curriculum weight not persisted: expected {current_ocr_weight}, got {criterion.weights['ocr']}"
-            if epoch % 5 == 0 or epoch < 3:  # Log frequently early on
-                logger.info(f"Curriculum: OCR weight = {current_ocr_weight:.3f} (epoch {epoch}, dead_epochs={ocr_dead_epochs})")
+            # Apply LCOFL classification weight
+            if hasattr(criterion, 'lcofl_loss') and criterion.lcofl_loss is not None:
+                criterion.lcofl_loss.weight_classification = lcofl_classification_weight
+            
+            # Logging
+            if epoch % 5 == 0 or epoch < 3:
+                gan_w = criterion.weights.get('gan', 0.0)
+                logger.info(f"Stage 3 Curriculum [epoch {epoch}]: {phase_name} | GAN={gan_w:.3f}, LCOFL_class={lcofl_classification_weight:.3f}")
         
         # Train
         train_losses = train_epoch(

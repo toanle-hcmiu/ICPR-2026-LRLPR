@@ -184,20 +184,25 @@ class TrainingConfig:
     epochs_restoration: int = 500
     epochs_finetune: int = 500  # Increased from 100 for better convergence
     
-    # Loss weights (for L_total = L_pixel + w1*L_GAN + w2*L_OCR + w3*L_geo)
-    weight_pixel: float = 1.0  # Primary anchor - prevents mode collapse
-    weight_gan: float = 0.005  # Reduced for stability (was 0.01 - too aggressive)
-    weight_ocr: float = 0.5  # Start low to prevent collapse (curriculum: ramp up after stable)
+    # Loss weights - Following Real-ESRGAN ratios for stable GAN training
+    # Real-ESRGAN uses L1:Perceptual:GAN = 1:1:0.1
+    # Reference: "Real-ESRGAN: Training Real-World Blind Super-Resolution" (Wang et al.)
+    weight_pixel: float = 1.0       # L1 reconstruction (primary anchor)
+    weight_perceptual: float = 1.0  # VGG perceptual loss (Real-ESRGAN: 1.0)
+    weight_gan: float = 0.1         # GAN loss (Real-ESRGAN: 0.1)
+    weight_ocr: float = 0.0         # DISABLED - replaced by LCOFL classification
     weight_geometry: float = 0.1
     
     # LCOFL Loss (from Nascimento et al. "Enhancing LP Super-Resolution" paper)
-    # Set use_lcofl=True to enable Layout and Character Oriented Focal Loss
-    # LCOFL helps prevent character collapse by penalizing confused character pairs
-    use_lcofl: bool = True   # Enable LCOFL loss to prevent character collapse
-    weight_lcofl: float = 0.5  # Weight for LCOFL loss
+    # LCOFL replaces separate OCR loss with a unified character-aware loss:
+    # - Classification: character recognition (curriculum-controlled)
+    # - Layout: digit/letter position enforcement (always active)
+    # - SSIM: structural similarity (always active)
+    use_lcofl: bool = True    # Enable LCOFL loss
+    weight_lcofl: float = 0.5 # Weight for total LCOFL loss
     weight_ssim: float = 0.3  # Weight for SSIM structural similarity loss
     lcofl_alpha: float = 1.0  # Penalty increment for confused character pairs
-    lcofl_beta: float = 2.0  # Layout violation penalty
+    lcofl_beta: float = 2.0   # Layout violation penalty
     
     # Total Variation Loss for suppressing wavy/checkerboard artifacts
     # Recommended: 1e-5 to 1e-4 for subtle smoothing without blur

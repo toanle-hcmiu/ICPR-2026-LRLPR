@@ -960,8 +960,8 @@ class CompositeLoss(nn.Module):
                 l_perceptual = self.perceptual_loss(outputs['hr_image'], targets['hr_image'])
                 l_perceptual = self._clamp_loss(l_perceptual)
                 loss_dict['perceptual'] = self._safe_loss_item(l_perceptual)
-                # Increase perceptual weight in Stage 3 to counterbalance OCR
-                perceptual_weight = max(self.weights['perceptual'], 0.3)
+                # Use config weight directly (Real-ESRGAN recommends 1.0)
+                perceptual_weight = self.weights.get('perceptual', 1.0)
                 weighted = perceptual_weight * l_perceptual
                 total_loss = weighted if total_loss is None else total_loss + weighted
         
@@ -989,17 +989,8 @@ class CompositeLoss(nn.Module):
                 loss_dict['ocr_raw'] = self._safe_loss_item(l_ocr_raw)
                 
                 # Use OCR weight from curriculum (set in train.py)
-                # Remove duplicate warmup logic that was conflicting with curriculum
-                ocr_weight = self.weights.get('ocr', 0.0)  # Use curriculum weight
-                
-                # DEBUG: Log if OCR weight is unexpectedly 0 when it should have been set by curriculum
-                if ocr_weight == 0.0:
-                    import logging
-                    logging.warning(
-                        f"get_stage3_loss: ocr_weight=0.0! "
-                        f"self.weights['ocr']={self.weights.get('ocr', 'NOT_SET')}, "
-                        f"full weights dict={self.weights}"
-                    )
+                # Note: OCR is now disabled (replaced by LCOFL), so weight is expected to be 0
+                ocr_weight = self.weights.get('ocr', 0.0)
                 
                 loss_dict['ocr_weight'] = ocr_weight
                 
@@ -1041,6 +1032,46 @@ class CompositeLoss(nn.Module):
                 l_tv = self._clamp_loss(l_tv)
                 loss_dict['tv'] = self._safe_loss_item(l_tv)
                 weighted = self.weights['tv'] * l_tv
+                total_loss = weighted if total_loss is None else total_loss + weighted
+        
+        # =================================================================
+        # 8. LCOFL LOSS (Character-aware loss with curriculum)
+        # =================================================================
+        # LCOFL replaces separate OCR loss with a unified approach:
+        # - Classification: character recognition (curriculum-controlled in train.py)
+        # - Layout: digit/letter position enforcement (always active)
+        # - SSIM: structural similarity for visual quality (always active)
+        if self.lcofl_loss is not None and 'masked_logits' in outputs and 'text_indices' in targets:
+            if not torch.isnan(outputs['masked_logits']).any():
+                # Get layout info
+                is_mercosul = targets.get('layout', torch.zeros(
+                    outputs['masked_logits'].size(0), 
+                    device=outputs['masked_logits'].device
+                ))
+                
+                # Strip BOS/EOS from targets
+                plate_length = outputs['masked_logits'].size(1)
+                lcofl_targets = targets['text_indices'][:, 1:plate_length+1]
+                
+                # Compute LCOFL loss (classification weight is set by curriculum in train.py)
+                l_lcofl, lcofl_dict = self.lcofl_loss(
+                    logits=outputs['masked_logits'],
+                    targets=lcofl_targets,
+                    is_mercosul=is_mercosul,
+                    generated_hr=outputs.get('hr_image'),
+                    gt_hr=targets.get('hr_image'),
+                    compute_ssim=True  # Always compute SSIM in Stage 3
+                )
+                l_lcofl = self._clamp_loss(l_lcofl)
+                loss_dict['lcofl'] = self._safe_loss_item(l_lcofl)
+                
+                # Log LCOFL sub-components for monitoring
+                for k, v in lcofl_dict.items():
+                    if k != 'total':
+                        loss_dict[f'lcofl_{k}'] = v
+                
+                # Apply LCOFL weight from config
+                weighted = self.weights.get('lcofl', 0.5) * l_lcofl
                 total_loss = weighted if total_loss is None else total_loss + weighted
         
         # =================================================================
