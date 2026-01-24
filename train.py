@@ -500,6 +500,10 @@ def train_epoch(
         scaler = scaler_g  # Use generator scaler for main forward pass
         
         with autocast('cuda', enabled=use_amp_for_batch):
+            # DEBUG: Log OCR weight at first batch of each epoch to trace curriculum issues
+            if batch_idx == 0 and stage == 'full' and hasattr(criterion, 'weights'):
+                if logger:
+                    logger.info(f"Epoch {epoch} Batch 0: criterion.weights['ocr'] = {criterion.weights.get('ocr', 'NOT SET')}")
             # SPECIAL CASE: parseq_warmup stage - bypass generator, use GT HR directly
             # This trains PARSeq on clean GT images, not noisy generated ones
             if stage == 'parseq_warmup':
@@ -1505,6 +1509,9 @@ def train_stage(
                 current_ocr_weight = target_ocr_weight
             
             criterion.weights['ocr'] = current_ocr_weight
+            # DEBUG: Verify the weight was set correctly
+            assert criterion.weights['ocr'] == current_ocr_weight, \
+                f"Curriculum weight not persisted: expected {current_ocr_weight}, got {criterion.weights['ocr']}"
             if epoch % 5 == 0:  # Log every 5 epochs
                 logger.info(f"Curriculum: OCR weight = {current_ocr_weight:.3f}")
         

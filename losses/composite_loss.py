@@ -992,6 +992,15 @@ class CompositeLoss(nn.Module):
                 # Remove duplicate warmup logic that was conflicting with curriculum
                 ocr_weight = self.weights.get('ocr', 0.0)  # Use curriculum weight
                 
+                # DEBUG: Log if OCR weight is unexpectedly 0 when it should have been set by curriculum
+                if ocr_weight == 0.0:
+                    import logging
+                    logging.warning(
+                        f"get_stage3_loss: ocr_weight=0.0! "
+                        f"self.weights['ocr']={self.weights.get('ocr', 'NOT_SET')}, "
+                        f"full weights dict={self.weights}"
+                    )
+                
                 loss_dict['ocr_weight'] = ocr_weight
                 
                 # Apply OCR loss (optionally with hinge constraint)
