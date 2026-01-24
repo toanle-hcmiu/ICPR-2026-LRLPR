@@ -223,8 +223,8 @@ class TrainingConfig:
     stage3_sr_anchor_weight: float = 1.0      # Weight for SR anchoring to Stage 2 output
     stage3_ocr_warmup_steps: int = 6000       # Steps before OCR loss starts ramping (increased for stability)
     stage3_ocr_ramp_steps: int = 6000         # Steps to ramp OCR from 0 to max weight (slower ramp)
-    stage3_ocr_max_weight: float = 0.3        # Max OCR weight after warmup (conservative to prevent collapse)
-    stage3_use_ocr_hinge: bool = True         # Use hinge constraint (only penalize if worse than Stage 2)
+    stage3_ocr_max_weight: float = 0.5        # Increased OCR weight to force character training
+    stage3_use_ocr_hinge: bool = False        # TEMPORARILY DISABLED: Test if hinge blocks gradients
     
     # Optimizer
     optimizer: str = 'adamw'

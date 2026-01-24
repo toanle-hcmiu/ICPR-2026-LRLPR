@@ -904,6 +904,18 @@ def train_epoch(
                             if p.grad is not None
                         ) ** 0.5
                         writer.add_scalar(f'grad_norm/{name}', grad_norm_module, global_step)
+                        
+                        # Debug: Check recognizer requires_grad status
+                        if name == 'recognizer' and grad_norm_module == 0:
+                            trainable_count = sum(1 for p in module.parameters() if p.requires_grad)
+                            total_count = sum(1 for p in module.parameters())
+                            logger.warning(f"Recognizer grad_norm=0! Trainable: {trainable_count}/{total_count}")
+                            
+                            # Emergency re-unfreeze
+                            for param in module.parameters():
+                                param.requires_grad = True
+                            logger.info("Emergency: Force-enabled requires_grad on all recognizer params")
+                            
                     except Exception:
                         pass  # Skip if module has no gradients
                 
