@@ -988,13 +988,9 @@ class CompositeLoss(nn.Module):
                 l_ocr_raw = self._clamp_loss(l_ocr_raw)
                 loss_dict['ocr_raw'] = self._safe_loss_item(l_ocr_raw)
                 
-                # OCR Warmup: Gate OCR loss for first N steps
-                if global_step < ocr_warmup_steps:
-                    ocr_weight = 0.0
-                else:
-                    # Ramp up OCR weight gradually
-                    ramp_progress = min(1.0, (global_step - ocr_warmup_steps) / max(1, ocr_ramp_steps))
-                    ocr_weight = ramp_progress * ocr_max_weight
+                # Use OCR weight from curriculum (set in train.py)
+                # Remove duplicate warmup logic that was conflicting with curriculum
+                ocr_weight = self.weights.get('ocr', 0.0)  # Use curriculum weight
                 
                 loss_dict['ocr_weight'] = ocr_weight
                 
