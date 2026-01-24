@@ -1494,26 +1494,31 @@ def train_stage(
     
     for epoch in range(start_epoch, num_epochs):
         # Curriculum learning for Stage 3: gradually increase OCR weight
-        # This prevents early collapse by letting generator stabilize first
+        # CRITICAL: Start at 0 and delay OCR to let generator stabilize with pixel loss first
+        # Otherwise OCR gradients cause mode collapse (characters fade to minimize OCR confusion)
         if stage == 'full' and hasattr(criterion, 'weights'):
-            # Ramp OCR weight from initial (0.5) to target (1.5) over warmup_epochs
-            ocr_warmup_epochs = 20
-            initial_ocr_weight = config.training.weight_ocr  # 0.5
-            target_ocr_weight = 1.5  # Final target
+            # OCR curriculum: 0 for first N epochs (dead zone), then ramp to target
+            ocr_dead_epochs = 5        # No OCR for first 5 epochs - generator must learn colors/shapes first
+            ocr_ramp_epochs = 15       # Ramp from 0 to target over next 15 epochs
+            target_ocr_weight = 0.3    # Reduced target - OCR is secondary to visual quality
             
-            if epoch < ocr_warmup_epochs:
-                # Linear ramp: 0.5 -> 1.5 over 20 epochs
-                progress = epoch / ocr_warmup_epochs
-                current_ocr_weight = initial_ocr_weight + (target_ocr_weight - initial_ocr_weight) * progress
+            if epoch < ocr_dead_epochs:
+                # Dead zone: no OCR loss at all
+                current_ocr_weight = 0.0
+            elif epoch < ocr_dead_epochs + ocr_ramp_epochs:
+                # Ramp zone: linear ramp from 0 to target
+                progress = (epoch - ocr_dead_epochs) / ocr_ramp_epochs
+                current_ocr_weight = target_ocr_weight * progress
             else:
+                # Stable zone: full OCR weight
                 current_ocr_weight = target_ocr_weight
             
             criterion.weights['ocr'] = current_ocr_weight
             # DEBUG: Verify the weight was set correctly
             assert criterion.weights['ocr'] == current_ocr_weight, \
                 f"Curriculum weight not persisted: expected {current_ocr_weight}, got {criterion.weights['ocr']}"
-            if epoch % 5 == 0:  # Log every 5 epochs
-                logger.info(f"Curriculum: OCR weight = {current_ocr_weight:.3f}")
+            if epoch % 5 == 0 or epoch < 3:  # Log frequently early on
+                logger.info(f"Curriculum: OCR weight = {current_ocr_weight:.3f} (epoch {epoch}, dead_epochs={ocr_dead_epochs})")
         
         # Train
         train_losses = train_epoch(
