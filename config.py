@@ -184,32 +184,33 @@ class TrainingConfig:
     epochs_restoration: int = 500
     epochs_finetune: int = 500  # Increased from 100 for better convergence
     
-    # Loss weights - Following Real-ESRGAN ratios for stable training
-    # Real-ESRGAN uses L1:Perceptual:GAN = 1:1:0.1
-    # Key insight: Pixel loss should DOMINATE, OCR is secondary guidance
-    weight_pixel: float = 1.0       # L1 reconstruction (primary - must dominate)
-    weight_perceptual: float = 0.1  # REDUCED from 0.5 - high perceptual causes averaging/blur
-    weight_gan: float = 0.0         # DISABLED - Original LCOFL paper uses OCR-only discriminator
+    # Loss weights - SIMPLIFIED to match original LCOFL paper
+    # Original paper uses ONLY LCOFL (which includes SSIM) + OCR discriminator
+    # We add small pixel loss as stabilizer since we have multi-stage training
+    weight_pixel: float = 0.25      # Small stabilizer - original paper doesn't have this
+    weight_perceptual: float = 0.0  # DISABLED - not in original paper, causes blur
+    weight_gan: float = 0.0         # DISABLED - original uses OCR-as-discriminator
     weight_ocr: float = 0.0         # DISABLED - replaced by LCOFL classification
-    weight_geometry: float = 0.1
+    weight_geometry: float = 0.0    # DISABLED - simplify
     
     # LCOFL Loss (from Nascimento et al. "Enhancing LP Super-Resolution" paper)
-    # MODIFIED: Reduced weights to prevent dominating pixel loss (prevents blur)
-    use_lcofl: bool = True     # Enable LCOFL loss
-    weight_lcofl: float = 0.2  # REDUCED from 0.75 - was overpowering pixel loss!
-    weight_ssim: float = 0.05  # REDUCED from 0.1 - SSIM causes averaging
+    # PRIMARY LOSS - following original paper configuration exactly
+    # loss_weight: 0.75 from cgnetV2_deformable.yaml
+    use_lcofl: bool = True     # Enable LCOFL loss (PRIMARY)
+    weight_lcofl: float = 0.75 # ORIGINAL paper value - this is the main loss!
+    weight_ssim: float = 0.1   # Part of LCOFL dissimilarity (original paper uses this)
     lcofl_alpha: float = 1.0   # Penalty increment for confused character pairs
     lcofl_beta: float = 2.0    # Layout violation penalty
     use_frozen_ocr_for_lcofl: bool = True  # Use frozen OCR copy for classification
-    weight_edge: float = 0.3   # REDUCED from 0.5 - helps edges but secondary to pixel
+    weight_edge: float = 0.0   # DISABLED - not in original paper
     
-    # PARSeq Feature Loss (L1 on encoder features - bypasses decoder/LM)
-    # This replaces CE-based classification with feature matching
-    use_parseq_feature_loss: bool = True   # Enable PARSeq feature loss
-    weight_parseq_feature: float = 1e-3    # Max OCR weight (after warmup)
-    parseq_feature_warmup_steps: int = 5000  # Steps to reach max weight
-    parseq_feature_pixel_threshold: float = 0.5  # Disable OCR when pixel loss > this
-    generator_grad_clip: float = 0.5       # Gradient clip for generator (stabilization)
+    # PARSeq Feature Loss - DISABLED (not in original paper)
+    # This was experimental, but adds complexity
+    use_parseq_feature_loss: bool = False  # DISABLED - simplify
+    weight_parseq_feature: float = 0.0
+    parseq_feature_warmup_steps: int = 5000
+    parseq_feature_pixel_threshold: float = 0.5
+    generator_grad_clip: float = 0.5
     
     # Total Variation Loss for suppressing wavy/checkerboard artifacts
     # Recommended: 1e-5 to 1e-4 for subtle smoothing without blur
@@ -227,14 +228,13 @@ class TrainingConfig:
     freeze_ocr_discriminator: bool = True  # Keep OCR frozen during training
     ocr_confidence_mode: str = 'mean'  # 'mean', 'min', or 'product'
     
-    # Stage 3 Anti-Collapse Parameters
-    # CRITICAL FIX: SR anchor was 1.0 which locked output to blurry Stage 2!
-    # Reduced to 0.1 to allow improvement while maintaining structure
-    stage3_sr_anchor_weight: float = 0.1      # REDUCED from 1.0 - was locking to blur!
-    stage3_ocr_warmup_steps: int = 6000       # Steps before OCR loss starts ramping
-    stage3_ocr_ramp_steps: int = 6000         # Steps to ramp OCR from 0 to max weight
-    stage3_ocr_max_weight: float = 0.3        # REDUCED from 0.5 - let pixel dominate
-    stage3_use_ocr_hinge: bool = False        # Disabled - simplify loss landscape
+    # Stage 3 Parameters - SIMPLIFIED
+    # No SR anchor (not in original paper), no OCR hinge
+    stage3_sr_anchor_weight: float = 0.0      # DISABLED - not in original paper
+    stage3_ocr_warmup_steps: int = 0          # No warmup - use LCOFL from start (like paper)
+    stage3_ocr_ramp_steps: int = 0            # No ramp
+    stage3_ocr_max_weight: float = 0.0        # Handled by LCOFL directly
+    stage3_use_ocr_hinge: bool = False        # Disabled
     
     # Optimizer
     optimizer: str = 'adamw'
