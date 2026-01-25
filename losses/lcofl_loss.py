@@ -34,7 +34,7 @@ class SSIMLoss(nn.Module):
     
     def __init__(
         self,
-        window_size: int = 11,
+        window_size: int = 5,  # Original LCOFL paper uses window_size=5 for license plates
         channel: int = 3,
         size_average: bool = True
     ):

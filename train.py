@@ -1497,62 +1497,31 @@ def train_stage(
     
     for epoch in range(start_epoch, num_epochs):
         # =====================================================================
-        # Stage 3 Curriculum Learning - 3 Phase Approach (Based on Real-ESRGAN)
+        # Stage 3 Training - Following Original LCOFL Paper
         # =====================================================================
-        # Phase 1 (epochs 0-4): PSNR-only warmup
-        #   - Pixel + Perceptual + SSIM + TV + Layout penalty ONLY
-        #   - NO GAN, NO OCR, NO LCOFL classification
-        #   - Generator learns stable reconstruction before adversarial training
-        #
-        # Phase 2 (epochs 5-19): GAN + Classification ramp-up
-        #   - Enable GAN loss (allows generator to produce sharper outputs)
-        #   - Ramp LCOFL classification from 0 to 1.0 (gradual OCR learning)
-        #   - SSIM/Layout stay active for stability
-        #
-        # Phase 3 (epochs 20+): Full training
-        #   - All losses at full weight
+        # Original paper (Nascimento et al. SIBGRAPI 2024) uses:
+        # - LCOFL with classification active from start (no curriculum)
+        # - OCR as discriminator (not binary GAN)
+        # - loss_weight = 0.75 for LCOFL
+        # - SSIM window_size = 5
         # =====================================================================
         
         if stage == 'full' and hasattr(criterion, 'weights'):
-            # Phase boundaries
-            psnr_only_epochs = 5       # Phase 1: PSNR-only (no adversarial)
-            classification_ramp_epochs = 15  # Phase 2: ramp classification
+            # Follow original paper: no curriculum, classification from start
+            criterion.weights['ocr'] = 0.0  # Disabled, replaced by LCOFL
+            criterion.weights['gan'] = 0.0  # Disabled - original uses OCR-only discriminator
             
-            # OCR is permanently disabled (replaced by LCOFL)
-            criterion.weights['ocr'] = 0.0
-            
-            if epoch < psnr_only_epochs:
-                # ============ PHASE 1: PSNR-Only Warmup ============
-                # Disable GAN and all character-oriented losses
-                # This lets generator learn stable reconstruction first
-                criterion.weights['gan'] = 0.0
-                lcofl_classification_weight = 0.0
-                phase_name = "PSNR-only"
-                
-            elif epoch < psnr_only_epochs + classification_ramp_epochs:
-                # ============ PHASE 2: GAN + Classification Ramp ============
-                # Enable GAN loss for sharper outputs
-                criterion.weights['gan'] = config.training.weight_gan  # 0.1
-                
-                # Ramp LCOFL classification from 0 to 1.0
-                progress = (epoch - psnr_only_epochs) / classification_ramp_epochs
-                lcofl_classification_weight = 1.0 * progress
-                phase_name = f"Ramp (GAN on, class={lcofl_classification_weight:.2f})"
-                
-            else:
-                # ============ PHASE 3: Full Training ============
-                criterion.weights['gan'] = config.training.weight_gan  # 0.1
-                lcofl_classification_weight = 1.0
-                phase_name = "Full"
+            # Classification at full weight from epoch 0 (original paper approach)
+            lcofl_classification_weight = 1.0
             
             # Apply LCOFL classification weight
             if hasattr(criterion, 'lcofl_loss') and criterion.lcofl_loss is not None:
                 criterion.lcofl_loss.weight_classification = lcofl_classification_weight
             
             # Logging
-            if epoch % 5 == 0 or epoch < 3:
-                gan_w = criterion.weights.get('gan', 0.0)
-                logger.info(f"Stage 3 Curriculum [epoch {epoch}]: {phase_name} | GAN={gan_w:.3f}, LCOFL_class={lcofl_classification_weight:.3f}")
+            if epoch % 10 == 0 or epoch < 3:
+                lcofl_w = criterion.weights.get('lcofl', 0.0)
+                logger.info(f"Stage 3 [epoch {epoch}]: LCOFL={lcofl_w:.3f}, Classification={lcofl_classification_weight:.3f}, GAN=0 (following original paper)")
         
         # Train
         train_losses = train_epoch(
