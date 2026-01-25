@@ -416,7 +416,8 @@ def train_epoch(
     total_epochs: int = 20,
     ocr_discriminator_loss: Optional['OCRDiscriminatorLoss'] = None,
     model_stage2: Optional[nn.Module] = None,  # Stage 2 model for anchor generation
-    config: Optional[Config] = None            # For Stage 3 parameters
+    config: Optional[Config] = None,           # For Stage 3 parameters
+    frozen_ocr: Optional[nn.Module] = None     # Frozen OCR for LCOFL classification
 ) -> Dict[str, float]:
     """
     Train for one epoch with optional mixed precision.
@@ -526,6 +527,19 @@ def train_epoch(
                 }
             else:
                 outputs = model(lr_frames, return_intermediates=True)
+            
+            # ================================================================
+            # FROZEN OCR FOR LCOFL (Mode Collapse Prevention)
+            # ================================================================
+            # Compute logits through frozen OCR for LCOFL classification loss.
+            # This prevents generator from learning "adversarial" features that
+            # fool the trainable recognizer, forcing visually clear characters.
+            # ================================================================
+            if frozen_ocr is not None and 'hr_image' in outputs:
+                with torch.no_grad():
+                    hr_for_frozen = outputs['hr_image'].detach()
+                    frozen_logits = frozen_ocr(hr_for_frozen)  # (B, L, V)
+                    outputs['frozen_logits'] = frozen_logits
             
             # Validate generator output isn't producing extreme values
             # This catches cases where the generator is collapsing before it causes NaN
@@ -1351,10 +1365,11 @@ def train_stage(
         weight_gan=config.training.weight_gan,
         weight_ocr=config.training.weight_ocr,
         weight_geometry=config.training.weight_geometry,
-        weight_perceptual=config.training.weight_perceptual,  # VGG feature matching (Real-ESRGAN: 1.0)
+        weight_perceptual=config.training.weight_perceptual,  # VGG feature matching (reduced to 0.5)
         weight_lcofl=config.training.weight_lcofl if config.training.use_lcofl else 0.0,
         weight_ssim=config.training.weight_ssim if config.training.use_lcofl else 0.0,
         weight_tv=config.training.weight_tv,  # Total Variation for wavy artifact suppression
+        weight_edge=getattr(config.training, 'weight_edge', 0.0),  # Edge loss for sharper characters
         use_perceptual=True,  # Enable perceptual loss for sharper images
         use_lcofl=config.training.use_lcofl,
         lcofl_alpha=config.training.lcofl_alpha,
@@ -1440,6 +1455,26 @@ def train_stage(
             for param in model.recognizer.parameters():
                 param.requires_grad = True
             logger.info("  Attempted to unfreeze recognizer again.")
+        
+        # =================================================================
+        # FROZEN OCR FOR LCOFL (Prevents Mode Collapse)
+        # =================================================================
+        # Create a frozen copy of the recognizer for LCOFL classification loss.
+        # This prevents the generator from learning "adversarial" features that
+        # fool the trainable recognizer, forcing it to produce visually clear
+        # characters instead of optimizing for hidden features.
+        # =================================================================
+        if getattr(config.training, 'use_frozen_ocr_for_lcofl', True):
+            import copy
+            frozen_ocr = copy.deepcopy(model.recognizer)
+            for param in frozen_ocr.parameters():
+                param.requires_grad = False
+            frozen_ocr.eval()
+            logger.info("  Created frozen OCR copy for LCOFL classification (mode collapse prevention)")
+        else:
+            frozen_ocr = None
+    else:
+        frozen_ocr = None
     
     optimizer_d = None
     
@@ -1521,7 +1556,7 @@ def train_stage(
             # Logging
             if epoch % 10 == 0 or epoch < 3:
                 lcofl_w = criterion.weights.get('lcofl', 0.0)
-                logger.info(f"Stage 3 [epoch {epoch}]: LCOFL={lcofl_w:.3f}, Classification={lcofl_classification_weight:.3f}, GAN=0 (following original paper)")
+                logger.info(f"Stage 3 [epoch {epoch}]: LCOFL={lcofl_w:.3f}, Classification={lcofl_classification_weight:.3f}, GAN=0")
         
         # Train
         train_losses = train_epoch(
@@ -1529,7 +1564,7 @@ def train_stage(
             optimizer_g, optimizer_d, device, epoch, stage, writer, logger,
             scaler_g=scaler_g, scaler_d=scaler_d, ema=ema, grad_clip_norm=grad_clip_norm,
             total_epochs=num_epochs, ocr_discriminator_loss=ocr_discriminator_loss,
-            model_stage2=model_stage2, config=config
+            model_stage2=model_stage2, config=config, frozen_ocr=frozen_ocr
         )
         
         # Log training losses

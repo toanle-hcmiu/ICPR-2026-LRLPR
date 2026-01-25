@@ -65,6 +65,78 @@ class TotalVariationLoss(nn.Module):
         
         return self.weight * tv_loss
 
+
+class EdgeLoss(nn.Module):
+    """
+    Edge-weighted loss for preserving character boundaries.
+    
+    Uses Sobel filters to extract edges and computes L1 loss on edge maps.
+    This helps prevent mode collapse by emphasizing sharp character edges
+    over smooth averaging that fools perceptual/SSIM losses.
+    
+    Reference: Research shows edge-weighted loss prevents character blur
+    in text super-resolution by prioritizing high-frequency details.
+    """
+    
+    def __init__(self, weight: float = 0.5):
+        super().__init__()
+        self.weight = weight
+        
+        # Sobel filters for edge detection
+        sobel_x = torch.tensor([
+            [-1., 0., 1.],
+            [-2., 0., 2.],
+            [-1., 0., 1.]
+        ]).view(1, 1, 3, 3)
+        
+        sobel_y = torch.tensor([
+            [-1., -2., -1.],
+            [0., 0., 0.],
+            [1., 2., 1.]
+        ]).view(1, 1, 3, 3)
+        
+        self.register_buffer('sobel_x', sobel_x)
+        self.register_buffer('sobel_y', sobel_y)
+    
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        Compute edge-weighted L1 loss.
+        
+        Args:
+            pred: Predicted HR image (B, C, H, W).
+            target: Ground truth HR image (B, C, H, W).
+            
+        Returns:
+            Edge-weighted loss value.
+        """
+        B, C, H, W = pred.shape
+        
+        # Convert to grayscale if RGB
+        if C == 3:
+            pred_gray = 0.299 * pred[:, 0] + 0.587 * pred[:, 1] + 0.114 * pred[:, 2]
+            target_gray = 0.299 * target[:, 0] + 0.587 * target[:, 1] + 0.114 * target[:, 2]
+            pred_gray = pred_gray.unsqueeze(1)
+            target_gray = target_gray.unsqueeze(1)
+        else:
+            pred_gray = pred
+            target_gray = target
+        
+        # Apply Sobel filters
+        pred_edge_x = F.conv2d(pred_gray, self.sobel_x, padding=1)
+        pred_edge_y = F.conv2d(pred_gray, self.sobel_y, padding=1)
+        target_edge_x = F.conv2d(target_gray, self.sobel_x, padding=1)
+        target_edge_y = F.conv2d(target_gray, self.sobel_y, padding=1)
+        
+        # Compute edge magnitudes
+        pred_edge = torch.sqrt(pred_edge_x ** 2 + pred_edge_y ** 2 + 1e-8)
+        target_edge = torch.sqrt(target_edge_x ** 2 + target_edge_y ** 2 + 1e-8)
+        
+        # L1 loss on edge maps
+        edge_loss = F.l1_loss(pred_edge, target_edge)
+        
+        return self.weight * edge_loss
+
+
 class SelfSupervisedSTNLoss(nn.Module):
     """
     Self-supervised loss for STN training when corner annotations are not available.
@@ -395,6 +467,7 @@ class CompositeLoss(nn.Module):
         weight_lcofl: float = 0.0,
         weight_ssim: float = 0.0,
         weight_tv: float = 0.0,  # Total Variation loss weight for wavy artifact suppression
+        weight_edge: float = 0.0,  # Edge loss weight for sharper character boundaries
         gan_mode: str = 'vanilla',
         ocr_loss_type: str = 'cross_entropy',
         use_perceptual: bool = False,
@@ -433,7 +506,8 @@ class CompositeLoss(nn.Module):
             'perceptual': weight_perceptual,
             'lcofl': weight_lcofl,
             'ssim': weight_ssim,
-            'tv': weight_tv  # Total Variation for wavy artifact suppression
+            'tv': weight_tv,  # Total Variation for wavy artifact suppression
+            'edge': weight_edge  # Edge loss for sharper characters
         }
         
         # Individual losses
@@ -472,6 +546,12 @@ class CompositeLoss(nn.Module):
             self.tv_loss = TotalVariationLoss(weight=1.0)  # Weight applied via self.weights
         else:
             self.tv_loss = None
+        
+        # Edge loss for sharper character boundaries (prevents mode collapse)
+        if weight_edge > 0:
+            self.edge_loss = EdgeLoss(weight=1.0)  # Weight applied via self.weights
+        else:
+            self.edge_loss = None
     
     def forward(
         self,
@@ -1035,6 +1115,17 @@ class CompositeLoss(nn.Module):
                 total_loss = weighted if total_loss is None else total_loss + weighted
         
         # =================================================================
+        # 7b. EDGE LOSS (for sharper character boundaries)
+        # =================================================================
+        if hasattr(self, 'edge_loss') and self.edge_loss is not None and 'hr_image' in outputs and 'hr_image' in targets:
+            if not (torch.isnan(outputs['hr_image']).any() or torch.isnan(targets['hr_image']).any()):
+                l_edge = self.edge_loss(outputs['hr_image'], targets['hr_image'])
+                l_edge = self._clamp_loss(l_edge)
+                loss_dict['edge'] = self._safe_loss_item(l_edge)
+                weighted = self.weights.get('edge', 0.0) * l_edge
+                total_loss = weighted if total_loss is None else total_loss + weighted
+        
+        # =================================================================
         # 8. LCOFL LOSS (Character-aware loss with curriculum)
         # =================================================================
         # LCOFL replaces separate OCR loss with a unified approach:
@@ -1053,9 +1144,20 @@ class CompositeLoss(nn.Module):
                 plate_length = outputs['masked_logits'].size(1)
                 lcofl_targets = targets['text_indices'][:, 1:plate_length+1]
                 
+                # ================================================================
+                # FROZEN OCR FOR LCOFL (Mode Collapse Prevention)
+                # ================================================================
+                # Use frozen_logits for classification if available.
+                # This prevents generator from learning adversarial features.
+                # ================================================================
+                if 'frozen_logits' in outputs:
+                    lcofl_logits = outputs['frozen_logits']
+                else:
+                    lcofl_logits = outputs['masked_logits']
+                
                 # Compute LCOFL loss (classification weight is set by curriculum in train.py)
                 l_lcofl, lcofl_dict = self.lcofl_loss(
-                    logits=outputs['masked_logits'],
+                    logits=lcofl_logits,
                     targets=lcofl_targets,
                     is_mercosul=is_mercosul,
                     generated_hr=outputs.get('hr_image'),

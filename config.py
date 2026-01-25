@@ -188,7 +188,7 @@ class TrainingConfig:
     # Real-ESRGAN uses L1:Perceptual:GAN = 1:1:0.1
     # Reference: "Real-ESRGAN: Training Real-World Blind Super-Resolution" (Wang et al.)
     weight_pixel: float = 1.0       # L1 reconstruction (primary anchor)
-    weight_perceptual: float = 1.0  # VGG perceptual loss (Real-ESRGAN: 1.0)
+    weight_perceptual: float = 0.5  # Reduced from 1.0 - high perceptual causes mode collapse
     weight_gan: float = 0.0         # DISABLED - Original LCOFL paper uses OCR-only discriminator
     weight_ocr: float = 0.0         # DISABLED - replaced by LCOFL classification
     weight_geometry: float = 0.1
@@ -200,9 +200,11 @@ class TrainingConfig:
     # - SSIM window_size: 5 (smaller for license plates)
     use_lcofl: bool = True     # Enable LCOFL loss
     weight_lcofl: float = 0.75 # Original paper: 0.75
-    weight_ssim: float = 0.3   # SSIM weight inside LCOFL
+    weight_ssim: float = 0.1   # Reduced from 0.3 - high SSIM causes averaging
     lcofl_alpha: float = 1.0   # Penalty increment for confused character pairs
     lcofl_beta: float = 2.0    # Layout violation penalty
+    use_frozen_ocr_for_lcofl: bool = True  # Use frozen OCR copy for classification (prevents mode collapse)
+    weight_edge: float = 0.5   # Edge-weighted loss for sharper character boundaries
     
     # Total Variation Loss for suppressing wavy/checkerboard artifacts
     # Recommended: 1e-5 to 1e-4 for subtle smoothing without blur

@@ -688,7 +688,25 @@ For enhanced security, consider migrating to [safetensors](https://github.com/hu
 
 ## Changelog
 
-### v1.2.0 (Latest)
+### v1.5.0 (Latest)
+
+**Stage 3 Anti-Collapse Training:**
+- ✅ Frozen OCR for LCOFL classification - prevents mode collapse by using a frozen copy of PARSeq for loss computation
+- ✅ SR Anchor Loss - anchors Stage 3 output to Stage 2 for visual quality preservation
+- ✅ GAN disabled in Stage 3 - using OCR-only discriminator approach from original LCOFL paper
+- ✅ LCOFL classification active from start (no curriculum) - matches original paper configuration
+
+**Configuration Updates:**
+- ✅ New config parameter: `use_frozen_ocr_for_lcofl` (default: True)
+- ✅ LCOFL weight increased to 0.75 (matching original paper)
+- ✅ Edge loss weight set to 0.5 for sharper character boundaries
+- ✅ Stage 3 OCR parameters: warmup 6000 steps, ramp 6000 steps, max weight 0.5
+
+**Documentation:**
+- ✅ Updated AGENTS.md with Stage 3 training patterns
+- ✅ Added frozen OCR integration guidance
+
+### v1.4.0
 
 **Training Improvements:**
 - ✅ Stage-aware validation to prevent NaN losses

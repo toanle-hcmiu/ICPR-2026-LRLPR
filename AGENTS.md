@@ -210,6 +210,14 @@ def _clamp_loss(self, loss, max_val=100.0):
 **Solution**: Added `TotalVariationLoss` to `losses/composite_loss.py` with `weight_tv` in config  
 **Usage**: Set `config.training.weight_tv = 1e-5` to enable TV denoising
 
+### 10. Stage 3 Mode Collapse (FIXED)
+**Issue**: Generator learns to produce "adversarial" features that fool trainable OCR but aren't visually clear  
+**Symptom**: Characters fade or become blurry while OCR loss decreases  
+**Solution**: Use frozen copy of OCR for LCOFL classification loss computation  
+**File**: `train.py:train_stage()` (lines 1459-1477)  
+**Config**: `use_frozen_ocr_for_lcofl: True` (default), LCOFL weight = 0.75
+
+
 ### 7. PARSeq Pretrained Model Issues (FIXED)
 **Issue 1**: Model loaded in training mode → random outputs due to dropout  
 **Solution**: Added `.eval()` in `models/parseq.py:_load_model()` after loading  
@@ -249,6 +257,28 @@ def _clamp_loss(self, loss, max_val=100.0):
 - **Status**: ✅ Integrated via Shared Attention Module
 - **Purpose**: Adaptive spatial sampling for character alignment
 - **Usage**: Set `config.training.use_deformable_conv = True` (requires `use_shared_attention = True`)
+
+### Stage 3 Mode Collapse Prevention
+- **File**: `train.py:train_stage()` (lines 1459-1477)
+- **Config**: `use_frozen_ocr_for_lcofl: True` (config.py line 206)
+- **Status**: ✅ Active by default for Stage 3 training
+- **Purpose**: Prevents generator from learning adversarial features that fool trainable OCR
+- **Mechanism**: 
+  1. Creates deep copy of recognizer at Stage 3 start
+  2. Freezes all parameters and sets `eval()` mode
+  3. Uses frozen copy for LCOFL classification loss computation
+- **Key Insight**: Generator cannot "cheat" by learning hidden features only trainable OCR detects
+
+**Stage 3 Anti-Collapse Configuration:**
+```python
+# In config.py - TrainingConfig
+use_frozen_ocr_for_lcofl: bool = True      # Enable frozen OCR copy
+stage3_sr_anchor_weight: float = 1.0       # Anchor to Stage 2 output
+stage3_ocr_warmup_steps: int = 6000        # Steps before OCR ramps up
+stage3_ocr_ramp_steps: int = 6000          # Steps to ramp to max weight
+stage3_ocr_max_weight: float = 0.5         # Max OCR loss weight
+weight_lcofl: float = 0.75                 # LCOFL weight (original paper)
+```
 
 
 ## Reproducibility & Determinism
