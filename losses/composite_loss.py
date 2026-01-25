@@ -121,11 +121,15 @@ class EdgeLoss(nn.Module):
             pred_gray = pred
             target_gray = target
         
+        # Move Sobel filters to same device as input
+        sobel_x = self.sobel_x.to(pred_gray.device, dtype=pred_gray.dtype)
+        sobel_y = self.sobel_y.to(pred_gray.device, dtype=pred_gray.dtype)
+        
         # Apply Sobel filters
-        pred_edge_x = F.conv2d(pred_gray, self.sobel_x, padding=1)
-        pred_edge_y = F.conv2d(pred_gray, self.sobel_y, padding=1)
-        target_edge_x = F.conv2d(target_gray, self.sobel_x, padding=1)
-        target_edge_y = F.conv2d(target_gray, self.sobel_y, padding=1)
+        pred_edge_x = F.conv2d(pred_gray, sobel_x, padding=1)
+        pred_edge_y = F.conv2d(pred_gray, sobel_y, padding=1)
+        target_edge_x = F.conv2d(target_gray, sobel_x, padding=1)
+        target_edge_y = F.conv2d(target_gray, sobel_y, padding=1)
         
         # Compute edge magnitudes
         pred_edge = torch.sqrt(pred_edge_x ** 2 + pred_edge_y ** 2 + 1e-8)
