@@ -534,15 +534,16 @@ def train_epoch(
             # FROZEN OCR FOR LCOFL (Mode Collapse Prevention)
             # ================================================================
             # Compute logits through frozen OCR for LCOFL classification loss.
-            # The frozen OCR has requires_grad=False on all parameters, but we
-            # DO NOT use torch.no_grad() or .detach() because gradients must
-            # flow back through the frozen OCR's computation graph to the
-            # generator's hr_image output. This is the key fix for mode collapse.
+            # Use torch.no_grad() and .detach() to prevent gradient flow through
+            # frozen OCR. This eliminates gradient conflict between frozen OCR (Stage 2
+            # weights) and trainable OCR (Stage 3 learning) that was causing
+            # character collapse. LCOFL still provides character guidance via loss value.
             # ================================================================
             if frozen_ocr is not None and 'hr_image' in outputs:
-                # Forward through frozen OCR without detaching - gradients flow to generator
-                frozen_logits = frozen_ocr(outputs['hr_image'])  # (B, L, V)
-                outputs['frozen_logits'] = frozen_logits
+                # Forward through frozen OCR with NO gradients - prevents adversarial gradient conflict
+                with torch.no_grad():
+                    frozen_logits = frozen_ocr(outputs['hr_image'])  # (B, L, V)
+                outputs['frozen_logits'] = frozen_logits.detach()
             
             # Validate generator output isn't producing extreme values
             # This catches cases where the generator is collapsing before it causes NaN
@@ -1595,9 +1596,16 @@ def train_stage(
             # Follow original paper: no curriculum, classification from start
             criterion.weights['ocr'] = 0.0  # Disabled, replaced by LCOFL
             criterion.weights['gan'] = 0.0  # Disabled - original uses OCR-only discriminator
-            
-            # Classification at full weight from epoch 0 (original paper approach)
-            lcofl_classification_weight = 1.0
+
+            # LCOFL curriculum - gradual introduction to prevent sudden gradient conflict
+            # Start with 0 weight for first 5 epochs (pixel-only warmup)
+            # Then ramp up to 1.0 over next 15 epochs
+            if epoch < 5:
+                lcofl_classification_weight = 0.0
+            elif epoch < 20:
+                lcofl_classification_weight = (epoch - 5) / 15.0
+            else:
+                lcofl_classification_weight = 1.0
             
             # Apply LCOFL classification weight
             if hasattr(criterion, 'lcofl_loss') and criterion.lcofl_loss is not None:

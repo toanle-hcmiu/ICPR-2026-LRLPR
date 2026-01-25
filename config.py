@@ -184,21 +184,22 @@ class TrainingConfig:
     epochs_restoration: int = 500
     epochs_finetune: int = 500  # Increased from 100 for better convergence
     
-    # Loss weights - SIMPLIFIED to match original LCOFL paper
-    # Original paper uses ONLY LCOFL (which includes SSIM) + OCR discriminator
-    # We add small pixel loss as stabilizer since we have multi-stage training
-    weight_pixel: float = 0.25      # Small stabilizer - original paper doesn't have this
+    # Loss weights - FIXED to rebalance Stage 3 training
+    # INCREASED pixel loss to anchor visual quality and prevent character destruction
+    # REDUCED LCOFL/SSIM/TV to prevent domination and over-smoothing
+    # Original paper uses ONLY LCOFL, but staged training requires stronger pixel anchor
+    weight_pixel: float = 0.50      # FIXED: Increased from 0.25 to 0.50 for better quality anchor
     weight_perceptual: float = 0.0  # DISABLED - not in original paper, causes blur
     weight_gan: float = 0.0         # DISABLED - original uses OCR-as-discriminator
     weight_ocr: float = 0.0         # DISABLED - replaced by LCOFL classification
     weight_geometry: float = 0.0    # DISABLED - simplify
-    
+
     # LCOFL Loss (from Nascimento et al. "Enhancing LP Super-Resolution" paper)
     # PRIMARY LOSS - following original paper configuration exactly
-    # loss_weight: 0.75 from cgnetV2_deformable.yaml
+    # FIXED: Reduced weight and added curriculum to prevent sudden gradient conflict
     use_lcofl: bool = True     # Enable LCOFL loss (PRIMARY)
-    weight_lcofl: float = 0.75 # ORIGINAL paper value - this is the main loss!
-    weight_ssim: float = 0.1   # Part of LCOFL dissimilarity (original paper uses this)
+    weight_lcofl: float = 0.25 # FIXED: Reduced from 0.75 to 0.25 to prevent domination
+    weight_ssim: float = 0.05   # FIXED: Reduced from 0.1 to 0.05 for less smoothing
     lcofl_alpha: float = 1.0   # Penalty increment for confused character pairs
     lcofl_beta: float = 2.0    # Layout violation penalty
     use_frozen_ocr_for_lcofl: bool = True  # Use frozen OCR copy for classification
@@ -214,8 +215,8 @@ class TrainingConfig:
     
     # Total Variation Loss for suppressing wavy/checkerboard artifacts
     # Recommended: 1e-5 to 1e-4 for subtle smoothing without blur
-    # Note: High TV causes oversmoothing and "round" characters - keep low
-    weight_tv: float = 1e-5  # Reduced from 2e-4 to prevent character smoothing
+    # FIXED: Reduced to prevent character oversmoothing and edge blurring
+    weight_tv: float = 5e-6  # FIXED: Reduced from 1e-5 to 5e-6 for sharper characters
     
     # Shared Attention and Deformable Convolutions (from same paper)
     use_shared_attention: bool = True  # Enable shared attention module
