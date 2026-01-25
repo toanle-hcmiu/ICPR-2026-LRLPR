@@ -184,27 +184,24 @@ class TrainingConfig:
     epochs_restoration: int = 500
     epochs_finetune: int = 500  # Increased from 100 for better convergence
     
-    # Loss weights - Following Real-ESRGAN ratios for stable GAN training
+    # Loss weights - Following Real-ESRGAN ratios for stable training
     # Real-ESRGAN uses L1:Perceptual:GAN = 1:1:0.1
-    # Reference: "Real-ESRGAN: Training Real-World Blind Super-Resolution" (Wang et al.)
-    weight_pixel: float = 1.0       # L1 reconstruction (primary anchor)
-    weight_perceptual: float = 0.5  # Reduced from 1.0 - high perceptual causes mode collapse
+    # Key insight: Pixel loss should DOMINATE, OCR is secondary guidance
+    weight_pixel: float = 1.0       # L1 reconstruction (primary - must dominate)
+    weight_perceptual: float = 0.1  # REDUCED from 0.5 - high perceptual causes averaging/blur
     weight_gan: float = 0.0         # DISABLED - Original LCOFL paper uses OCR-only discriminator
     weight_ocr: float = 0.0         # DISABLED - replaced by LCOFL classification
     weight_geometry: float = 0.1
     
     # LCOFL Loss (from Nascimento et al. "Enhancing LP Super-Resolution" paper)
-    # Following original paper configuration:
-    # - loss_weight: 0.75 (from cgnetV2_deformable.yaml)
-    # - Classification active from start (no curriculum)
-    # - SSIM window_size: 5 (smaller for license plates)
+    # MODIFIED: Reduced weights to prevent dominating pixel loss (prevents blur)
     use_lcofl: bool = True     # Enable LCOFL loss
-    weight_lcofl: float = 0.75 # Original paper: 0.75
-    weight_ssim: float = 0.1   # Reduced from 0.3 - high SSIM causes averaging
+    weight_lcofl: float = 0.2  # REDUCED from 0.75 - was overpowering pixel loss!
+    weight_ssim: float = 0.05  # REDUCED from 0.1 - SSIM causes averaging
     lcofl_alpha: float = 1.0   # Penalty increment for confused character pairs
     lcofl_beta: float = 2.0    # Layout violation penalty
-    use_frozen_ocr_for_lcofl: bool = True  # Use frozen OCR copy for classification (prevents mode collapse)
-    weight_edge: float = 0.5   # Edge-weighted loss for sharper character boundaries
+    use_frozen_ocr_for_lcofl: bool = True  # Use frozen OCR copy for classification
+    weight_edge: float = 0.3   # REDUCED from 0.5 - helps edges but secondary to pixel
     
     # PARSeq Feature Loss (L1 on encoder features - bypasses decoder/LM)
     # This replaces CE-based classification with feature matching
@@ -231,15 +228,13 @@ class TrainingConfig:
     ocr_confidence_mode: str = 'mean'  # 'mean', 'min', or 'product'
     
     # Stage 3 Anti-Collapse Parameters
-    # These prevent OCR gradients from dominating and causing visual quality degradation
-    # Problem: Stage 2 output is already good, Stage 3 over-optimizes for OCR confidence
-    # Solution: Anchor to Stage 2 + delay OCR influence + use hinge constraint
-    # Note: PARSeq is now trainable in Stage 3, with dropout disabled for stable gradients
-    stage3_sr_anchor_weight: float = 1.0      # Weight for SR anchoring to Stage 2 output
-    stage3_ocr_warmup_steps: int = 6000       # Steps before OCR loss starts ramping (increased for stability)
-    stage3_ocr_ramp_steps: int = 6000         # Steps to ramp OCR from 0 to max weight (slower ramp)
-    stage3_ocr_max_weight: float = 0.5        # Increased OCR weight to force character training
-    stage3_use_ocr_hinge: bool = False        # TEMPORARILY DISABLED: Test if hinge blocks gradients
+    # CRITICAL FIX: SR anchor was 1.0 which locked output to blurry Stage 2!
+    # Reduced to 0.1 to allow improvement while maintaining structure
+    stage3_sr_anchor_weight: float = 0.1      # REDUCED from 1.0 - was locking to blur!
+    stage3_ocr_warmup_steps: int = 6000       # Steps before OCR loss starts ramping
+    stage3_ocr_ramp_steps: int = 6000         # Steps to ramp OCR from 0 to max weight
+    stage3_ocr_max_weight: float = 0.3        # REDUCED from 0.5 - let pixel dominate
+    stage3_use_ocr_hinge: bool = False        # Disabled - simplify loss landscape
     
     # Optimizer
     optimizer: str = 'adamw'
