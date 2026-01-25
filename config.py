@@ -206,6 +206,14 @@ class TrainingConfig:
     use_frozen_ocr_for_lcofl: bool = True  # Use frozen OCR copy for classification (prevents mode collapse)
     weight_edge: float = 0.5   # Edge-weighted loss for sharper character boundaries
     
+    # PARSeq Feature Loss (L1 on encoder features - bypasses decoder/LM)
+    # This replaces CE-based classification with feature matching
+    use_parseq_feature_loss: bool = True   # Enable PARSeq feature loss
+    weight_parseq_feature: float = 1e-3    # Max OCR weight (after warmup)
+    parseq_feature_warmup_steps: int = 5000  # Steps to reach max weight
+    parseq_feature_pixel_threshold: float = 0.5  # Disable OCR when pixel loss > this
+    generator_grad_clip: float = 0.5       # Gradient clip for generator (stabilization)
+    
     # Total Variation Loss for suppressing wavy/checkerboard artifacts
     # Recommended: 1e-5 to 1e-4 for subtle smoothing without blur
     # Note: High TV causes oversmoothing and "round" characters - keep low

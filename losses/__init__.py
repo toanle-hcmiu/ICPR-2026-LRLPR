@@ -21,6 +21,11 @@ from .ocr_discriminator import (
     RecognitionGuidedLoss,
     create_ocr_discriminator,
 )
+from .parseq_feature_loss import (
+    PARSeqAdapter,
+    PARSeqFeatureLoss,
+    GatedPARSeqFeatureLoss,
+)
 
 __all__ = [
     'CornerLoss',
@@ -43,6 +48,10 @@ __all__ = [
     'OCRDiscriminatorLoss',
     'RecognitionGuidedLoss',
     'create_ocr_discriminator',
+    # PARSeq Feature Loss
+    'PARSeqAdapter',
+    'PARSeqFeatureLoss',
+    'GatedPARSeqFeatureLoss',
 ]
 
 

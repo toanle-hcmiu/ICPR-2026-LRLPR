@@ -39,6 +39,7 @@ from models import NeuroSymbolicLPR, PatchDiscriminator
 from losses import CompositeLoss, CornerLoss, GANLoss, ConfusionMatrixTracker
 from losses.composite_loss import StagedTrainingManager
 from losses.ocr_discriminator import create_ocr_discriminator, OCRDiscriminatorLoss
+from losses.parseq_feature_loss import GatedPARSeqFeatureLoss
 from data import RodoSolDataset, SyntheticLPRDataset, LPRAugmentation, lpr_collate_fn
 
 
@@ -417,7 +418,8 @@ def train_epoch(
     ocr_discriminator_loss: Optional['OCRDiscriminatorLoss'] = None,
     model_stage2: Optional[nn.Module] = None,  # Stage 2 model for anchor generation
     config: Optional[Config] = None,           # For Stage 3 parameters
-    frozen_ocr: Optional[nn.Module] = None     # Frozen OCR for LCOFL classification
+    frozen_ocr: Optional[nn.Module] = None,    # Frozen OCR for LCOFL classification
+    parseq_feature_loss: Optional['GatedPARSeqFeatureLoss'] = None  # PARSeq feature loss
 ) -> Dict[str, float]:
     """
     Train for one epoch with optional mixed precision.
@@ -532,14 +534,15 @@ def train_epoch(
             # FROZEN OCR FOR LCOFL (Mode Collapse Prevention)
             # ================================================================
             # Compute logits through frozen OCR for LCOFL classification loss.
-            # This prevents generator from learning "adversarial" features that
-            # fool the trainable recognizer, forcing visually clear characters.
+            # The frozen OCR has requires_grad=False on all parameters, but we
+            # DO NOT use torch.no_grad() or .detach() because gradients must
+            # flow back through the frozen OCR's computation graph to the
+            # generator's hr_image output. This is the key fix for mode collapse.
             # ================================================================
             if frozen_ocr is not None and 'hr_image' in outputs:
-                with torch.no_grad():
-                    hr_for_frozen = outputs['hr_image'].detach()
-                    frozen_logits = frozen_ocr(hr_for_frozen)  # (B, L, V)
-                    outputs['frozen_logits'] = frozen_logits
+                # Forward through frozen OCR without detaching - gradients flow to generator
+                frozen_logits = frozen_ocr(outputs['hr_image'])  # (B, L, V)
+                outputs['frozen_logits'] = frozen_logits
             
             # Validate generator output isn't producing extreme values
             # This catches cases where the generator is collapsing before it causes NaN
@@ -648,6 +651,31 @@ def train_epoch(
                 loss_dict['ocr_guidance'] = 0.0
                 loss_dict['ocr_fake_conf'] = 0.0
                 loss_dict['ocr_real_conf'] = 0.0
+        
+        # =================================================================
+        # PARSeq FEATURE LOSS (L1 on encoder features - Stage 3)
+        # =================================================================
+        # Compute L1 loss on PARSeq encoder features with gating and warmup.
+        # This bypasses the decoder/LM for smoother OCR-aware gradients.
+        # =================================================================
+        if parseq_feature_loss is not None and 'hr_image' in outputs and 'hr_image' in targets:
+            # Get current pixel loss for gating
+            pixel_loss_val = loss_dict.get('pixel', 0.0)
+            
+            # Compute feature loss (includes warmup and gating internally)
+            l_parseq = parseq_feature_loss(
+                sr_image=outputs['hr_image'],
+                gt_image=targets['hr_image'],
+                pixel_loss=pixel_loss_val
+            )
+            
+            if not check_for_nan(l_parseq, "parseq_feature"):
+                loss_g = loss_g + l_parseq
+                loss_dict['parseq_feature'] = l_parseq.item() if hasattr(l_parseq, 'item') else l_parseq
+                loss_dict['parseq_weight'] = parseq_feature_loss.get_current_weight(pixel_loss_val)
+            
+            # Increment step counter for warmup
+            parseq_feature_loss.step()
         
         # Check for NaN loss and skip batch if detected
         if check_for_nan(loss_g, "loss_g"):
@@ -1473,8 +1501,30 @@ def train_stage(
             logger.info("  Created frozen OCR copy for LCOFL classification (mode collapse prevention)")
         else:
             frozen_ocr = None
+        
+        # =================================================================
+        # PARSeq FEATURE LOSS (L1 on encoder features - bypasses CE)
+        # =================================================================
+        # Create frozen PARSeq for feature extraction. This uses L1 loss
+        # on encoder features instead of CE loss, providing smoother gradients.
+        # =================================================================
+        if getattr(config.training, 'use_parseq_feature_loss', False):
+            parseq_feature_loss = GatedPARSeqFeatureLoss(
+                parseq_model=model.recognizer,
+                max_weight=getattr(config.training, 'weight_parseq_feature', 1e-3),
+                warmup_steps=getattr(config.training, 'parseq_feature_warmup_steps', 5000),
+                pixel_threshold=getattr(config.training, 'parseq_feature_pixel_threshold', 0.5)
+            )
+            parseq_feature_loss = parseq_feature_loss.to(device)
+            logger.info("  Created PARSeq feature loss (L1 on encoder features)")
+            logger.info(f"    Max weight: {getattr(config.training, 'weight_parseq_feature', 1e-3)}")
+            logger.info(f"    Warmup steps: {getattr(config.training, 'parseq_feature_warmup_steps', 5000)}")
+            logger.info(f"    Pixel threshold: {getattr(config.training, 'parseq_feature_pixel_threshold', 0.5)}")
+        else:
+            parseq_feature_loss = None
     else:
         frozen_ocr = None
+        parseq_feature_loss = None
     
     optimizer_d = None
     
@@ -1564,7 +1614,8 @@ def train_stage(
             optimizer_g, optimizer_d, device, epoch, stage, writer, logger,
             scaler_g=scaler_g, scaler_d=scaler_d, ema=ema, grad_clip_norm=grad_clip_norm,
             total_epochs=num_epochs, ocr_discriminator_loss=ocr_discriminator_loss,
-            model_stage2=model_stage2, config=config, frozen_ocr=frozen_ocr
+            model_stage2=model_stage2, config=config, frozen_ocr=frozen_ocr,
+            parseq_feature_loss=parseq_feature_loss
         )
         
         # Log training losses
