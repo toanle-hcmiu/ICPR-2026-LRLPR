@@ -83,7 +83,7 @@ class NeuroSymbolicLPR(nn.Module):
         # Syntax mask configuration
         soft_mask_value: float = -100.0,
         soft_inference: bool = False,  # Use soft constraints during inference
-        soft_inference_value: float = -50.0
+        soft_inference_value: float = -50.0,
 
         # Character Refiner configuration (Two-Stage Solution for Mode Collapse)
         use_refiner: bool = False,
