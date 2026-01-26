@@ -191,7 +191,7 @@ class TrainingConfig:
     weight_pixel: float = 0.50      # FIXED: Increased from 0.25 to 0.50 for better quality anchor
     weight_perceptual: float = 0.0  # DISABLED - not in original paper, causes blur
     weight_gan: float = 0.0         # DISABLED - original uses OCR-as-discriminator
-    weight_ocr: float = 0.05        # Re-enabled alongside LCOFL - provides direct character recognition signal
+    weight_ocr: float = 0.2         # Increased for stronger character guidance (0.05 was too weak)
     weight_geometry: float = 0.0    # DISABLED - simplify
 
     # LCOFL Loss (from Nascimento et al. "Enhancing LP Super-Resolution" paper)
@@ -212,7 +212,7 @@ class TrainingConfig:
     weight_ssim: float = 0.05   # SSIM for structural similarity
     lcofl_alpha: float = 1.0   # Penalty increment for confused character pairs
     lcofl_beta: float = 2.0    # Layout violation penalty
-    use_frozen_ocr_for_lcofl: bool = True  # Use frozen OCR copy for classification
+    use_frozen_ocr_for_lcofl: bool = False  # DISABLED: Use trainable OCR only (simplifies training, removes confusing signals)
     weight_edge: float = 0.0   # DISABLED - not in original paper
     
     # PARSeq Feature Loss - DISABLED (not in original paper)
@@ -246,7 +246,26 @@ class TrainingConfig:
     stage3_ocr_ramp_steps: int = 0            # No ramp
     stage3_ocr_max_weight: float = 0.0        # Handled by LCOFL directly
     stage3_use_ocr_hinge: bool = False        # Disabled
-    
+
+    # Character Refiner - Two-Stage Solution for Mode Collapse (2026-01-27)
+    # Problem: Direct OCR supervision on generator causes mode collapse
+    # Solution: Keep Stage 2 generator fixed, train separate refiner with OCR loss
+    use_refiner: bool = True                  # Enable character refiner (fixes mode collapse)
+    refiner_num_blocks: int = 3              # Number of residual blocks (lightweight)
+    refiner_channels: int = 3                # RGB channels
+    refiner_use_dropout: bool = True         # Dropout for regularization
+    refiner_use_attention: bool = False      # Experimental: attention for character focus
+    refiner_use_checkpointing: bool = False  # Gradient checkpointing for memory efficiency
+    refiner_lr: float = 1e-4                 # Higher LR than generator (refiner learns faster)
+    refiner_epochs: int = 10                  # Training epochs for refiner
+    refiner_warmup_epochs: int = 2            # Warmup epochs before full OCR loss
+    # Refiner loss weights (OCR only - no pixel loss to prevent blurring)
+    weight_refiner_ocr: float = 1.0          # Main loss: OCR cross-entropy
+    weight_refiner_perceptual: float = 0.05  # Optional: perceptual loss for structure
+    weight_refiner_pixel: float = 0.001      # Minimal pixel loss to preserve Stage 2 output
+    # Generator is frozen during refiner training
+    refiner_freeze_generator: bool = True     # Freeze Stage 2 generator (CRITICAL for no mode collapse)
+
     # Optimizer
     optimizer: str = 'adamw'
     weight_decay: float = 0.01

@@ -303,6 +303,7 @@ def create_optimizer(
         'stn': config.training.lr_stn,
         'parseq_warmup': config.training.lr_parseq_warmup,
         'restoration': config.training.lr_restoration,
+        'refiner': config.training.refiner_lr,  # Two-Stage Solution: Refiner LR (2026-01-27)
         'full': config.training.lr_finetune
     }.get(stage, 1e-4)
     
@@ -575,6 +576,10 @@ def train_epoch(
                 loss_g, loss_dict = criterion.get_stage_loss('stn', outputs, targets)
             elif stage == 'restoration':
                 loss_g, loss_dict = criterion.get_stage_loss('restoration', outputs, targets, current_discriminator)
+            elif stage == 'refiner':
+                # Refiner Stage: Two-Stage Solution for Mode Collapse (2026-01-27)
+                # Only OCR loss on refined output - generator is frozen
+                loss_g, loss_dict = criterion.get_stage_loss('refiner', outputs, targets, None)
             else:
                 # Stage 3 ('full'): Use anti-collapse loss with OCR warmup
                 # Compute global_step for OCR warmup scheduling
@@ -1091,6 +1096,9 @@ def validate(
                 _, loss_dict = criterion.get_stage_loss('stn', outputs, targets)
             elif stage == 'restoration':
                 _, loss_dict = criterion.get_stage_loss('restoration', outputs, targets)
+            elif stage == 'refiner':
+                # Refiner Stage: Two-Stage Solution for Mode Collapse (2026-01-27)
+                _, loss_dict = criterion.get_stage_loss('refiner', outputs, targets)
             else:
                 _, loss_dict = criterion(outputs, targets)
             
@@ -1404,6 +1412,10 @@ def train_stage(
         weight_ssim=config.training.weight_ssim if config.training.use_lcofl else 0.0,
         weight_tv=config.training.weight_tv,  # Total Variation for wavy artifact suppression
         weight_edge=getattr(config.training, 'weight_edge', 0.0),  # Edge loss for sharper characters
+        # Refiner weights - Two-Stage Solution for Mode Collapse (2026-01-27)
+        weight_refiner_ocr=config.training.weight_refiner_ocr,
+        weight_refiner_perceptual=config.training.weight_refiner_perceptual,
+        weight_refiner_pixel=config.training.weight_refiner_pixel,
         use_perceptual=True,  # Enable perceptual loss for sharper images
         use_lcofl=config.training.use_lcofl,
         lcofl_alpha=config.training.lcofl_alpha,
@@ -1602,9 +1614,10 @@ def train_stage(
             # CRITICAL: OCR loss provides direct character recognition signal that LCOFL alone cannot
             # LCOFL focuses on confusion/layout, not specific character prediction
             if epoch < 3:
-                ocr_curriculum_weight = 0.0  # Pixel-only warmup
+                ocr_curriculum_weight = 0.0  # Pixel-only warmup (epochs 0-2)
             elif epoch < 10:
-                ocr_curriculum_weight = config.training.weight_ocr * ((epoch - 3) / 7.0)
+                # Ramp from epoch 3 to epoch 9: (epoch-2) starts at 1, reaches 7 at epoch 9
+                ocr_curriculum_weight = config.training.weight_ocr * ((epoch - 2) / 7.0)
             else:
                 ocr_curriculum_weight = config.training.weight_ocr
             criterion.weights['ocr'] = ocr_curriculum_weight
@@ -2278,16 +2291,23 @@ def main():
             ('stn', config.training.epochs_stn),
             ('parseq_warmup', config.training.epochs_parseq_warmup),
             ('restoration', config.training.epochs_restoration),
+            ('refiner', config.training.refiner_epochs) if config.training.use_refiner else (),
             ('full', config.training.epochs_finetune)
         ]
+        # Filter out empty tuples if refiner is disabled
+        stages = [s for s in stages if s]
     else:
         stage_map = {
             '0': ('pretrain', config.training.epochs_pretrain),
             '1': ('stn', config.training.epochs_stn),
             '1.5': ('parseq_warmup', config.training.epochs_parseq_warmup),
             '2': ('restoration', config.training.epochs_restoration),
+            '2.5': ('refiner', config.training.refiner_epochs) if config.training.use_refiner else None,
             '3': ('full', config.training.epochs_finetune)
         }
+        # Handle case where refiner is disabled
+        if args.stage == '2.5' and stage_map['2.5'] is None:
+            raise ValueError("Refiner stage (2.5) requested but use_refiner=False in config")
         stages = [stage_map[args.stage]]
     
     # Train each stage
@@ -2304,13 +2324,22 @@ def main():
         elif stage_name == 'restoration':
             model.freeze_stn()
             model.freeze_recognizer()
+        elif stage_name == 'refiner':
+            # Refiner Stage: Two-Stage Solution for Mode Collapse (2026-01-27)
+            # CRITICAL: Generator MUST stay frozen to prevent mode collapse
+            # Only train the lightweight refiner network with OCR loss
+            model.freeze_stn()
+            model.freeze_recognizer()
+            model.freeze_generator()  # Freeze Stage 2 generator
+            model.unfreeze_refiner()  # Only refiner is trainable
+            logger.info("  Refiner Stage: Generator frozen, only refiner trainable")
         else:  # full
             model.unfreeze_stn()
             # Stage 3: Train recognizer end-to-end with SR
             # PARSeq stays in eval mode (dropout off) to stabilize gradients
             # while still allowing weight updates via requires_grad=True
             model.unfreeze_recognizer()
-            
+
             # Force recognizer to be trainable (checkpoint may have restored frozen state)
             # Ensure all recognizer parameters have requires_grad=True
             recognizer_params = list(model.recognizer.parameters())
@@ -2324,6 +2353,7 @@ def main():
             'stn': config.training.batch_size_stn,
             'parseq_warmup': config.training.batch_size_parseq_warmup,
             'restoration': config.training.batch_size_restoration,
+            'refiner': config.training.batch_size_restoration,  # Use same batch size as restoration
             'full': config.training.batch_size_finetune
         }
         batch_size = batch_size_map.get(stage_name, config.training.batch_size_finetune)

@@ -20,6 +20,8 @@ from .shared_attention import (
     create_shared_attention_network,
 )
 from .blur_pool import BlurPool2d, MaxBlurPool2d, AntiAliasedConv2d
+# Character Refiner - Two-Stage Solution for Mode Collapse (2026-01-27)
+from .refiner import CharacterRefiner, RefinerResBlock, create_refiner, RefinerWithCheckpoint
 
 __all__ = [
     'NeuroSymbolicLPR',
@@ -55,5 +57,10 @@ __all__ = [
     'BlurPool2d',
     'MaxBlurPool2d',
     'AntiAliasedConv2d',
+    # Character Refiner - Two-Stage Solution for Mode Collapse (2026-01-27)
+    'CharacterRefiner',
+    'RefinerResBlock',
+    'create_refiner',
+    'RefinerWithCheckpoint',
 ]
 

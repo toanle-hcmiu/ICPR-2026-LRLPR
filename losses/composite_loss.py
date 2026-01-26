@@ -472,6 +472,10 @@ class CompositeLoss(nn.Module):
         weight_ssim: float = 0.0,
         weight_tv: float = 0.0,  # Total Variation loss weight for wavy artifact suppression
         weight_edge: float = 0.0,  # Edge loss weight for sharper character boundaries
+        # Refiner weights - Two-Stage Solution for Mode Collapse (2026-01-27)
+        weight_refiner_ocr: float = 1.0,  # Primary refiner loss: OCR cross-entropy
+        weight_refiner_perceptual: float = 0.05,  # Optional: perceptual loss for structure
+        weight_refiner_pixel: float = 0.001,  # Minimal pixel loss to preserve Stage 2 output
         gan_mode: str = 'vanilla',
         ocr_loss_type: str = 'cross_entropy',
         use_perceptual: bool = False,
@@ -481,7 +485,7 @@ class CompositeLoss(nn.Module):
     ):
         """
         Initialize composite loss.
-        
+
         Args:
             weight_pixel: Weight for pixel loss.
             weight_gan: Weight for GAN loss.
@@ -492,6 +496,9 @@ class CompositeLoss(nn.Module):
             weight_lcofl: Weight for LCOFL loss (0 to disable).
             weight_ssim: Weight for SSIM loss (0 to disable).
             weight_tv: Weight for Total Variation loss (0 to disable, 1e-5 recommended for wavy suppression).
+            weight_refiner_ocr: Weight for refiner OCR loss (primary refiner loss).
+            weight_refiner_perceptual: Weight for refiner perceptual loss (optional).
+            weight_refiner_pixel: Weight for refiner pixel loss (minimal, for structure preservation).
             gan_mode: Type of GAN loss.
             ocr_loss_type: Type of OCR loss.
             use_perceptual: Whether to use perceptual loss.
@@ -500,7 +507,7 @@ class CompositeLoss(nn.Module):
             lcofl_beta: LCOFL layout violation penalty.
         """
         super().__init__()
-        
+
         self.weights = {
             'pixel': weight_pixel,
             'gan': weight_gan,
@@ -511,7 +518,11 @@ class CompositeLoss(nn.Module):
             'lcofl': weight_lcofl,
             'ssim': weight_ssim,
             'tv': weight_tv,  # Total Variation for wavy artifact suppression
-            'edge': weight_edge  # Edge loss for sharper characters
+            'edge': weight_edge,  # Edge loss for sharper characters
+            # Refiner weights - Two-Stage Solution (2026-01-27)
+            'refiner_ocr': weight_refiner_ocr,
+            'refiner_perceptual': weight_refiner_perceptual,
+            'refiner_pixel': weight_refiner_pixel
         }
         
         # Individual losses
@@ -955,10 +966,71 @@ class CompositeLoss(nn.Module):
             
             # Final clamp
             total_loss = self._clamp_loss(total_loss, max_val=100.0)
-            
+
             loss_dict['total'] = self._safe_loss_item(total_loss)
             return total_loss, loss_dict
-        
+
+        elif stage == 'refiner':
+            # Refiner Stage: Two-Stage Solution for Mode Collapse (2026-01-27)
+            # Only OCR loss on refined output - generator is frozen
+            # No pixel loss to prevent blurring
+            loss_dict = {}
+            total_loss = None
+
+            # Use refined output if available, otherwise fall back to regular hr_image
+            hr_output = outputs.get('hr_image_refined', outputs.get('hr_image'))
+
+            # OCR loss on refined output - primary loss for refiner
+            if 'masked_logits' in outputs and 'text_indices' in targets:
+                logits = outputs['masked_logits']
+                text_targets = targets['text_indices']
+
+                if not (torch.isnan(logits).any() or torch.isnan(text_targets.float()).any()):
+                    l_ocr = self.ocr_loss(logits, text_targets)
+                    l_ocr = self._clamp_loss(l_ocr)
+                    loss_dict['ocr'] = self._safe_loss_item(l_ocr)
+
+                    # Use refiner OCR weight (default: 1.0 - primary loss)
+                    refiner_ocr_weight = self.weights.get('refiner_ocr', 1.0)
+                    weighted = refiner_ocr_weight * l_ocr
+                    total_loss = weighted if total_loss is None else total_loss + weighted
+
+            # Optional: Minimal pixel loss to preserve Stage 2 structure
+            # Use refined output if available, otherwise fall back to regular hr_image
+            if hr_output is not None and 'hr_image' in targets:
+                refiner_pixel_weight = self.weights.get('refiner_pixel', 0.001)
+                if refiner_pixel_weight > 0:
+                    if not (torch.isnan(hr_output).any() or torch.isnan(targets['hr_image']).any()):
+                        l_pixel = self.pixel_loss(hr_output, targets['hr_image'])
+                        l_pixel = self._clamp_loss(l_pixel)
+                        loss_dict['pixel'] = self._safe_loss_item(l_pixel)
+                        weighted = refiner_pixel_weight * l_pixel
+                        total_loss = weighted if total_loss is None else total_loss + weighted
+
+            # Optional: Perceptual loss for structure preservation
+            if self.perceptual_loss is not None and hr_output is not None and 'hr_image' in targets:
+                refiner_perceptual_weight = self.weights.get('refiner_perceptual', 0.05)
+                if refiner_perceptual_weight > 0:
+                    if not (torch.isnan(hr_output).any() or torch.isnan(targets['hr_image']).any()):
+                        l_perceptual = self.perceptual_loss(hr_output, targets['hr_image'])
+                        l_perceptual = self._clamp_loss(l_perceptual)
+                        loss_dict['perceptual'] = self._safe_loss_item(l_perceptual)
+                        weighted = refiner_perceptual_weight * l_perceptual
+                        total_loss = weighted if total_loss is None else total_loss + weighted
+
+            # Ensure total_loss requires grad
+            if total_loss is not None and not total_loss.requires_grad:
+                if hr_output is not None:
+                    total_loss = total_loss + hr_output.sum() * 0.0
+                else:
+                    total_loss = total_loss.requires_grad_(True)
+
+            # Final clamp
+            total_loss = self._clamp_loss(total_loss, max_val=100.0)
+
+            loss_dict['total'] = self._safe_loss_item(total_loss)
+            return total_loss, loss_dict
+
         else:  # 'full' - Stage 3 with anti-collapse mechanisms
             return self.get_stage3_loss(
                 outputs, targets, discriminator,

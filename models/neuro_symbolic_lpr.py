@@ -84,6 +84,14 @@ class NeuroSymbolicLPR(nn.Module):
         soft_mask_value: float = -100.0,
         soft_inference: bool = False,  # Use soft constraints during inference
         soft_inference_value: float = -50.0
+
+        # Character Refiner configuration (Two-Stage Solution for Mode Collapse)
+        use_refiner: bool = False,
+        refiner_num_blocks: int = 3,
+        refiner_channels: int = 3,
+        refiner_use_dropout: bool = True,
+        refiner_use_attention: bool = False,
+        refiner_use_checkpointing: bool = False
     ):
         """
         Initialize the Neuro-Symbolic LPR system.
@@ -230,6 +238,27 @@ class NeuroSymbolicLPR(nn.Module):
             soft_inference=soft_inference,
             soft_inference_value=soft_inference_value
         )
+
+        # ==========================================
+        # Phase 5: Character Refiner (Optional)
+        # ==========================================
+        # Two-stage solution for mode collapse:
+        # - Stage 2 generator produces varied but somewhat blurry characters
+        # - Refiner sharpens characters without causing mode collapse
+        # - Refiner is trained separately with OCR loss only
+        self.use_refiner = use_refiner
+
+        if use_refiner:
+            from models.refiner import create_refiner
+            self.refiner = create_refiner(
+                num_blocks=refiner_num_blocks,
+                channels=refiner_channels,
+                use_dropout=refiner_use_dropout,
+                use_attention=refiner_use_attention,
+                use_checkpointing=refiner_use_checkpointing
+            )
+        else:
+            self.refiner = None
     
     def forward(
         self,
@@ -334,16 +363,36 @@ class NeuroSymbolicLPR(nn.Module):
         hr_image = self.generator(lr_image)  # (B, C, HR_H, HR_W)
         outputs['hr_image'] = hr_image
         outputs['lr_image'] = lr_image
+
+        # ==========================================
+        # Phase 5: Character Refinement (Optional)
+        # ==========================================
+        # Apply refiner to sharpen characters (only if enabled)
+        # This is done AFTER generator but BEFORE recognition
+        # The refiner learns to make characters more OCR-readable
+        if self.use_refiner and self.refiner is not None:
+            hr_image = self.refiner(hr_image)
+            outputs['hr_image_refined'] = hr_image  # Track refined version
+        else:
+            outputs['hr_image_refined'] = hr_image  # Same as generator output
         
         # ==========================================
         # Phase 4: Recognition with Syntax Mask
         # ==========================================
-        
+
+        # CRITICAL: Ensure recognizer is in train mode during training
+        # Pretrained PARSeq may have internal state that affects gradient flow
+        if self.training and not self.recognizer.training:
+            self.recognizer.train()
+
+        # Use refined HR image for recognition (if refiner is enabled)
+        recognition_image = hr_image  # This is either generator output or refined output
+
         # Get raw logits from recognizer
         if targets is not None:
-            raw_logits = self.recognizer(hr_image, targets)
+            raw_logits = self.recognizer(recognition_image, targets)
         else:
-            raw_logits = self.recognizer.forward_parallel(hr_image)
+            raw_logits = self.recognizer.forward_parallel(recognition_image)
         
         outputs['raw_logits'] = raw_logits
         
@@ -430,18 +479,48 @@ class NeuroSymbolicLPR(nn.Module):
         # Leave recognizer trainable
         for param in self.recognizer.parameters():
             param.requires_grad = True
-    
-    def get_trainable_params(self, stage: str) -> list:
+
+    def freeze_generator(self):
+        """
+        Freeze the Stage 2 generator (SwinIR) weights.
+
+        Used during refiner training to prevent mode collapse.
+        The generator stays fixed at Stage 2 quality while refiner learns character correction.
+        """
+        for param in self.generator.parameters():
+            param.requires_grad = False
+        for param in self.feature_to_image.parameters():
+            param.requires_grad = False
+        for param in self.layout_classifier.parameters():
+            param.requires_grad = False
+        for param in self.quality_fusion.parameters():
+            param.requires_grad = False
+
+    def unfreeze_refiner(self):
+        """
+        Unfreeze the character refiner weights.
+
+        Used during refiner training to enable character correction learning.
+        """
+        if self.use_refiner and self.refiner is not None:
+            for param in self.refiner.parameters():
+                param.requires_grad = True
+        else:
+            raise ValueError("Refiner is not enabled. Set use_refiner=True in model config.")
+
+    def get_trainable_params(self, stage: str, freeze_generator: bool = False) -> list:
         """
         Get trainable parameters for a specific training stage.
-        
+
         Args:
             stage: Training stage name.
                 'pretrain': Only recognizer parameters (OCR pre-training)
                 'stn': Only STN parameters
                 'restoration': Generator and layout classifier
                 'full': All parameters
-                
+                'refiner': Only refiner parameters (generator frozen)
+            freeze_generator: If True, freeze generator parameters (for refiner training)
+
         Returns:
             List of parameter groups.
         """
@@ -467,18 +546,42 @@ class NeuroSymbolicLPR(nn.Module):
                 {'params': self.feature_to_image.parameters()},
                 {'params': self.recognizer.parameters(), 'lr_scale': 0.5},  # Joint OCR training
             ]
+        elif stage == 'refiner':
+            # Two-Stage Solution: Train ONLY refiner, keep generator frozen
+            # This prevents mode collapse while allowing character correction
+            if self.use_refiner and self.refiner is not None:
+                return [
+                    {'params': self.refiner.parameters(), 'name': 'refiner', 'lr': 1e-4}
+                ]
+            else:
+                raise ValueError("Refiner is not enabled. Set use_refiner=True in model config.")
         elif stage == 'full':
-            # Stage 3: End-to-end fine-tuning with lower LR for pretrained components
-            # lr_scale=0.1 means PARSeq uses lr_finetune*0.1 = lr_parseq_finetune
-            return [
+            # Stage 3: End-to-end fine-tuning with proper LR for all components
+            # CRITICAL FIX: Changed recognizer lr_scale from 0.1 to 1.0
+            # Previous lr_scale=0.1 made effective LR = 1e-6, preventing recognizer from learning
+            # Now lr_scale=1.0 gives recognizer LR = 1e-5, same as generator
+
+            params = [
                 {'params': self.encoder.parameters(), 'lr_scale': 0.1, 'name': 'encoder'},
                 {'params': self.stn.parameters(), 'lr_scale': 0.1, 'name': 'stn'},
                 {'params': self.layout_classifier.parameters(), 'name': 'layout'},
                 {'params': self.quality_fusion.parameters(), 'name': 'fusion'},
                 {'params': self.feature_to_image.parameters(), 'name': 'feat_to_img'},
                 {'params': self.generator.parameters(), 'name': 'generator'},
-                {'params': self.recognizer.parameters(), 'lr_scale': 0.1, 'name': 'recognizer'}
+                {'params': self.recognizer.parameters(), 'lr_scale': 1.0, 'name': 'recognizer'}
             ]
+
+            # Optionally add refiner if enabled
+            if self.use_refiner and self.refiner is not None:
+                params.append(
+                    {'params': self.refiner.parameters(), 'name': 'refiner', 'lr': 1e-4}
+                )
+
+            # Optionally freeze generator if requested (for refiner training)
+            if freeze_generator:
+                params = [p for p in params if p.get('name') != 'generator']
+
+            return params
         else:
             raise ValueError(f"Unknown training stage: {stage}")
 
