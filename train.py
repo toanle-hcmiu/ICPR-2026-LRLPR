@@ -2075,21 +2075,30 @@ def main():
     # Setup device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logger.info(f"Using device: {device}")
-    
+
     # Create model
-    # With optional shared attention and deformable convolutions
+    # With optional shared attention, deformable convolutions, and refiner
     model = NeuroSymbolicLPR(
         num_frames=config.model.num_frames,
         lr_size=(config.data.lr_height, config.data.lr_width),
         hr_size=(config.data.hr_height, config.data.hr_width),
         use_shared_attention=config.training.use_shared_attention,
         use_deformable_conv=config.training.use_deformable_conv,
+        # Character Refiner - Two-Stage Solution for Mode Collapse (2026-01-27)
+        use_refiner=config.training.use_refiner,
+        refiner_num_blocks=config.training.refiner_num_blocks,
+        refiner_channels=config.training.refiner_channels,
+        refiner_use_dropout=config.training.refiner_use_dropout,
+        refiner_use_attention=config.training.refiner_use_attention,
+        refiner_use_checkpointing=config.training.refiner_use_checkpointing,
     ).to(device)
-    
+
     if config.training.use_shared_attention:
         logger.info("Model using shared attention")
     if config.training.use_deformable_conv:
         logger.info("Model using deformable convolutions")
+    if config.training.use_refiner:
+        logger.info("Model using character refiner (Two-Stage Solution)")
     
     # Create discriminator
     discriminator = PatchDiscriminator(
