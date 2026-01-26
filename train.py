@@ -531,19 +531,24 @@ def train_epoch(
                 outputs = model(lr_frames, return_intermediates=True)
             
             # ================================================================
-            # FROZEN OCR FOR LCOFL (Mode Collapse Prevention)
+            # FROZEN OCR FOR LCOFL (Character-Aware SR Training)
             # ================================================================
             # Compute logits through frozen OCR for LCOFL classification loss.
-            # Use torch.no_grad() and .detach() to prevent gradient flow through
-            # frozen OCR. This eliminates gradient conflict between frozen OCR (Stage 2
-            # weights) and trainable OCR (Stage 3 learning) that was causing
-            # character collapse. LCOFL still provides character guidance via loss value.
+            # 
+            # CRITICAL: We must NOT use torch.no_grad() here! 
+            # The frozen OCR has requires_grad=False on all parameters, so OCR
+            # weights won't be updated. However, gradients MUST flow back to 
+            # hr_image so the SR generator can learn to produce OCR-readable images.
+            # 
+            # Using torch.no_grad() breaks the gradient chain entirely, making
+            # the LCOFL classification loss ineffective (no gradient to generator).
             # ================================================================
             if frozen_ocr is not None and 'hr_image' in outputs:
-                # Forward through frozen OCR with NO gradients - prevents adversarial gradient conflict
-                with torch.no_grad():
-                    frozen_logits = frozen_ocr(outputs['hr_image'])  # (B, L, V)
-                outputs['frozen_logits'] = frozen_logits.detach()
+                # Forward through frozen OCR WITH gradient flow to hr_image
+                # OCR weights are frozen (requires_grad=False), but input tensor
+                # (hr_image) will receive gradients for the generator to learn
+                frozen_logits = frozen_ocr(outputs['hr_image'])  # (B, L, V)
+                outputs['frozen_logits'] = frozen_logits  # Don't detach - need gradient flow!
             
             # Validate generator output isn't producing extreme values
             # This catches cases where the generator is collapsing before it causes NaN

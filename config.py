@@ -196,10 +196,20 @@ class TrainingConfig:
 
     # LCOFL Loss (from Nascimento et al. "Enhancing LP Super-Resolution" paper)
     # PRIMARY LOSS - following original paper configuration exactly
-    # FIXED: Reduced weight and added curriculum to prevent sudden gradient conflict
-    use_lcofl: bool = True     # Enable LCOFL loss (PRIMARY)
-    weight_lcofl: float = 0.25 # FIXED: Reduced from 0.75 to 0.25 to prevent domination
-    weight_ssim: float = 0.05   # FIXED: Reduced from 0.1 to 0.05 for less smoothing
+    # 
+    # CRITICAL SCALING FIX:
+    # - LCOFL classification CE loss is ~38 (high when predictions are wrong)
+    # - Pixel L1 loss is ~0.3 typical
+    # - With weight_lcofl=0.25: LCOFL contributes ~9.5, Pixel contributes ~0.15
+    # - This 60x imbalance caused the generator to ONLY optimize for OCR, ignoring pixel fidelity
+    # - Result: mode collapse to a single character pattern "AEE-9333" that minimizes OCR loss
+    # 
+    # NEW WEIGHTS:
+    # - weight_lcofl=0.005: LCOFL contributes ~0.19, Pixel contributes ~0.15 (balanced!)
+    # - This ensures generator produces images that are BOTH visually correct AND OCR-readable
+    use_lcofl: bool = True     # Enable LCOFL loss
+    weight_lcofl: float = 0.005  # FIXED: Reduced from 0.25 to 0.005 to balance with pixel loss
+    weight_ssim: float = 0.05   # SSIM for structural similarity
     lcofl_alpha: float = 1.0   # Penalty increment for confused character pairs
     lcofl_beta: float = 2.0    # Layout violation penalty
     use_frozen_ocr_for_lcofl: bool = True  # Use frozen OCR copy for classification

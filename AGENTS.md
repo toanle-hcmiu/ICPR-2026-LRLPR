@@ -280,66 +280,59 @@ stage3_ocr_max_weight: float = 0.5         # Max OCR loss weight
 weight_lcofl: float = 0.75                 # LCOFL weight (original paper)
 ```
 
-### 11. Stage 3 Character Collapse - CRITICAL FIX (2025-01-25)
+### 11. Stage 3 Mode Collapse - CRITICAL FIX (2025-01-25 v2)
 
-**Problem:** Stage 3 training causes character destruction/averaging despite Stage 2 producing good results with readable 7 characters and PARSeq pretrained >90% accuracy on HR.
+**Problem:** Stage 3 training causes ALL plates to predict the same characters (e.g., "AEE-9333") despite having different ground truth texts. Loss increases over time instead of decreasing.
 
-**Root Cause: Gradient Conflict Loss Imbalance (GCLI)**
-- Stage 3 uses TWO different OCR sources with conflicting gradients:
-  1. **Trainable OCR** (forward pass) - continues learning, representation drifts
-  2. **Frozen OCR** (for LCOFL loss) - stuck at Stage 2 weights, provides static gradients
-- Frozen OCR forward pass was NOT wrapped in `torch.no_grad()` or `.detach()`
-- Computation graph was tracked, allowing gradients to flow back through frozen OCR to generator
-- Trainable OCR's representation drifted from frozen OCR's static weights
-- Generator received **conflicting gradient fields** from two diverging OCRs
-- Impossible optimization → generator learned adversarial features → character collapse
+**Root Cause Analysis:**
+
+**Issue 1: No Gradient Flow to Generator**
+- Previous code used `torch.no_grad()` around frozen OCR forward pass
+- This completely broke the gradient chain - generator received ZERO gradient from LCOFL
+- Result: LCOFL classification loss was computed but had no effect on training
+
+**Issue 2: Massive Loss Imbalance (CRITICAL)**
+- LCOFL classification CE loss is typically ~38 when model makes wrong predictions
+- Pixel L1 loss is typically ~0.3
+- With `weight_lcofl=0.25`: LCOFL contributes ~9.5, Pixel contributes ~0.15
+- This 60x imbalance caused generator to ONLY optimize for OCR, ignoring pixel fidelity
+- Generator learned a "shortcut": produce a single character pattern that minimizes CE
 
 **Fixes Applied:**
 
-1. **Disable Frozen OCR Gradient Flow (CRITICAL)** - `train.py` lines 542-546:
+1. **Enable Gradient Flow to Generator (CRITICAL)** - `train.py` lines 533-551:
    ```python
-   # Wrapped frozen OCR forward in torch.no_grad() and added .detach()
-   with torch.no_grad():
+   # REMOVED torch.no_grad() - gradients must flow to generator
+   # OCR weights are frozen (requires_grad=False), so OCR won't be updated
+   # But hr_image will receive gradients for generator to learn OCR-readable images
+   if frozen_ocr is not None and 'hr_image' in outputs:
        frozen_logits = frozen_ocr(outputs['hr_image'])
-   outputs['frozen_logits'] = frozen_logits.detach()
+       outputs['frozen_logits'] = frozen_logits  # Don't detach!
    ```
-   - Eliminates gradient conflict between frozen and trainable OCR
-   - LCOFL still provides character guidance via loss value
-   - No adversarial gradient flow back through frozen OCR
 
-2. **Rebalance Loss Weights** - `config.py` lines 191, 201-202, 218:
+2. **Reduce LCOFL Weight Drastically** - `config.py` lines 197-213:
    ```python
-   # Increased pixel anchor, reduced LCOFL domination
-   weight_pixel = 0.50      # Increased from 0.25
-   weight_lcofl = 0.25       # Decreased from 0.75
-   weight_ssim = 0.05        # Decreased from 0.1
-   weight_tv = 5e-6            # Decreased from 1e-5
+   # Old: weight_lcofl = 0.25 → LCOFL ~9.5 vs Pixel ~0.15 (60x imbalance!)
+   # New: weight_lcofl = 0.005 → LCOFL ~0.19 vs Pixel ~0.15 (balanced)
+   weight_lcofl: float = 0.005  # CRITICAL: Reduced from 0.25 to 0.005
    ```
-   - Pixel loss anchors generator to maintain visual quality
-   - LCOFL provides refinement (not domination)
-   - Reduces SSIM/TV smoothing effects
 
-3. **LCOFL Curriculum** - `train.py` lines 1600-1608:
-   ```python
-   # Gradual LCOFL classification introduction over 20 epochs
-   if epoch < 5:
-       lcofl_classification_weight = 0.0      # Pixel-only warmup
-   elif epoch < 20:
-       lcofl_classification_weight = (epoch - 5) / 15.0  # Ramp up
-   else:
-       lcofl_classification_weight = 1.0      # Full strength
-   ```
-   - Generator maintains Stage 2 quality in early epochs
-   - Gradually adapts to LCOFL guidance
-   - Prevents sudden gradient conflict shock
+3. **LCOFL Curriculum (unchanged)** - `train.py` lines 1603-1612:
+   - Epochs 0-4: Classification weight = 0 (pixel-only warmup)
+   - Epochs 5-19: Ramp from 0 → 1 
+   - Epochs 20+: Full strength
+
+**Why This Works:**
+- Frozen OCR has `requires_grad=False` on all parameters → OCR weights won't be updated
+- But input tensor (`hr_image`) CAN receive gradients → generator learns to produce OCR-readable images
+- Balanced loss weights ensure generator produces images that are BOTH visually correct AND OCR-readable
+- No single loss component can dominate and cause mode collapse
 
 **Expected Results:**
-- ✅ Stage 3 maintains Stage 2 character quality
-- ✅ OCR accuracy improves to 85-92% without collapse
+- ✅ Different plates produce different predictions (no mode collapse)
+- ✅ Loss decreases over time (not increases)
 - ✅ Visual quality preserved (sharp characters)
-- ✅ Smooth convergence without sudden degradation
-
-**Total Changes:** 9 lines of code (5 in train.py, 4 in config.py)
+- ✅ OCR accuracy improves gradually
 
 
 ## Reproducibility & Determinism
