@@ -1598,8 +1598,17 @@ def train_stage(
         # =====================================================================
         
         if stage == 'full' and hasattr(criterion, 'weights'):
-            # Follow original paper: no curriculum, classification from start
-            criterion.weights['ocr'] = 0.0  # Disabled, replaced by LCOFL
+            # OCR curriculum - gradual introduction to prevent overwhelming pixel loss
+            # CRITICAL: OCR loss provides direct character recognition signal that LCOFL alone cannot
+            # LCOFL focuses on confusion/layout, not specific character prediction
+            if epoch < 3:
+                ocr_curriculum_weight = 0.0  # Pixel-only warmup
+            elif epoch < 10:
+                ocr_curriculum_weight = config.training.weight_ocr * ((epoch - 3) / 7.0)
+            else:
+                ocr_curriculum_weight = config.training.weight_ocr
+            criterion.weights['ocr'] = ocr_curriculum_weight
+
             criterion.weights['gan'] = 0.0  # Disabled - original uses OCR-only discriminator
 
             # LCOFL curriculum - gradual introduction to prevent sudden gradient conflict
@@ -1611,15 +1620,15 @@ def train_stage(
                 lcofl_classification_weight = (epoch - 5) / 15.0
             else:
                 lcofl_classification_weight = 1.0
-            
+
             # Apply LCOFL classification weight
             if hasattr(criterion, 'lcofl_loss') and criterion.lcofl_loss is not None:
                 criterion.lcofl_loss.weight_classification = lcofl_classification_weight
-            
+
             # Logging
             if epoch % 10 == 0 or epoch < 3:
                 lcofl_w = criterion.weights.get('lcofl', 0.0)
-                logger.info(f"Stage 3 [epoch {epoch}]: LCOFL={lcofl_w:.3f}, Classification={lcofl_classification_weight:.3f}, GAN=0")
+                logger.info(f"Stage 3 [epoch {epoch}]: OCR={ocr_curriculum_weight:.3f}, LCOFL={lcofl_w:.3f}, Classification={lcofl_classification_weight:.3f}, GAN=0")
         
         # Train
         train_losses = train_epoch(

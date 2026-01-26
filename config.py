@@ -191,7 +191,7 @@ class TrainingConfig:
     weight_pixel: float = 0.50      # FIXED: Increased from 0.25 to 0.50 for better quality anchor
     weight_perceptual: float = 0.0  # DISABLED - not in original paper, causes blur
     weight_gan: float = 0.0         # DISABLED - original uses OCR-as-discriminator
-    weight_ocr: float = 0.0         # DISABLED - replaced by LCOFL classification
+    weight_ocr: float = 0.05        # Re-enabled alongside LCOFL - provides direct character recognition signal
     weight_geometry: float = 0.0    # DISABLED - simplify
 
     # LCOFL Loss (from Nascimento et al. "Enhancing LP Super-Resolution" paper)

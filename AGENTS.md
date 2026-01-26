@@ -334,6 +334,66 @@ weight_lcofl: float = 0.75                 # LCOFL weight (original paper)
 - ✅ Visual quality preserved (sharp characters)
 - ✅ OCR accuracy improves gradually
 
+### 12. Stage 3 Mode Collapse - CRITICAL FIX v3 (2026-01-26)
+
+**Problem:** Stage 3 training still produces identical license plates (mode collapse). The v2 fix above was necessary but not sufficient.
+
+**Root Cause Analysis:**
+
+**Issue 1: OCR Loss Completely Disabled (CRITICAL)**
+- `config.py` had `weight_ocr = 0.0` with comment "replaced by LCOFL"
+- `train.py` line 1602 hardcoded `criterion.weights['ocr'] = 0.0`
+- **Conceptual Error**: LCOFL was meant to work WITH OCR loss, not replace it
+- LCOFL focuses on character *confusion* and *layout* constraints - it does NOT provide direct character recognition signal
+- Without OCR loss, generator has NO signal telling it what specific characters to produce
+
+**Issue 2: Recognizer grad_norm=0**
+- Repeated warnings: `WARNING - Recognizer grad_norm=0! Trainable: 175/175`
+- Symptom of Issue 1 - no OCR loss = no recognizer gradients
+- Emergency force-enable kept happening but wasn't effective
+
+**Evidence from Logs:**
+```
+Plate Acc: 0.0000, Char Acc: 0.1376  (should be >95%, stuck at ~13%)
+SR Gap: +0.8565  (generated HR much worse than GT HR)
+Most confused chars: R->B(0.40), Q->B(0.39), H->B(0.36)  (mode collapse to single char)
+ocr_weight: 0.0  (disabled - this was the problem)
+```
+
+**Fixes Applied:**
+
+1. **Re-enable OCR Loss** - `config.py` line 194:
+   ```python
+   # Old: weight_ocr = 0.0  # DISABLED - replaced by LCOFL
+   # New: weight_ocr = 0.05  # Re-enabled alongside LCOFL
+   ```
+
+2. **Add OCR Curriculum** - `train.py` lines 1601-1610:
+   ```python
+   # OCR curriculum - gradual introduction to prevent overwhelming pixel loss
+   if epoch < 3:
+       ocr_curriculum_weight = 0.0  # Pixel-only warmup
+   elif epoch < 10:
+       ocr_curriculum_weight = config.training.weight_ocr * ((epoch - 3) / 7.0)
+   else:
+       ocr_curriculum_weight = config.training.weight_ocr
+   criterion.weights['ocr'] = ocr_curriculum_weight
+   ```
+
+**Why This Works:**
+- OCR loss provides direct character recognition signal (cross-entropy on predicted characters)
+- LCOFL provides character confusion penalty and layout constraints
+- Small weight (0.05) provides guidance without overwhelming pixel loss
+- With OCR loss ~6-12, contributes ~0.3-0.6 to total loss - comparable to pixel loss
+- Curriculum ramps up gradually to avoid sudden gradient conflict
+
+**Expected Results:**
+- ✅ Generator receives direct character recognition signal
+- ✅ Recognizer grad_norm becomes non-zero
+- ✅ Different plates produce different predictions (no mode collapse)
+- ✅ Character accuracy improves from ~13% to >90%
+- ✅ Visual quality maintained (pixel loss still anchors)
+
 
 ## Reproducibility & Determinism
 
