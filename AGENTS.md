@@ -1,41 +1,47 @@
-# AGENTS.md - AI Coding Agent Guidelines
+# AGENTS.md - Text-Prior Guided LPR System
 
 This document provides guidelines for AI coding agents (Claude, GPT, Copilot, etc.) working on this codebase.
 
 ## Project Overview
 
-**Neuro-Symbolic License Plate Recognition (LPR) System** for Brazilian license plates, targeting ICPR 2026.
+**Text-Prior Guided License Plate Recognition (LPR) System** for Brazilian license plates, targeting ICPR 2026.
 
 ### Core Concept
-Combines deep neural networks with symbolic reasoning:
-- **Neural**: CNN encoder, STN, SwinIR, PARSeq
-- **Symbolic**: Syntax mask enforcing valid plate formats
+
+Uses frozen PARSeq to provide **text prior guidance** during training:
+
+- **Training Mode**: Frozen PARSeq extracts character probabilities → guides generator via text prior loss
+- **Inference Mode**: Pure LR→HR super-resolution (no PARSeq needed)
+- **Key Innovation**: Text prior provides categorical constraints preventing mode collapse
 
 ### Target Formats
 - **Brazilian**: `LLLNNNN` (3 letters + 4 digits)
 - **Mercosul**: `LLLNLNN` (3 letters + digit + letter + 2 digits)
 
-## Architecture Summary
+## TP Architecture
 
 ```
-LR Frames (5×16×48) → Encoder → STN → Layout+Fusion → SwinIR → PARSeq → Syntax Mask → Text
+LR Frames (5×16×48) → Encoder → STN → Layout+Fusion → TP Generator → HR (64×192)
+                                                              ↓
+                                                      Text Prior (training only)
+                                                              ↓
+                                                      PARSeq (frozen)
 ```
 
 ### Key Components
 
 | Module | File | Purpose |
 |--------|------|---------|
-| Main Model | `models/neuro_symbolic_lpr.py` | Orchestrates 4-phase pipeline |
-| Encoder | `models/encoder.py` | Shared CNN feature extraction |
-| STN | `models/stn.py` | Geometric rectification |
-| Layout | `models/layout_classifier.py` | Brazilian vs Mercosul detection |
-| Fusion | `models/feature_fusion.py` | Quality-weighted frame fusion |
-| SwinIR | `models/swinir.py` | Super-resolution (4× upscale) |
-| PARSeq | `models/parseq.py` | Character recognition (pretrained) |
-| Syntax Mask | `models/syntax_mask.py` | Enforces valid plate formats |
-| Deformable Conv | `models/deformable_conv.py` | Adaptive spatial sampling |
-| Shared Attention | `models/shared_attention.py` | PLTFAM-style attention module |
-| Composite Loss | `losses/composite_loss.py` | Combined training loss |
+| TextPriorGuidedLPR | `models/tp_lpr.py` | Complete TP-guided system |
+| TextPriorGuidedGenerator | `models/tp_guided_generator.py` | TP generator with BiLSTM blocks |
+| TextPriorExtractor | `models/text_prior.py` | Text prior from frozen PARSeq |
+| SequentialResidualBlock | `models/sequential_blocks.py` | BiLSTM sequential modeling |
+| InterFrameCrossAttention | `models/multi_frame_fusion.py` | Multi-frame temporal fusion |
+| SharedCNNEncoder | `models/encoder.py` | Shared CNN feature extraction |
+| SpatialTransformerNetwork | `models/stn.py` | Geometric rectification |
+| LayoutClassifier | `models/layout_classifier.py` | Brazilian vs Mercosul detection |
+| PARSeq | `models/parseq.py` | Character recognition (pretrained, frozen) |
+| CompositeLoss | `losses/composite_loss.py` | Combined training loss |
 | LCOFL Loss | `losses/lcofl_loss.py` | Layout-aware character-oriented loss |
 
 ## Critical Constraints
@@ -52,41 +58,121 @@ EOS_IDX = 2
 CHAR_START_IDX = 3
 ```
 
-### Files with Hardcoded Format Logic
-- `config.py`: Pattern definitions, `get_position_constraints()`
-- `models/syntax_mask.py`: Mask generation (lines ~317, 320, 349, 352)
-- `data/dataset.py`: Text validation and layout inference
-
 ### Image Sizes
 ```python
 LR_SIZE = (16, 48)   # Low-resolution input
 HR_SIZE = (64, 192)  # High-resolution output (4× upscale)
 ```
 
-## Training Pipeline
+## TP Training Pipeline
 
-### Staged Training
+### Three Training Stages
+
 ```
-Stage 0: Pretrain (SKIPPED with pretrained PARSeq)
-Stage 1: STN - Geometry warm-up (encoder + STN)
-Stage 1.5: PARSeq Warm-up - Train recognizer on GT HR images
-Stage 2: Restoration - SwinIR + Layout + Fusion
-Stage 3: Full - End-to-end fine-tuning
+Stage 1 (tp_stn):     STN + Layout training (15 epochs)
+Stage 2 (tp_generator): Generator with text prior (50 epochs)
+Stage 3 (tp_full):     End-to-end fine-tuning (30 epochs)
 ```
 
 ### Stage-Specific Behavior
 
-| Stage | Frozen Modules | Loss Functions |
-|-------|----------------|----------------|
-| STN | Recognizer | Self-supervised, Pixel, Corner |
-| PARSeq Warm-up | All except Recognizer | OCR only |
-| Restoration | Encoder, STN, Recognizer | Pixel, GAN, Layout |
-| Full | None | All losses |
+| Stage | Frozen Modules | Active Modules | Loss Functions |
+|-------|----------------|----------------|----------------|
+| tp_stn | Generator, Recognizer | STN, Layout | Self-supervised, Pixel, Corner, Layout |
+| tp_generator | STN, Recognizer | Generator | Pixel, Text Prior, Layout, SSIM |
+| tp_full | None | All | All losses (reduced OCR weight) |
 
-### Important Training Details
-- **Validation uses stage-aware loss** to prevent NaN (see `train.py:validate()`)
-- **STN stage uses tighter gradient clipping** (0.5 vs 1.0)
-- **Self-supervised STN loss** provides gradients without corner annotations
+### Usage
+
+```bash
+# Train STN + Layout
+python train.py --stage 1
+
+# Train Generator with text prior
+python train.py --stage 2
+
+# Full end-to-end fine-tuning
+python train.py --stage 3
+
+# Train all stages
+python train.py --stage all
+
+# Also supports explicit TP stage names
+python train.py --stage tp_stn
+python train.py --stage tp_generator
+python train.py --stage tp_full
+```
+
+## Code Patterns
+
+### TP Generator Forward
+
+```python
+# Training: use text prior guidance
+hr_image = model(lr_frames, use_text_prior=True)
+
+# Inference: no text prior needed
+hr_image = model(lr_frames, use_text_prior=False)
+```
+
+### Model Forward Pass Pattern
+
+```python
+def forward(self, x, targets=None, return_intermediates=False):
+    outputs = {}
+    # Encode multi-frame LR
+    encoded = self.encoder.forward_multi_frame(x)
+    # Rectify with STN
+    rectified, thetas, corners = self.stn(encoded, ...)
+    # Classify layout
+    layout_logits = self.layout_classifier(rectified)
+    # Fuse multi-frame features
+    fused = self.multi_frame_fusion(rectified)
+    # Generate HR (with text prior if training)
+    text_prior = None
+    if self.training and use_text_prior:
+        text_prior, text_features = self.text_prior_extractor(x)
+    hr_image = self.generator(fused, text_features=text_features)
+    # Recognize text
+    logits = self.recognizer(hr_image)
+    return {**outputs, 'hr_image': hr_image, 'masked_logits': logits, ...}
+```
+
+### Loss Computation Pattern
+
+```python
+def forward(self, outputs, targets, discriminator=None):
+    loss_dict = {}
+    total_loss = None
+
+    # Check for NaN inputs before computing each loss
+    if 'hr_image' in outputs and 'hr_image' in targets:
+        if not torch.isnan(outputs['hr_image']).any():
+            l_pixel = self.pixel_loss(...)
+            l_pixel = self._clamp_loss(l_pixel)
+            loss_dict['pixel'] = self._safe_loss_item(l_pixel)
+            total_loss = weighted if total_loss is None else total_loss + weighted
+
+    # Text prior loss (training only)
+    if self.text_prior_loss is not None and 'hr_image' in outputs:
+        l_tp = self.text_prior_loss(outputs['hr_image'], targets['text_indices'])
+        loss_dict['tp_text_prior'] = self._safe_loss_item(l_tp)
+        weighted = self.weights['tp_text_prior'] * l_tp
+        total_loss = weighted if total_loss is None else total_loss + weighted
+
+    return total_loss, loss_dict
+```
+
+### Numerical Stability Pattern
+
+```python
+def _clamp_loss(self, loss, max_val=100.0):
+    if loss is None:
+        return None
+    if torch.isnan(loss).any() or torch.isinf(loss).any():
+        return loss * 0.0  # Zero with gradient connection
+    return torch.clamp(loss, min=0.0, max=max_val)
+```
 
 ## Common Tasks
 
@@ -101,20 +187,13 @@ Stage 3: Full - End-to-end fine-tuning
 
 1. Edit component in `models/` directory
 2. Update `models/__init__.py` if new module
-3. Integrate in `models/neuro_symbolic_lpr.py`
+3. Integrate in `models/tp_lpr.py`
 4. Update `get_trainable_params()` for staged training
 
-### Adding a Training Stage
-
-1. Add stage config in `train.py:main()` stages list
-2. Add stage-specific loss in `composite_loss.py:get_stage_loss()`
-3. Update validation in `train.py:validate()` for stage-aware loss
-4. Add freeze/unfreeze methods if needed
-
-### Using LCOFL Loss (Layout and Character Oriented Focal Loss)
+### Using LCOFL Loss
 
 ```python
-# In config.py or training script
+# In config.py
 config.training.use_lcofl = True      # Enable LCOFL
 config.training.weight_lcofl = 0.5    # Weight for LCOFL
 config.training.weight_ssim = 0.3     # SSIM component weight
@@ -122,679 +201,53 @@ config.training.lcofl_alpha = 1.0     # Confusion penalty increment
 config.training.lcofl_beta = 2.0      # Layout violation penalty
 ```
 
-**Key files:**
-- `losses/lcofl_loss.py` - LCOFL implementation
-- `models/deformable_conv.py` - Deformable convolutions
-- `models/shared_attention.py` - PLTFAM-style attention
-
-## Code Patterns
-
-### Model Forward Pass Pattern
-```python
-def forward(self, x, targets=None, return_intermediates=False):
-    outputs = {}
-    # Phase 1: Encode and rectify
-    encoded = self.encoder.forward_multi_frame(x)
-    rectified, thetas, corners = self.multi_frame_stn(encoded, ...)
-    if return_intermediates:
-        outputs['corners'] = corners
-        outputs['thetas'] = thetas
-    # ... more phases
-    return outputs
-```
-
-### Loss Computation Pattern
-```python
-def forward(self, outputs, targets, discriminator=None):
-    loss_dict = {}
-    total_loss = None
-    
-    # Check for NaN inputs before computing each loss
-    if 'hr_image' in outputs and 'hr_image' in targets:
-        if not torch.isnan(outputs['hr_image']).any():
-            l_pixel = self.pixel_loss(...)
-            l_pixel = self._clamp_loss(l_pixel)
-            loss_dict['pixel'] = self._safe_loss_item(l_pixel)
-            total_loss = weighted if total_loss is None else total_loss + weighted
-    
-    return total_loss, loss_dict
-```
-
-### Numerical Stability Pattern
-```python
-def _clamp_loss(self, loss, max_val=100.0):
-    if loss is None:
-        return None
-    if torch.isnan(loss).any() or torch.isinf(loss).any():
-        return loss * 0.0  # Zero with gradient connection
-    return torch.clamp(loss, min=0.0, max=max_val)
-```
-
 ## Known Issues & Gotchas
 
-### 1. OCR Loss NaN During STN Stage
-**Cause**: Pretrained PARSeq uses different charset; unmapped logits = -100  
-**Solution**: Stage-aware validation skips OCR loss during STN stage
+### 1. PARSeq Pretrained Model Lazy Loading
 
-### 2. Pretrained PARSeq Lazy Loading
-**Behavior**: `PretrainedPARSeq._load_model()` is called lazily on first forward  
-**Gotcha**: Model may not be on correct device until first forward pass  
+**Behavior**: `PretrainedPARSeq._load_model()` is called lazily on first forward
+**Gotcha**: Model may not be on correct device until first forward pass
 **Solution**: Always pass device to `_load_model(device=x.device)`
 
-### 3. Multi-Frame STN Output Dimensions
-**Shape**: `(B, T, 2, 3)` for thetas, `(B, T, 4, 2)` for corners  
-**Gotcha**: Some losses expect `(B, 2, 3)` or `(B, 4, 2)`  
+### 2. Multi-Frame STN Output Dimensions
+
+**Shape**: `(B, T, 2, 3)` for thetas, `(B, T, 4, 2)` for corners
+**Gotcha**: Some losses expect `(B, 2, 3)` or `(B, 4, 2)`
 **Solution**: Average over frames when needed: `corners.mean(dim=1)`
 
-### 4. Layout Label Invalid Values
-**Value**: `-1` indicates invalid/unknown layout  
-**Gotcha**: Don't include in loss computation  
+### 3. Layout Label Invalid Values
+
+**Value**: `-1` indicates invalid/unknown layout
+**Gotcha**: Don't include in loss computation
 **Solution**: Filter with `valid_mask = (layout >= 0)`
 
-### 5. Text Indices Format
-**Shape**: `(B, PLATE_LENGTH + 2)` with `[BOS, char1, ..., char7, EOS]`  
-**Gotcha**: Logits are `(B, PLATE_LENGTH, VOCAB_SIZE)` - no BOS/EOS  
+### 4. Text Indices Format
+
+**Shape**: `(B, PLATE_LENGTH + 2)` with `[BOS, char1, ..., char7, EOS]`
+**Gotcha**: Logits are `(B, PLATE_LENGTH, VOCAB_SIZE)` - no BOS/EOS
 **Solution**: Slice targets: `targets[:, 1:PLATE_LENGTH + 1]`
 
-### 6. GAN Training Stability
-**Issues Fixed**: LSGAN mismatch, GAN weight cap, R1 penalty, warm-up  
-**File**: `train.py`, `losses/composite_loss.py`  
-**Details**: See commit history or walkthrough artifact for full list
+### 5. Text Prior vs Inference
 
-### 9. Wavy/Checkerboard Artifact Prevention (FIXED)
-**Issue 1**: UNetDiscriminator used `ConvTranspose2d` causing checkerboard artifacts  
-**Solution**: Replaced with resize-convolution (`Upsample + Conv2d`) in `models/discriminator.py`  
-**Issue 2**: Missing anti-aliased downsampling caused aliasing  
-**Solution**: Created `models/blur_pool.py` with `BlurPool2d`, `MaxBlurPool2d`, `AntiAliasedConv2d`  
-**Issue 3**: No explicit penalty for high-frequency wavy noise  
-**Solution**: Added `TotalVariationLoss` to `losses/composite_loss.py` with `weight_tv` in config  
-**Usage**: Set `config.training.weight_tv = 1e-5` to enable TV denoising
+**Training**: Set `use_text_prior=True` to enable PARSeq guidance
+**Inference**: Set `use_text_prior=False` - PARSeq not needed
+**Gotcha**: Don't forget to toggle between modes
 
-### 10. Stage 3 Mode Collapse (FIXED)
-**Issue**: Generator learns to produce "adversarial" features that fool trainable OCR but aren't visually clear  
-**Symptom**: Characters fade or become blurry while OCR loss decreases  
-**Solution**: Use frozen copy of OCR for LCOFL classification loss computation  
-**File**: `train.py:train_stage()` (lines 1459-1477)  
-**Config**: `use_frozen_ocr_for_lcofl: True` (default), LCOFL weight = 0.75
+### 6. Frozen PARSeq in Text Prior
 
-
-### 7. PARSeq Pretrained Model Issues (FIXED)
-**Issue 1**: Model loaded in training mode → random outputs due to dropout  
-**Solution**: Added `.eval()` in `models/parseq.py:_load_model()` after loading  
-**Issue 2**: Charset adapter overwrote lowercase logits with uppercase  
-**Solution**: Use `logsumexp` to properly combine both in `_adapt_logits()`  
-**File**: `models/parseq.py`
-
-### 8. Perceptual Loss Not Working (FIXED)
-**Issue 1**: VGG feature extraction fed wrong shapes (reused `x` across layers)  
-**Solution**: Single forward pass with incremental layer extraction in `losses/gan_loss.py`  
-**Issue 2**: Perceptual loss not computed in restoration stage  
-**Solution**: Added perceptual loss to `composite_loss.py:get_stage_loss()` for restoration  
-**Issue 3**: Perceptual loss not enabled in training  
-**Solution**: Added `use_perceptual=True, weight_perceptual=0.1` in `train.py`
-
-## LCOFL Paper Features (Nascimento et al.)
-
-> **INTEGRATED**: These features from "Enhancing License Plate Super-Resolution: A Layout-Aware and Character-Driven Approach" are now fully integrated.
-
-### OCR-as-Discriminator
-- **File**: `losses/ocr_discriminator.py`
-- **Config**: `use_ocr_discriminator: True` (config.py line 204)
-- **Status**: ✅ Integrated into `train.py:train_stage()` and `train_epoch()`
-- **Purpose**: Uses OCR recognition confidence instead of binary real/fake for more stable GAN training
-- **Usage**: Set `config.training.use_ocr_discriminator = True` to enable
-
-### Shared Attention Module (PLTFAM-style)
-- **File**: `models/shared_attention.py`
-- **Config**: `use_shared_attention: True` (config.py line 199)
-- **Status**: ✅ Integrated into `models/swinir.py` RSTB blocks
-- **Purpose**: Three-fold attention (Channel, Positional, Geometrical) with shared weights across all RSTB blocks
-- **Usage**: Set `config.training.use_shared_attention = True` to enable
-
-### Deformable Convolutions
-- **File**: `models/deformable_conv.py`
-- **Config**: `use_deformable_conv: True` (config.py line 200)
-- **Status**: ✅ Integrated via Shared Attention Module
-- **Purpose**: Adaptive spatial sampling for character alignment
-- **Usage**: Set `config.training.use_deformable_conv = True` (requires `use_shared_attention = True`)
-
-### Stage 3 Mode Collapse Prevention (SUPERSEDED - See Section 14)
-> **NOTE**: This approach was superseded by the Two-Stage Refinement Solution (Section 14). Kept for historical context.
-
-- **File**: `train.py:train_stage()` (lines 1459-1477)
-- **Config**: `use_frozen_ocr_for_lcofl: False` (currently DISABLED - see Section 14)
-- **Previous Status**: ✅ Was active, but did not fully prevent mode collapse
-- **Purpose**: Was intended to prevent generator from learning adversarial features that fool trainable OCR
-
-**Current Configuration (as of 2026-01-27):**
-```python
-# In config.py - TrainingConfig
-use_frozen_ocr_for_lcofl: bool = False     # DISABLED - use trainable OCR only
-use_refiner: bool = True                    # ENABLED - Two-Stage Solution instead
-```
-
----
-
-### 11. Stage 3 Mode Collapse - CRITICAL FIX v2 (2025-01-25) - SUPERSEDED
-> **NOTE**: This fix was necessary but not sufficient. See Section 14 for the final solution.
-
-**Problem:** Stage 3 training causes ALL plates to predict the same characters (e.g., "AEE-9333") despite having different ground truth texts. Loss increases over time instead of decreasing.
-
-**Root Cause Analysis:**
-
-**Issue 1: No Gradient Flow to Generator**
-- Previous code used `torch.no_grad()` around frozen OCR forward pass
-- This completely broke the gradient chain - generator received ZERO gradient from LCOFL
-- Result: LCOFL classification loss was computed but had no effect on training
-
-**Issue 2: Massive Loss Imbalance (CRITICAL)**
-- LCOFL classification CE loss is typically ~38 when model makes wrong predictions
-- Pixel L1 loss is typically ~0.3
-- With `weight_lcofl=0.25`: LCOFL contributes ~9.5, Pixel contributes ~0.15
-- This 60x imbalance caused generator to ONLY optimize for OCR, ignoring pixel fidelity
-- Generator learned a "shortcut": produce a single character pattern that minimizes CE
-
-**Fixes Applied:**
-
-1. **Enable Gradient Flow to Generator (CRITICAL)** - `train.py` lines 533-551:
-   ```python
-   # REMOVED torch.no_grad() - gradients must flow to generator
-   # OCR weights are frozen (requires_grad=False), so OCR won't be updated
-   # But hr_image will receive gradients for generator to learn OCR-readable images
-   if frozen_ocr is not None and 'hr_image' in outputs:
-       frozen_logits = frozen_ocr(outputs['hr_image'])
-       outputs['frozen_logits'] = frozen_logits  # Don't detach!
-   ```
-
-2. **Reduce LCOFL Weight Drastically** - `config.py` lines 197-213:
-   ```python
-   # Old: weight_lcofl = 0.25 → LCOFL ~9.5 vs Pixel ~0.15 (60x imbalance!)
-   # New: weight_lcofl = 0.005 → LCOFL ~0.19 vs Pixel ~0.15 (balanced)
-   weight_lcofl: float = 0.005  # CRITICAL: Reduced from 0.25 to 0.005
-   ```
-
-3. **LCOFL Curriculum (unchanged)** - `train.py` lines 1603-1612:
-   - Epochs 0-4: Classification weight = 0 (pixel-only warmup)
-   - Epochs 5-19: Ramp from 0 → 1 
-   - Epochs 20+: Full strength
-
-**Why This Works:**
-- Frozen OCR has `requires_grad=False` on all parameters → OCR weights won't be updated
-- But input tensor (`hr_image`) CAN receive gradients → generator learns to produce OCR-readable images
-- Balanced loss weights ensure generator produces images that are BOTH visually correct AND OCR-readable
-- No single loss component can dominate and cause mode collapse
-
-**Expected Results:**
-- ✅ Different plates produce different predictions (no mode collapse)
-- ✅ Loss decreases over time (not increases)
-- ✅ Visual quality preserved (sharp characters)
-- ✅ OCR accuracy improves gradually
-
-### 12. Stage 3 Mode Collapse - CRITICAL FIX v3 (2026-01-26) - SUPERSEDED
-> **NOTE**: This fix was also necessary but not sufficient. See Section 14 for the final solution.
-
-**Problem:** Stage 3 training still produces identical license plates (mode collapse). The v2 fix above was necessary but not sufficient.
-
-**Root Cause Analysis:**
-
-**Issue 1: OCR Loss Completely Disabled (CRITICAL)**
-- `config.py` had `weight_ocr = 0.0` with comment "replaced by LCOFL"
-- `train.py` line 1602 hardcoded `criterion.weights['ocr'] = 0.0`
-- **Conceptual Error**: LCOFL was meant to work WITH OCR loss, not replace it
-- LCOFL focuses on character *confusion* and *layout* constraints - it does NOT provide direct character recognition signal
-- Without OCR loss, generator has NO signal telling it what specific characters to produce
-
-**Issue 2: Recognizer grad_norm=0**
-- Repeated warnings: `WARNING - Recognizer grad_norm=0! Trainable: 175/175`
-- Symptom of Issue 1 - no OCR loss = no recognizer gradients
-- Emergency force-enable kept happening but wasn't effective
-
-**Evidence from Logs:**
-```
-Plate Acc: 0.0000, Char Acc: 0.1376  (should be >95%, stuck at ~13%)
-SR Gap: +0.8565  (generated HR much worse than GT HR)
-Most confused chars: R->B(0.40), Q->B(0.39), H->B(0.36)  (mode collapse to single char)
-ocr_weight: 0.0  (disabled - this was the problem)
-```
-
-**Fixes Applied:**
-
-1. **Re-enable OCR Loss** - `config.py` line 194:
-   ```python
-   # Old: weight_ocr = 0.0  # DISABLED - replaced by LCOFL
-   # New: weight_ocr = 0.05  # Re-enabled alongside LCOFL
-   ```
-
-2. **Add OCR Curriculum** - `train.py` lines 1601-1610:
-   ```python
-   # OCR curriculum - gradual introduction to prevent overwhelming pixel loss
-   if epoch < 3:
-       ocr_curriculum_weight = 0.0  # Pixel-only warmup
-   elif epoch < 10:
-       ocr_curriculum_weight = config.training.weight_ocr * ((epoch - 3) / 7.0)
-   else:
-       ocr_curriculum_weight = config.training.weight_ocr
-   criterion.weights['ocr'] = ocr_curriculum_weight
-   ```
-
-**Why This Works:**
-- OCR loss provides direct character recognition signal (cross-entropy on predicted characters)
-- LCOFL provides character confusion penalty and layout constraints
-- Small weight (0.05) provides guidance without overwhelming pixel loss
-- With OCR loss ~6-12, contributes ~0.3-0.6 to total loss - comparable to pixel loss
-- Curriculum ramps up gradually to avoid sudden gradient conflict
-
-**Expected Results:**
-- ✅ Generator receives direct character recognition signal
-- ✅ Recognizer grad_norm becomes non-zero
-- ✅ Different plates produce different predictions (no mode collapse)
-- ✅ Character accuracy improves from ~13% to >90%
-- ✅ Visual quality maintained (pixel loss still anchors)
-
-### 13. Stage 3 Mode Collapse - ROOT CAUSE FIX (2026-01-27) - SUPERSEDED
-> **NOTE**: This fix addressed the recognizer LR issue but OCR supervision on generator still caused collapse. See Section 14 for the final solution.
-
-**Problem:** After days of hyperparameter tuning, mode collapse persisted. Character accuracy stuck at ~13-14% regardless of loss weight adjustments.
-
-**Root Cause Analysis:**
-
-**Issue 1: Recognizer Learning Rate 10x Too Low (CRITICAL)**
-- Location: `models/neuro_symbolic_lpr.py` line 480
-- Code: `'params': self.recognizer.parameters(), 'lr_scale': 0.1, 'name': 'recognizer'`
-- Impact: Base LR = 1e-5, lr_scale = 0.1 → Effective LR = 1e-6
-- Generator LR = 1e-5 (10x HIGHER than recognizer!)
-- **The recognizer literally cannot learn at 1e-6**
-
-**Issue 2: Frozen OCR Confusion**
-- Frozen OCR used for LCOFL classification (receives gradients to generator)
-- Trainable OCR has lr_scale=0.1 (CANNOT learn)
-- Generator receives confusing signals from two different OCR sources
-- Result: Generator doesn't know which OCR to optimize for
-
-**Issue 3: Potential Gradient Flow Blockage**
-- Pretrained PARSeq may have internal state management
-- Eval mode vs train mode affects gradient flow
-- Dropout behavior differs between modes
-
-**Fixes Applied:**
-
-1. **Recognize lr_scale Changed from 0.1 to 1.0** - `models/neuro_symbolic_lpr.py` line 482:
-   ```python
-   # Old: lr_scale=0.1 → Effective LR = 1e-6 (broken)
-   # New: lr_scale=1.0 → Effective LR = 1e-5 (working!)
-   {'params': self.recognizer.parameters(), 'lr_scale': 1.0, 'name': 'recognizer'}
-   ```
-
-2. **Disabled Frozen OCR** - `config.py` line 215:
-   ```python
-   # Old: use_frozen_ocr_for_lcofl: bool = True
-   # New: use_frozen_ocr_for_lcofl: bool = False  # Use trainable OCR only
-   ```
-
-3. **Force Recognizer Train Mode** - `models/neuro_symbolic_lpr.py` lines 342-345:
-   ```python
-   # CRITICAL: Ensure recognizer is in train mode during training
-   if self.training and not self.recognizer.training:
-       self.recognizer.train()
-   ```
-
-**Why This Works:**
-- Recognizer now has same LR as generator (1e-5), allowing it to actually learn
-- Single OCR source eliminates confusing gradient signals
-- Train mode ensures proper gradient flow through PARSeq
-
-**Expected Results:**
-- ✅ Recognizer LR increases from 1e-6 to 1e-5 (10x higher)
-- ✅ Character accuracy increases from ~13% to 30-50% by epoch 5
-- ✅ Character accuracy reaches 70-90% by epoch 10
-- ✅ Plate accuracy increases from 0% to 30-60%
-- ✅ SR Gap decreases from +0.85 to +0.3 to +0.5
-
-**Verification:**
-Check training logs for:
-```
-Optimizer param groups:
-  recognizer: lr=1.00e-05  # Should be 1e-5, NOT 1e-6!
-```
-
-
-### 14. Two-Stage Refinement Solution (2026-01-27) ✅ CURRENT SOLUTION
-
-> **This is the CURRENT solution for mode collapse.** Previous approaches (Sections 10-13) were necessary steps but did not fully solve the problem.
-
-**Problem:** Stage 3 training with any form of OCR supervision causes severe mode collapse (all plates identical).
-
-**Discovery Process:**
-- Tested without LCOFL → collapsed
-- Tested without frozen OCR → collapsed
-- Tested multiple OCR weights (0.01, 0.05, 0.1, 0.5) → all collapsed
-- **Root Cause**: ANY direct OCR supervision on generator causes mode collapse
-
-**Why OCR Causes Mode Collapse:**
-
-**Hypothesis 1: Cross-Entropy encourages confidence, not correctness**
-- OCR CE loss rewards high confidence predictions
-- Generator learns to produce input that makes OCR "confidently wrong"
-- But confident ≠ correct (all plates look like "A" or "B" - letters OCR is confident about)
-
-**Hypothesis 2: Gradients through PARSeq are pathological**
-- PARSeq is pretrained on clean text
-- Gradients flowing back through it might push generator toward degenerate solutions
-- The generator learns to produce "adversarial" inputs that exploit OCR's biases
-
-**Hypothesis 3: Loss conflict between pixels and OCR**
-- Pixel loss wants "correct looking" images (blurry but right structure)
-- OCR loss wants "readable" images (sharp characters)
-- The compromise is a single "safe" pattern that minimizes both
-
-**Solution: Two-Stage Architecture**
-
-Instead of training the generator with OCR loss, use a separate refiner network:
-
-```
-Stage 2 Generator (fixed) → Refiner Network → OCR supervision
-         ↓                        ↓                    ↓
-    Varied blur           Sharp correct         Match GT
-    (no mode collapse)     characters           characters
-```
-
-**Architecture:**
-
-**File**: `models/refiner.py`
-
-- **CharacterRefiner**: Lightweight residual network (3 blocks)
-- Takes Stage 2 HR output (64x192) as input
-- Outputs refined HR with corrected characters
-- Uses residual connection: `output = input + refinement`
-- Trained ONLY with OCR loss (no pixel loss to prevent blurring)
-
-**Configuration**: `config.py` lines 250-267
-
-```python
-use_refiner: bool = True                  # Enable character refiner
-refiner_num_blocks: int = 3              # Lightweight (3 residual blocks)
-refiner_lr: float = 1e-4                 # Higher LR than generator
-refiner_epochs: int = 10                  # Training epochs
-weight_refiner_ocr: float = 1.0          # Main loss: OCR cross-entropy
-weight_refiner_perceptual: float = 0.05  # Maintain visual quality
-weight_refiner_pixel: float = 0.001      # Preserve Stage 2 structure
-refiner_freeze_generator: bool = True     # Freeze Stage 2 generator (CRITICAL)
-```
-
-**Training Procedure:**
-
-**Stage 1: Train Generator (Stage 2)** - Already done ✅
-- Pixel loss, layout loss, SSIM
-- No OCR supervision
-- Produces varied blurry alphanumeric patterns
-
-**Stage 2: Train Refiner (New)**
-- Fix Stage 2 generator (`freeze_generator=True`)
-- Train refiner with OCR loss only
-- Goal: Refiner learns to correct characters while preserving structure
-
-**Model Integration**: `models/neuro_symbolic_lpr.py`
-
-- Added refiner parameters to `__init__` (lines 88-94)
-- Integrated refiner into forward pass (lines 367-377)
-- Added `refiner` stage to `get_trainable_params` (lines 521-529)
-- Updated `get_trainable_params` signature to support `freeze_generator` parameter
-
-**Usage:**
-
-```python
-# Create model with refiner
-model = NeuroSymbolicLPR(
-    ...,
-    use_refiner=True,
-    refiner_num_blocks=3,
-    ...
-)
-
-# Training: Stage 2 (restoration) → Refiner training
-# During refiner training:
-params = model.get_trainable_params('refiner', freeze_generator=True)
-```
-
-**Expected Results:**
-
-| Metric | Stage 2 | Stage 3 (Direct OCR) | Refiner Approach |
-|--------|---------|-------------------|------------------|
-| Diversity | ✅ Varied | ❌ All same | ✅ Varied |
-| Character Match | ❌ Wrong | ❌ Collapsed | ✅ Correct |
-| Visual Quality | ✅ Good | ❌ Poor | ✅ Good |
-| Mode Collapse | Mild | Severe | None |
-
-**Training Commands:**
-
-```bash
-# Train all stages including refiner (recommended)
-python train.py --stage all --config config.py
-
-# Or train refiner stage specifically (after Stage 2 restoration is complete)
-python train.py --stage 2.5 --config config.py
-
-# The refiner stage (2.5) runs after restoration (2) and before full (3)
-# Stage order:
-#   1: STN training
-#   1.5: PARSeq warmup
-#   2: Restoration (Stage 2 generator)
-#   2.5: Refiner (NEW - Two-Stage Solution)
-#   3: Full end-to-end (optional, may not be needed with refiner)
-```
-
-**Training Pipeline:**
-
-The refiner training is automatically integrated into the training pipeline:
-
-1. **Stage 2 (restoration)**: Train the generator with pixel/layout/SSIM loss
-   - Output: `checkpoints/restoration_best.pth`
-   - Generator produces varied but somewhat blurry characters
-
-2. **Stage 2.5 (refiner)**: Train the refiner with OCR loss, generator frozen
-   - Loads: `restoration_best.pth` automatically
-   - Output: `checkpoints/refiner_best.pth`
-   - Refiner sharpens characters and corrects content
-
-3. **Stage 3 (full)**: Optional end-to-end finetuning
-   - May not be needed if refiner achieves target accuracy
-
-**Key Implementation Details:**
-
-**train.py modifications:**
-- Added '2.5' → ('refiner', refiner_epochs) to stage_map (line 2293)
-- Added refiner freeze/unfreeze logic (lines 2315-2323)
-- Added refiner batch size and LR configuration (lines 2344, 306)
-- Added refiner loss computation in training loop (lines 579-582)
-- Added refiner loss computation in validation loop (lines 1099-1101)
-- Updated CompositeLoss instantiation with refiner weights (lines 1408-1411)
-
-**losses/composite_loss.py modifications:**
-- Added 'refiner' case to `get_stage_loss` (lines 962-1021)
-- Added refiner loss weights to `__init__` (lines 475-478, 522-525)
-
-**models/neuro_symbolic_lpr.py modifications:**
-- Added `freeze_generator()` method (lines 483-497)
-- Added `unfreeze_refiner()` method (lines 499-509)
-- Refiner forward pass integration (lines 367-377)
-
-**Files Created/Modified:**
-1. **Created**: `models/refiner.py` - Refiner module
-2. **Modified**: `config.py` lines 250-267 - Refiner configuration
-3. **Modified**: `models/neuro_symbolic_lpr.py` - Refiner integration
-4. **Modified**: `models/__init__.py` - Export refiner classes
-5. **Modified**: `train.py` - Training pipeline integration
-6. **Modified**: `losses/composite_loss.py` - Refiner loss computation
-
-
-### 15. OCR Embedding Similarity Loss (2026-01-27) ✅ CURRENT SOLUTION
-
-> **This is the FINAL solution for mode collapse.** The refiner approach (Section 14) was a step in the right direction but still used cross-entropy loss, which is the root cause of mode collapse.
-
-**Problem:** Cross-entropy loss rewards **confidence**, not **correctness**.
-
-**Key Insight from User:**
-> "pixel and perceptual was increasing, and only ocr decreasing, cause overal total loss decreasing, but it actually all collapse and the increasing ocr i think was more like random guessing, i seen this pattern many time when training stage 3 manytimes"
-
-This is the classic signature of cross-entropy mode collapse:
-- OCR loss decreases → model becomes more **confident**
-- Character accuracy decreases → model becomes more **wrong**
-- Model learns to be "confidently wrong"
-
-**Why Cross-Entropy Causes Mode Collapse:**
-
-```python
-# Cross-entropy loss: L = -log(p(correct_char))
-# When model predicts "AAAAAAA" with 99% confidence:
-# - If GT is "ABC1234": loss ≈ 4.6 (high)
-# - Model learns: predict same chars always → get confident → lower loss
-# - Result: mode collapse to single pattern (B→9→6)
-```
-
-**Solution: OCR Embedding Similarity Loss**
-
-Instead of cross-entropy on classification logits, use frozen PARSeq encoder embeddings with cosine similarity:
-
-```python
-# 1. Extract encoder features from frozen PARSeq
-gen_emb = ocr_model.encoder(generated)  # (B, C, H, W)
-real_emb = ocr_model.encoder(ground_truth)
-
-# 2. Pool to character-level (7 chars per plate)
-gen_chars = adaptive_avg_pool2d(gen_emb, (1, 1, 7))  # (B, C, 7)
-real_chars = adaptive_avg_pool2d(real_emb, (1, 1, 7))
-
-# 3. Compute cosine similarity per character
-similarity = cosine_similarity(gen_chars, real_chars)
-
-# 4. Loss = 1 - mean_similarity
-loss = 1.0 - similarity.mean()
-```
-
-**Why This Works:**
-- Embeddings capture **character semantics** (shape, structure)
-- Similarity loss rewards **semantic correctness**, not confidence
-- Frozen OCR → no gradient flow into OCR → no mode collapse
-- Can't "cheat" by being confidently wrong
-
-**Architecture Comparison:**
-
-| Aspect | Refiner (Stage 2.5) | Embedding Fine-tuning (Stage 3.5) |
-|--------|---------------------|----------------------------------|
-| Generator | Frozen | Trainable |
-| Loss type | Cross-entropy | Embedding similarity |
-| Capacity | 588 params (too small) | Full generator capacity |
-| Mode collapse | Still happens (CE) | Fixed (embeddings) |
-| Training stage | 2.5 | 3.5 |
-
-**Implementation:**
-
-**File**: `losses/embedding_loss.py` (NEW)
-
-- **OCREmbeddingLoss**: Frozen PARSeq encoder + cosine similarity loss
-- Supports character-level pooling (spatial or adaptive)
-- Multiple loss types: 'cosine', 'mse', 'combined'
-
-**File**: `losses/composite_loss.py` (MODIFIED)
-
-- Added `setup_embedding_loss()` method to initialize with OCR model
-- Added 'embedding_finetune' stage to `get_stage_loss()`
-- Stage 3.5 uses pixel + SSIM + embedding loss (no cross-entropy)
-
-**File**: `config.py` (MODIFIED)
-
-Added configuration (lines 269-288):
-```python
-# OCR Embedding Loss (Stage 3.5)
-use_embedding_loss: bool = True
-weight_embedding: float = 0.3
-embedding_loss_type: str = 'cosine'
-embedding_char_pooling: str = 'spatial'
-embedding_temperature: float = 1.0
-
-# Stage 3.5 Configuration
-embedding_finetune_epochs: int = 50
-embedding_finetune_lr: float = 1e-5
-weight_finetune_pixel: float = 0.5
-weight_finetune_ssim: float = 0.2
-weight_finetune_tv: float = 1e-5
-# DISABLE cross-entropy based losses
-weight_finetune_lcofl: float = 0.0
-weight_finetune_ocr: float = 0.0
-```
-
-**File**: `train.py` (MODIFIED)
-
-- Added '3.5' to argparse choices
-- Added '3.5' → ('embedding_finetune', epochs) to stage_map
-- Added embedding_finetune stage handling (freeze STN/OCR, unfreeze generator)
-- Setup embedding loss before training
-- Added to batch_size_map and lr_map
-
-**Training Procedure:**
-
-**Stage 2: Pixel-only Pre-training** (Already done)
-- Train generator with L1 + SSIM loss only
-- No OCR loss at all
-- Result: Good visual quality, blurry but diverse characters
-
-**Stage 3.5: Embedding Fine-tuning** (NEW)
-- Load Stage 2 checkpoint
-- Enable embedding loss only (disable LCOFL, OCR CE)
-- Keep generator trainable (unlike refiner approach)
-- Train until character accuracy >90%
-
-**Expected Results:**
-
-| Metric | Current (CE-based) | Target (Embedding-based) |
-|--------|-------------------|-------------------------|
-| Character Accuracy | 9-14% (collapsed) | >90% |
-| Plate Accuracy | 0% | >80% |
-| Mode Collapse | Severe (B→9→6) | None |
-| Visual Quality | Good | Good (preserved from Stage 2) |
-
-**Training Commands:**
-
-```bash
-# Train Stage 2 (pixel-only) - already done
-python train.py --stage 2 --config config.py
-
-# Train Stage 3.5 (embedding fine-tuning) - NEW
-python train.py --stage 3.5 --config config.py
-
-# Or train all stages (includes 3.5)
-python train.py --stage all --config config.py
-```
-
-**Key Research References:**
-
-- **LP-Diff (CVPR 2025)**: Multi-frame diffusion with frozen OCR supervision
-- **LPSRGAN / Embedding SR**: Frozen OCR + cosine similarity on embeddings
-- **LCOFL (SIBGRAPI 2024)**: Character confusion penalties (still uses CE)
-
-**Verification:**
-
-After training Stage 3.5, check:
-1. Character accuracy should reach >90%
-2. All characters should be represented (not just B, 9, 6)
-3. Embedding similarity should correlate with character correctness
-4. Visual quality should be preserved from Stage 2
-
+**Behavior**: `TextPriorExtractor` freezes PARSeq completely
+**Gotcha**: No gradients flow through PARSeq (intentional)
+**Solution**: Only projection layers are trainable
 
 ## Reproducibility & Determinism
 
 ### Strict Determinism (Default)
 
-The codebase enables strict determinism by default via `seed_everything()` in `train.py`. This ensures exact reproducibility across runs but has a 5-15% performance overhead.
-
-**DO NOT disable strict determinism** unless you have a specific reason and document it.
+The codebase enables strict determinism by default via `seed_everything()` in `train.py`.
 
 ```python
 # Default - strict determinism enabled
 seed_everything(42)
-
-# Only if you need faster training and don't need reproducibility
-seed_everything(42, strict_determinism=False)
 ```
 
 ### What Strict Determinism Enables
@@ -806,122 +259,45 @@ seed_everything(42, strict_determinism=False)
 - TF32 disabled (exact float32)
 - `PYTHONHASHSEED` set to seed
 
-### Non-Deterministic Operations
-
-If you encounter a `RuntimeError` about non-deterministic operations:
-
-1. First, try to find a deterministic alternative
-2. If unavoidable, document the exception clearly
-3. Consider using `torch.use_deterministic_algorithms(True, warn_only=True)` locally
-
 ## Checkpoint Security
 
 ### Critical Security Rules
 
-1. **NEVER load checkpoints from untrusted sources** - `torch.load()` uses pickle which can execute arbitrary code
+1. **NEVER load checkpoints from untrusted sources** - `torch.load()` uses pickle
 2. **NEVER accept checkpoint paths from user input without validation**
-3. **Always validate checkpoint paths are local files** - The `load_checkpoint()` function enforces this
-
-### Adding New Checkpoint Loading Code
-
-If you need to add new checkpoint loading functionality:
-
-```python
-from pathlib import Path
-import warnings
-
-def load_something(checkpoint_path: str):
-    # REQUIRED: Validate path is a local file
-    checkpoint_file = Path(checkpoint_path)
-    if not checkpoint_file.is_file():
-        raise FileNotFoundError(
-            f"Checkpoint not found or not a local file: {checkpoint_path}. "
-            "For security reasons, only local file paths are accepted."
-        )
-    
-    # REQUIRED: Emit security warning
-    warnings.warn(
-        f"Loading checkpoint from '{checkpoint_path}'. "
-        "torch.load() uses pickle which can execute arbitrary code. "
-        "Only load checkpoints from trusted sources.",
-        UserWarning
-    )
-    
-    # Load with weights_only=False (we need optimizer state, etc.)
-    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
-    return checkpoint
-```
+3. **Always validate checkpoint paths are local files**
 
 ## Testing Changes
 
 ### Quick Validation
 ```bash
 # Run training for 1 epoch to check for errors
-python train.py --data-dir data/ --output-dir test_outputs/ --stage 1
+python train.py --stage 1 --epochs 1
 ```
 
 ### Check for NaN
 - Monitor validation logs for `nan` values in losses
 - Check `train.py` NaN batch detection warnings
 
-### Memory Check
-```python
-# Monitor GPU memory
-import torch
-print(f"Allocated: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
-print(f"Cached: {torch.cuda.memory_reserved() / 1e9:.2f} GB")
-```
-
 ## Dependencies
 
 ### Required
 - `torch>=2.0.0` - Core framework
 - `timm>=0.9.0` - For PARSeq pretrained models
-- `einops>=0.7.0` - Tensor operations in SwinIR
+- `einops>=0.7.0` - Tensor operations
 
 ### For Pretrained PARSeq
 - Requires internet on first run (torch.hub download)
 - Falls back to custom implementation if download fails
 
-## File Modification Checklist
+## Verification
 
-When modifying key files, ensure consistency:
+After training, verify:
 
-- [ ] `config.py` - Update hyperparameters
-- [ ] `train.py` - Update training logic
-- [ ] `models/__init__.py` - Export new modules
-- [ ] `losses/__init__.py` - Export new losses
-- [ ] `README.md` - Update documentation
-- [ ] Test with `python train.py --stage 1` (quick smoke test)
-- [ ] Run `ruff check .` and `ruff format --check .` before committing
-- [ ] Run `pytest` to verify no regressions
-
-## CI/CD
-
-This project uses GitHub Actions for continuous integration:
-
-- **Lint**: Ruff formatting and linting checks
-- **Test**: pytest on Python 3.10 and 3.11
-- **Smoke Test**: Quick training pipeline validation
-
-See `.github/workflows/ci.yml` for details.
-
-### Running CI Checks Locally
-
-```bash
-# Install dev dependencies
-pip install ruff pytest
-
-# Linting
-ruff check .
-ruff format --check .
-
-# Testing
-pytest -v
-
-# Smoke tests only
-pytest -v -m smoke
-```
+1. **Character accuracy** >90%
+2. **All characters represented** (no mode collapse)
+3. **Inference works** without text input
+4. **Visual quality** preserved (sharp characters)
 
 ## Contact
 

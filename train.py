@@ -35,11 +35,9 @@ from tqdm import tqdm
 import yaml
 
 from config import Config, get_default_config
-from models import NeuroSymbolicLPR, PatchDiscriminator
+from models import TextPriorGuidedLPR
 from losses import CompositeLoss, CornerLoss, GANLoss, ConfusionMatrixTracker
 from losses.composite_loss import StagedTrainingManager
-from losses.ocr_discriminator import create_ocr_discriminator, OCRDiscriminatorLoss
-from losses.parseq_feature_loss import GatedPARSeqFeatureLoss
 from data import RodoSolDataset, SyntheticLPRDataset, LPRAugmentation, lpr_collate_fn
 
 
@@ -299,13 +297,10 @@ def create_optimizer(
     
     # Adjust learning rates based on lr_scale if present
     base_lr = {
-        'pretrain': config.training.lr_pretrain,
-        'stn': config.training.lr_stn,
-        'parseq_warmup': config.training.lr_parseq_warmup,
-        'restoration': config.training.lr_restoration,
-        'refiner': config.training.refiner_lr,  # Two-Stage Solution: Refiner LR (2026-01-27)
-        'full': config.training.lr_finetune,
-        'embedding_finetune': config.training.embedding_finetune_lr,  # Embedding fine-tuning LR (2026-01-27)
+        # TP Architecture learning rates
+        'tp_stn': getattr(config.training, 'tp_stn_lr', 1e-4),
+        'tp_generator': getattr(config.training, 'tp_generator_lr', 1e-4),
+        'tp_full': getattr(config.training, 'tp_full_lr', 5e-5),
     }.get(stage, 1e-4)
     
     for group in param_groups:
@@ -417,11 +412,9 @@ def train_epoch(
     ema: Optional[EMA] = None,
     grad_clip_norm: float = 1.0,
     total_epochs: int = 20,
-    ocr_discriminator_loss: Optional['OCRDiscriminatorLoss'] = None,
     model_stage2: Optional[nn.Module] = None,  # Stage 2 model for anchor generation
     config: Optional[Config] = None,           # For Stage 3 parameters
-    frozen_ocr: Optional[nn.Module] = None,    # Frozen OCR for LCOFL classification
-    parseq_feature_loss: Optional['GatedPARSeqFeatureLoss'] = None  # PARSeq feature loss
+    frozen_ocr: Optional[nn.Module] = None    # Frozen OCR for LCOFL classification
 ) -> Dict[str, float]:
     """
     Train for one epoch with optional mixed precision.
@@ -530,7 +523,12 @@ def train_epoch(
                     'hr_image': hr_image,  # Use GT HR for logging purposes
                 }
             else:
-                outputs = model(lr_frames, return_intermediates=True)
+                # TP Architecture: Use text prior during training (not during inference)
+                use_text_prior = stage.startswith('tp_') and model.training
+                if use_text_prior:
+                    outputs = model(lr_frames, return_intermediates=True, use_text_prior=True)
+                else:
+                    outputs = model(lr_frames, return_intermediates=True)
             
             # ================================================================
             # FROZEN OCR FOR LCOFL (Character-Aware SR Training)
@@ -619,80 +617,7 @@ def train_epoch(
                     ocr_baseline=ocr_baseline,  # Validated Stage 2 OCR loss
                     config=config.training if config else None
                 )
-            
-            # Add OCR-based guidance loss if configured
-            # Uses recognition confidence to guide super-resolution
-            # OPTIMIZATION: Only run OCR every N steps to reduce overhead
-            ocr_every_n_steps = 4  # Run OCR every 4 iterations (4x speedup)
-            ocr_batch_size = 8  # Only use subset of batch for OCR (4x speedup)
-            
-            run_ocr_this_step = (batch_idx % ocr_every_n_steps == 0)
-            
-            if ocr_discriminator_loss is not None and stage == 'restoration' and run_ocr_this_step:
-                # Get text targets (remove BOS/EOS tokens)
-                text_targets = targets['text_indices'][:, 1:-1]  # (B, PLATE_LENGTH)
-                
-                # OPTIMIZATION: Only use subset of batch for OCR (saves ~75% OCR cost)
-                hr_for_ocr = outputs['hr_image'][:ocr_batch_size]
-                gt_for_ocr = targets['hr_image'][:ocr_batch_size]
-                text_for_ocr = text_targets[:ocr_batch_size]
-                
-                # Compute OCR guidance loss on generated HR images
-                ocr_loss, ocr_metrics = ocr_discriminator_loss.generator_loss(
-                    fake_images=hr_for_ocr,
-                    targets=text_for_ocr,
-                    real_images=gt_for_ocr
-                )
-                
-                # Only apply OCR guidance if the OCR model has meaningful confidence
-                # If real image confidence is too low, the OCR model is untrained/unreliable
-                real_conf = ocr_metrics.get('real_confidence', 0.0)
-                min_ocr_confidence = 0.10  # 10% threshold
-                
-                if real_conf >= min_ocr_confidence:
-                    # Add to total loss (scaled by ocr_every_n_steps to compensate for frequency)
-                    if not check_for_nan(ocr_loss, "ocr_guidance"):
-                        loss_g = loss_g + ocr_loss * ocr_every_n_steps
-                        loss_dict['ocr_guidance'] = ocr_metrics.get('total', ocr_loss.item())
-                else:
-                    # Skip OCR guidance - model not ready
-                    loss_dict['ocr_guidance'] = 0.0
-                
-                # Always log confidence for monitoring
-                loss_dict['ocr_fake_conf'] = ocr_metrics.get('fake_confidence', 0.0)
-                if 'real_confidence' in ocr_metrics:
-                    loss_dict['ocr_real_conf'] = ocr_metrics['real_confidence']
-            elif ocr_discriminator_loss is not None and stage == 'restoration':
-                # Not running OCR this step - use cached values for logging
-                loss_dict['ocr_guidance'] = 0.0
-                loss_dict['ocr_fake_conf'] = 0.0
-                loss_dict['ocr_real_conf'] = 0.0
-        
-        # =================================================================
-        # PARSeq FEATURE LOSS (L1 on encoder features - Stage 3)
-        # =================================================================
-        # Compute L1 loss on PARSeq encoder features with gating and warmup.
-        # This bypasses the decoder/LM for smoother OCR-aware gradients.
-        # =================================================================
-        if parseq_feature_loss is not None and 'hr_image' in outputs and 'hr_image' in targets:
-            # Get current pixel loss for gating
-            pixel_loss_val = loss_dict.get('pixel', 0.0)
-            
-            # Compute feature loss (includes warmup and gating internally)
-            l_parseq = parseq_feature_loss(
-                sr_image=outputs['hr_image'],
-                gt_image=targets['hr_image'],
-                pixel_loss=pixel_loss_val
-            )
-            
-            if not check_for_nan(l_parseq, "parseq_feature"):
-                loss_g = loss_g + l_parseq
-                loss_dict['parseq_feature'] = l_parseq.item() if hasattr(l_parseq, 'item') else l_parseq
-                loss_dict['parseq_weight'] = parseq_feature_loss.get_current_weight(pixel_loss_val)
-            
-            # Increment step counter for warmup
-            parseq_feature_loss.step()
-        
+
         # Check for NaN loss and skip batch if detected
         if check_for_nan(loss_g, "loss_g"):
             nan_batch_count += 1
@@ -1091,15 +1016,21 @@ def validate(
                     'hr_image': hr_image,
                 }
             else:
-                outputs = model(lr_frames, return_intermediates=True)
+                # TP Architecture: Never use text prior during validation (inference mode)
+                if stage.startswith('tp_'):
+                    outputs = model(lr_frames, return_intermediates=True, use_text_prior=False)
+                else:
+                    outputs = model(lr_frames, return_intermediates=True)
             
             # Compute loss - use stage-specific loss to avoid NaN from OCR
             # during early training stages (STN stage especially)
             if stage == 'pretrain' or stage == 'parseq_warmup':
                 _, loss_dict = criterion.get_stage_loss('pretrain', outputs, targets)
-            elif stage == 'stn':
+            elif stage == 'stn' or stage == 'tp_stn':
+                # tp_stn uses same loss as stn (geometry + pixel)
                 _, loss_dict = criterion.get_stage_loss('stn', outputs, targets)
-            elif stage == 'restoration':
+            elif stage == 'restoration' or stage == 'tp_generator':
+                # tp_generator uses same loss as restoration (pixel + perceptual + text prior)
                 _, loss_dict = criterion.get_stage_loss('restoration', outputs, targets)
             elif stage == 'refiner':
                 # Refiner Stage: Two-Stage Solution for Mode Collapse (2026-01-27)
@@ -1107,6 +1038,9 @@ def validate(
             elif stage == 'embedding_finetune':
                 # Stage 3.5: Embedding-based Fine-tuning (Fix for mode collapse - 2026-01-27)
                 _, loss_dict = criterion.get_stage_loss('embedding_finetune', outputs, targets)
+            elif stage == 'full' or stage == 'tp_full':
+                # tp_full uses same loss as full (end-to-end)
+                _, loss_dict = criterion(outputs, targets)
             else:
                 _, loss_dict = criterion(outputs, targets)
             
@@ -1420,50 +1354,25 @@ def train_stage(
         weight_ssim=config.training.weight_ssim if config.training.use_lcofl else 0.0,
         weight_tv=config.training.weight_tv,  # Total Variation for wavy artifact suppression
         weight_edge=getattr(config.training, 'weight_edge', 0.0),  # Edge loss for sharper characters
-        # Refiner weights - Two-Stage Solution for Mode Collapse (2026-01-27)
-        weight_refiner_ocr=config.training.weight_refiner_ocr,
-        weight_refiner_perceptual=config.training.weight_refiner_perceptual,
-        weight_refiner_pixel=config.training.weight_refiner_pixel,
+        # Text-Prior weights - NEW Architecture (2026-01-27)
+        weight_tp_text_prior=getattr(config.training, 'weight_tp_text_prior', 0.3),
         use_perceptual=True,  # Enable perceptual loss for sharper images
         use_lcofl=config.training.use_lcofl,
         lcofl_alpha=config.training.lcofl_alpha,
         lcofl_beta=config.training.lcofl_beta,
         gan_mode='lsgan'  # Use LSGAN (MSE loss) instead of vanilla (BCE) to prevent vanishing gradients when D is too strong
     )
-    
-    # Create OCR Discriminator if configured
-    # Uses OCR recognition confidence instead of binary real/fake classification
-    ocr_discriminator = None
-    ocr_discriminator_loss = None
-    if config.training.use_ocr_discriminator and stage in ['restoration', 'full']:
-        logger.info("Using OCR-as-Discriminator for GAN training")
-        logger.info(f"  OCR frozen: {config.training.freeze_ocr_discriminator}")
-        logger.info(f"  Confidence mode: {config.training.ocr_confidence_mode}")
-        logger.info(f"  OCR guidance weight: {config.training.weight_ocr_guidance}")
-        
-        ocr_discriminator = create_ocr_discriminator(
+
+    # ============================================
+    # Setup Text Prior Loss for TP Architecture (2026-01-27)
+    # ============================================
+    if stage.startswith('tp_') and hasattr(model, 'recognizer'):
+        logger.info("Setting up text prior loss for TP-guided training...")
+        criterion.setup_text_prior_loss(
             ocr_model=model.recognizer,
-            freeze_ocr=config.training.freeze_ocr_discriminator,
-            confidence_mode=config.training.ocr_confidence_mode
+            weight_tp_text_prior=getattr(config.training, 'weight_tp_text_prior', 0.3)
         )
-        ocr_discriminator_loss = OCRDiscriminatorLoss(
-            ocr_discriminator=ocr_discriminator,
-            generator_loss_type='combined',
-            lambda_conf=config.training.weight_ocr_guidance
-        )
-        
-        # Stage 3 FIX: The OCR discriminator above freezes the recognizer when
-        # freeze_ocr=True, but Stage 3 requires the recognizer to be trainable
-        # for end-to-end fine-tuning. We unfreeze it here AFTER creating the
-        # discriminator so the discriminator still uses the frozen reference
-        # for stable discrimination, but gradients can flow through for training.
-        if stage == 'full':
-            logger.info("Stage 3: Re-unfreezing recognizer after OCR discriminator creation")
-            model.unfreeze_recognizer()
-            for param in model.recognizer.parameters():
-                param.requires_grad = True
-            recognizer_param_count = sum(1 for _ in model.recognizer.parameters())
-            logger.info(f"  Set requires_grad=True on {recognizer_param_count} recognizer parameters")
+        logger.info(f"  Text prior loss weight: {criterion.weights.get('tp_text_prior', 0.3)}")
     
     # Create optimizers
     optimizer_g = create_optimizer(model, stage, config)
@@ -1528,30 +1437,10 @@ def train_stage(
         else:
             frozen_ocr = None
         
-        # =================================================================
-        # PARSeq FEATURE LOSS (L1 on encoder features - bypasses CE)
-        # =================================================================
-        # Create frozen PARSeq for feature extraction. This uses L1 loss
-        # on encoder features instead of CE loss, providing smoother gradients.
-        # =================================================================
-        if getattr(config.training, 'use_parseq_feature_loss', False):
-            parseq_feature_loss = GatedPARSeqFeatureLoss(
-                parseq_model=model.recognizer,
-                max_weight=getattr(config.training, 'weight_parseq_feature', 1e-3),
-                warmup_steps=getattr(config.training, 'parseq_feature_warmup_steps', 5000),
-                pixel_threshold=getattr(config.training, 'parseq_feature_pixel_threshold', 0.5)
-            )
-            parseq_feature_loss = parseq_feature_loss.to(device)
-            logger.info("  Created PARSeq feature loss (L1 on encoder features)")
-            logger.info(f"    Max weight: {getattr(config.training, 'weight_parseq_feature', 1e-3)}")
-            logger.info(f"    Warmup steps: {getattr(config.training, 'parseq_feature_warmup_steps', 5000)}")
-            logger.info(f"    Pixel threshold: {getattr(config.training, 'parseq_feature_pixel_threshold', 0.5)}")
-        else:
-            parseq_feature_loss = None
-    else:
-        frozen_ocr = None
-        parseq_feature_loss = None
-    
+        # PARSeq feature loss removed - no longer needed in TP architecture
+
+    frozen_ocr = None
+
     optimizer_d = None
     
     # DISABLE GAN for Stage 3 (full) - GAN causes mode collapse
@@ -1656,9 +1545,8 @@ def train_stage(
             model, discriminator, train_loader, criterion,
             optimizer_g, optimizer_d, device, epoch, stage, writer, logger,
             scaler_g=scaler_g, scaler_d=scaler_d, ema=ema, grad_clip_norm=grad_clip_norm,
-            total_epochs=num_epochs, ocr_discriminator_loss=ocr_discriminator_loss,
-            model_stage2=model_stage2, config=config, frozen_ocr=frozen_ocr,
-            parseq_feature_loss=parseq_feature_loss
+            total_epochs=num_epochs,
+            model_stage2=model_stage2, config=config, frozen_ocr=frozen_ocr
         )
         
         # Log training losses
@@ -2084,36 +1972,19 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logger.info(f"Using device: {device}")
 
-    # Create model
-    # With optional shared attention, deformable convolutions, and refiner
-    model = NeuroSymbolicLPR(
+    # Create model - Text-Prior Guided Architecture
+    from models.tp_lpr import create_text_prior_lpr
+    model = create_text_prior_lpr(
         num_frames=config.model.num_frames,
-        lr_size=(config.data.lr_height, config.data.lr_width),
-        hr_size=(config.data.hr_height, config.data.hr_width),
-        use_shared_attention=config.training.use_shared_attention,
-        use_deformable_conv=config.training.use_deformable_conv,
-        # Character Refiner - Two-Stage Solution for Mode Collapse (2026-01-27)
-        use_refiner=config.training.use_refiner,
-        refiner_num_blocks=config.training.refiner_num_blocks,
-        refiner_channels=config.training.refiner_channels,
-        refiner_use_dropout=config.training.refiner_use_dropout,
-        refiner_use_attention=config.training.refiner_use_attention,
-        refiner_use_checkpointing=config.training.refiner_use_checkpointing,
+        num_srb=config.model.tp_num_srb,
+        generator_channels=config.model.tp_generator_channels,
+        use_layout=True,  # Always use layout classifier
+        lightweight=config.model.tp_lightweight
     ).to(device)
+    logger.info("Using Text-Prior Guided Architecture")
 
-    if config.training.use_shared_attention:
-        logger.info("Model using shared attention")
-    if config.training.use_deformable_conv:
-        logger.info("Model using deformable convolutions")
-    if config.training.use_refiner:
-        logger.info("Model using character refiner (Two-Stage Solution)")
-    
-    # Create discriminator
-    discriminator = PatchDiscriminator(
-        in_channels=3,
-        base_channels=64,
-        use_spectral_norm=True
-    ).to(device)
+    # No discriminator in TP architecture (text prior provides guidance instead)
+    discriminator = None
     
     # Create datasets with style-aware augmentation
     if config.data.use_augmentation:
@@ -2303,101 +2174,79 @@ def main():
             logger.info(f"Resumed from {args.resume}, starting at epoch {start_epoch}")
     
     # Determine stages to train
+    # ============================================
+    # Text-Prior Guided Architecture (2026-01-27)
+    # ============================================
+    # Simplified training pipeline with only TP architecture stages
+
+    # Map simple stage numbers to TP stages for convenience
+    stage_map = {
+        '1': ('tp_stn', getattr(config.training, 'tp_stn_epochs', 15)),
+        '2': ('tp_generator', getattr(config.training, 'tp_generator_epochs', 50)),
+        '3': ('tp_full', getattr(config.training, 'tp_full_epochs', 30)),
+        # Also support explicit TP stage names
+        'tp_stn': ('tp_stn', getattr(config.training, 'tp_stn_epochs', 15)),
+        'tp_generator': ('tp_generator', getattr(config.training, 'tp_generator_epochs', 50)),
+        'tp_full': ('tp_full', getattr(config.training, 'tp_full_epochs', 30)),
+    }
+
     if args.stage == 'all':
         stages = [
-            ('stn', config.training.epochs_stn),
-            ('parseq_warmup', config.training.epochs_parseq_warmup),
-            ('restoration', config.training.epochs_restoration),
-            ('refiner', config.training.refiner_epochs) if config.training.use_refiner else (),
-            ('full', config.training.epochs_finetune),
-            ('embedding_finetune', config.training.embedding_finetune_epochs) if config.training.use_embedding_loss else (),
+            ('tp_stn', getattr(config.training, 'tp_stn_epochs', 15)),
+            ('tp_generator', getattr(config.training, 'tp_generator_epochs', 50)),
+            ('tp_full', getattr(config.training, 'tp_full_epochs', 30)),
         ]
-        # Filter out empty tuples if refiner or embedding_finetune is disabled
-        stages = [s for s in stages if s]
+        logger.info(f"Using Text-Prior Guided Architecture stages: {stages}")
     else:
-        stage_map = {
-            '0': ('pretrain', config.training.epochs_pretrain),
-            '1': ('stn', config.training.epochs_stn),
-            '1.5': ('parseq_warmup', config.training.epochs_parseq_warmup),
-            '2': ('restoration', config.training.epochs_restoration),
-            '2.5': ('refiner', config.training.refiner_epochs) if config.training.use_refiner else None,
-            '3': ('full', config.training.epochs_finetune),
-            '3.5': ('embedding_finetune', config.training.embedding_finetune_epochs) if config.training.use_embedding_loss else None,
-        }
-        # Handle case where refiner or embedding_finetune is disabled
-        if args.stage == '2.5' and stage_map['2.5'] is None:
-            raise ValueError("Refiner stage (2.5) requested but use_refiner=False in config")
-        if args.stage == '3.5' and stage_map['3.5'] is None:
-            raise ValueError("Embedding finetune stage (3.5) requested but use_embedding_loss=False in config")
         stages = [stage_map[args.stage]]
     
     # Train each stage
     for stage_name, num_epochs in stages:
-        # Prepare model for stage
-        if stage_name == 'pretrain':
-            # Pretrain: freeze all except recognizer (train OCR only)
-            model.freeze_all_except_recognizer()
-        elif stage_name == 'stn':
-            model.freeze_recognizer()
-        elif stage_name == 'parseq_warmup':
-            # PARSeq warm-up: train only recognizer on GT HR images
-            model.freeze_all_except_recognizer()
-        elif stage_name == 'restoration':
-            model.freeze_stn()
-            model.freeze_recognizer()
-        elif stage_name == 'refiner':
-            # Refiner Stage: Two-Stage Solution for Mode Collapse (2026-01-27)
-            # CRITICAL: Generator MUST stay frozen to prevent mode collapse
-            # Only train the lightweight refiner network with OCR loss
-            model.freeze_stn()
-            model.freeze_recognizer()
-            model.freeze_generator()  # Freeze Stage 2 generator
-            model.unfreeze_refiner()  # Only refiner is trainable
-            logger.info("  Refiner Stage: Generator frozen, only refiner trainable")
-        elif stage_name == 'embedding_finetune':
-            # Stage 3.5: Embedding-based Fine-tuning (Fix for mode collapse - 2026-01-27)
-            # Key difference from refiner: Generator is trainable!
-            # Uses embedding similarity loss instead of cross-entropy
-            model.freeze_stn()
-            model.freeze_recognizer()
-            model.unfreeze_generator()  # Generator is trainable (unlike refiner)
-            # Don't unfreeze refiner - not needed for this stage
-            logger.info("  Embedding Fine-tuning Stage: Generator trainable, using embedding loss")
+        # ============================================
+        # Setup text prior for TP architecture (2026-01-27)
+        # ============================================
+        # For TP architecture, setup text prior extractor before training
+        if stage_name.startswith('tp_') and hasattr(model, 'setup_text_prior'):
+            logger.info("Setting up text prior extractor for TP-guided training...")
+            model.setup_text_prior()
+            logger.info("  Text prior extractor configured (PARSeq frozen)")
 
-            # Setup embedding loss if not already initialized
-            if not criterion._embedding_loss_initialized:
-                criterion.setup_embedding_loss(
-                    ocr_model=model.recognizer,
-                    weight_embedding=config.training.weight_embedding,
-                    loss_type=config.training.embedding_loss_type,
-                    char_pooling=config.training.embedding_char_pooling
-                )
-                logger.info(f"  Initialized embedding loss (type={config.training.embedding_loss_type})")
-        else:  # full
+        # ============================================
+        # Prepare model for TP architecture stage
+        # ============================================
+        if stage_name == 'tp_stn':
+            # TP STN Stage: Train STN + Layout + Quality Fusion
+            # Generator and recognizer are frozen during this stage
+            logger.info("  TP STN Stage: Training geometric rectification only")
+            model.freeze_generator()
+            model.freeze_recognizer()
+            # STN, encoder, layout, quality_fusion are trainable by default
+        elif stage_name == 'tp_generator':
+            # TP Generator Stage: Train generator with text prior
+            # Key: Text prior guides generation, preventing mode collapse
+            logger.info("  TP Generator Stage: Training with text prior guidance")
+            model.freeze_stn()
+            model.freeze_recognizer()
+            model.unfreeze_generator()
+        elif stage_name == 'tp_full':
+            # TP Full Stage: End-to-end training
+            # All components trainable, text prior still guides generation
+            logger.info("  TP Full Stage: End-to-end training with text prior")
             model.unfreeze_stn()
-            # Stage 3: Train recognizer end-to-end with SR
-            # PARSeq stays in eval mode (dropout off) to stabilize gradients
-            # while still allowing weight updates via requires_grad=True
+            model.unfreeze_generator()
             model.unfreeze_recognizer()
-
-            # Force recognizer to be trainable (checkpoint may have restored frozen state)
-            # Ensure all recognizer parameters have requires_grad=True
-            recognizer_params = list(model.recognizer.parameters())
-            for param in recognizer_params:
+            # Ensure recognizer is trainable
+            for param in model.recognizer.parameters():
                 param.requires_grad = True
-            logger.info(f"  Explicitly set requires_grad=True on {len(recognizer_params)} recognizer parameters")
         
         # Get appropriate batch size for this stage
         batch_size_map = {
-            'pretrain': config.training.batch_size_pretrain,
-            'stn': config.training.batch_size_stn,
-            'parseq_warmup': config.training.batch_size_parseq_warmup,
-            'restoration': config.training.batch_size_restoration,
-            'refiner': config.training.batch_size_restoration,  # Use same batch size as restoration
-            'full': config.training.batch_size_finetune,
-            'embedding_finetune': config.training.batch_size_restoration,  # Use same batch size as restoration
+            # TP Architecture batch sizes
+            'tp_stn': getattr(config.training, 'batch_size_tp', getattr(config.training, 'batch_size_stn', 16)),
+            'tp_generator': getattr(config.training, 'batch_size_tp', getattr(config.training, 'batch_size_restoration', 16)),
+            'tp_full': getattr(config.training, 'batch_size_tp', getattr(config.training, 'batch_size_finetune', 8)),
         }
-        batch_size = batch_size_map.get(stage_name, config.training.batch_size_finetune)
+        batch_size = batch_size_map.get(stage_name, getattr(config.training, 'batch_size_tp', 16))
         
         # Create data loaders with stage-specific batch size, custom collate, and deterministic seeding
         # Use a generator seeded from config for reproducible shuffling

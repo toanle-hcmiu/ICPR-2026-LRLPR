@@ -122,18 +122,28 @@ class ModelConfig:
     
     # Layout Classifier
     layout_hidden_dim: int = 256
-    
+
     # Quality Scorer
     quality_hidden_dim: int = 128
-    
-    # SwinIR Generator
-    swinir_embed_dim: int = 96
-    swinir_depths: List[int] = field(default_factory=lambda: [6, 6, 6, 6])
-    swinir_num_heads: List[int] = field(default_factory=lambda: [6, 6, 6, 6])
-    swinir_window_size: int = 8
-    swinir_mlp_ratio: float = 4.0
-    upscale_factor: int = 4
-    
+
+    # Text-Prior Guided Generator (2026-01-27)
+    # Replaces SwinIR with text-aware architecture based on TPGSR + LP-Diff + TSRN
+    use_tp_generator: bool = True  # Enable new text-prior guided generator
+    tp_generator_channels: int = 64  # Feature channels in generator
+    tp_num_srb: int = 4  # Number of Sequential Residual Blocks
+    tp_lstm_hidden: int = 32  # Hidden size for BiLSTM in SRB
+    tp_lightweight: bool = False  # Use lightweight variant for testing
+    tp_text_feature_dim: int = 256  # Dimension for text prior features
+    tp_num_heads: int = 4  # Number of attention heads in cross-attention
+
+    # Multi-Frame Fusion (NEW - from LP-Diff)
+    fusion_type: str = 'icam'  # 'icam' for cross-attention, '3d' for 3d conv, 'adaptive'
+    fusion_num_heads: int = 4  # Number of attention heads (for ICAM)
+
+    # Text Prior (NEW - from TPGSR)
+    use_text_prior_training: bool = True  # Use text prior during training only
+    text_prior_aggregation: str = 'average'  # How to aggregate multi-frame text prior
+
     # Discriminator
     disc_channels: List[int] = field(default_factory=lambda: [64, 128, 256, 512])
     disc_use_spectral_norm: bool = True
@@ -247,45 +257,28 @@ class TrainingConfig:
     stage3_ocr_max_weight: float = 0.0        # Handled by LCOFL directly
     stage3_use_ocr_hinge: bool = False        # Disabled
 
-    # Character Refiner - Two-Stage Solution for Mode Collapse (2026-01-27)
-    # Problem: Direct OCR supervision on generator causes mode collapse
-    # Solution: Keep Stage 2 generator fixed, train separate refiner with OCR loss
-    use_refiner: bool = True                  # Enable character refiner (fixes mode collapse)
-    refiner_num_blocks: int = 3              # Number of residual blocks (lightweight)
-    refiner_channels: int = 3                # RGB channels
-    refiner_use_dropout: bool = True         # Dropout for regularization
-    refiner_use_attention: bool = False      # Experimental: attention for character focus
-    refiner_use_checkpointing: bool = False  # Gradient checkpointing for memory efficiency
-    refiner_lr: float = 1e-4                 # Higher LR than generator (refiner learns faster)
-    refiner_epochs: int = 10                  # Training epochs for refiner
-    refiner_warmup_epochs: int = 2            # Warmup epochs before full OCR loss
-    # Refiner loss weights (OCR only - no pixel loss to prevent blurring)
-    weight_refiner_ocr: float = 1.0          # Main loss: OCR cross-entropy
-    weight_refiner_perceptual: float = 0.05  # Optional: perceptual loss for structure
-    weight_refiner_pixel: float = 0.001      # Minimal pixel loss to preserve Stage 2 output
-    # Generator is frozen during refiner training
-    refiner_freeze_generator: bool = True     # Freeze Stage 2 generator (CRITICAL for no mode collapse)
+    # Text-Prior Guided Architecture Training (2026-01-27)
+    # Training stages for the new text-prior guided architecture
+    use_tp_architecture: bool = True          # Use new TP-guided architecture
+    tp_architecture_stages: List[str] = field(
+        default_factory=lambda: ['tp_stn', 'tp_generator', 'tp_full']
+    )  # Training stages for TP architecture
+    tp_stn_epochs: int = 15                  # STN pre-training with TP-generator
+    tp_generator_epochs: int = 50             # Generator training with text prior
+    tp_full_epochs: int = 30                  # End-to-end fine-tuning
 
-    # OCR Embedding Loss (Stage 3.5) - Fix for mode collapse (2026-01-27)
-    # Problem: Cross-entropy rewards confidence, not correctness → mode collapse
-    # Solution: Embedding similarity loss rewards semantic correctness
-    # Key insight: Can't "cheat" by being confidently wrong
-    use_embedding_loss: bool = True           # Enable embedding loss for Stage 3.5
-    weight_embedding: float = 0.3             # Weight for embedding similarity loss
-    embedding_loss_type: str = 'cosine'       # 'cosine', 'mse', or 'combined'
-    embedding_char_pooling: str = 'spatial'   # 'spatial' or 'adaptive'
-    embedding_temperature: float = 1.0        # Temperature for cosine similarity
+    # TP Architecture loss weights
+    weight_tp_pixel: float = 1.0              # Reconstruction loss (L1)
+    weight_tp_text_prior: float = 0.3         # Text prior loss (during training)
+    weight_tp_perceptual: float = 0.1         # Perceptual loss (VGG)
+    weight_tp_ssim: float = 0.2                # SSIM loss
+    # Disable GAN loss for TP architecture (causes instability)
+    weight_tp_gan: float = 0.0                 # DISABLE - GAN causes mode collapse
 
-    # Stage 3.5: Embedding Fine-tuning Configuration
-    embedding_finetune_epochs: int = 50       # Epochs for embedding fine-tuning
-    embedding_finetune_lr: float = 1e-5       # Learning rate (conservative)
-    # Stage 3.5 loss weights (disables CE-based losses)
-    weight_finetune_pixel: float = 0.5        # Anchor visual quality
-    weight_finetune_ssim: float = 0.2         # Structural similarity
-    weight_finetune_tv: float = 1e-5          # Suppress artifacts
-    # Disable cross-entropy based losses during embedding fine-tuning
-    weight_finetune_lcofl: float = 0.0        # DISABLE - uses cross-entropy
-    weight_finetune_ocr: float = 0.0           # DISABLE - uses cross-entropy
+    # TP Architecture learning rates
+    tp_stn_lr: float = 1e-4                   # STN learning rate
+    tp_generator_lr: float = 1e-4               # Generator learning rate
+    tp_full_lr: float = 5e-5                    # Full model learning rate
 
     # Optimizer
     optimizer: str = 'adamw'

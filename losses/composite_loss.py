@@ -14,7 +14,6 @@ from typing import Dict, Optional, Tuple
 from .corner_loss import CornerLoss
 from .gan_loss import GANLoss, PixelLoss, PerceptualLoss
 from .lcofl_loss import LCOFLLoss, SSIMLoss, ConfusionMatrixTracker
-from .embedding_loss import OCREmbeddingLoss, create_embedding_loss
 
 
 class TotalVariationLoss(nn.Module):
@@ -473,10 +472,8 @@ class CompositeLoss(nn.Module):
         weight_ssim: float = 0.0,
         weight_tv: float = 0.0,  # Total Variation loss weight for wavy artifact suppression
         weight_edge: float = 0.0,  # Edge loss weight for sharper character boundaries
-        # Refiner weights - Two-Stage Solution for Mode Collapse (2026-01-27)
-        weight_refiner_ocr: float = 1.0,  # Primary refiner loss: OCR cross-entropy
-        weight_refiner_perceptual: float = 0.05,  # Optional: perceptual loss for structure
-        weight_refiner_pixel: float = 0.001,  # Minimal pixel loss to preserve Stage 2 output
+        # Text-Prior weights - NEW Architecture (2026-01-27)
+        weight_tp_text_prior: float = 0.3,  # Text prior loss for TP-guided training
         gan_mode: str = 'vanilla',
         ocr_loss_type: str = 'cross_entropy',
         use_perceptual: bool = False,
@@ -497,9 +494,7 @@ class CompositeLoss(nn.Module):
             weight_lcofl: Weight for LCOFL loss (0 to disable).
             weight_ssim: Weight for SSIM loss (0 to disable).
             weight_tv: Weight for Total Variation loss (0 to disable, 1e-5 recommended for wavy suppression).
-            weight_refiner_ocr: Weight for refiner OCR loss (primary refiner loss).
-            weight_refiner_perceptual: Weight for refiner perceptual loss (optional).
-            weight_refiner_pixel: Weight for refiner pixel loss (minimal, for structure preservation).
+            weight_tp_text_prior: Weight for text prior loss (TP architecture).
             gan_mode: Type of GAN loss.
             ocr_loss_type: Type of OCR loss.
             use_perceptual: Whether to use perceptual loss.
@@ -520,10 +515,8 @@ class CompositeLoss(nn.Module):
             'ssim': weight_ssim,
             'tv': weight_tv,  # Total Variation for wavy artifact suppression
             'edge': weight_edge,  # Edge loss for sharper characters
-            # Refiner weights - Two-Stage Solution (2026-01-27)
-            'refiner_ocr': weight_refiner_ocr,
-            'refiner_perceptual': weight_refiner_perceptual,
-            'refiner_pixel': weight_refiner_pixel
+            # Text-Prior weights - NEW Architecture (2026-01-27)
+            'tp_text_prior': weight_tp_text_prior,
         }
         
         # Individual losses
@@ -569,39 +562,31 @@ class CompositeLoss(nn.Module):
         else:
             self.edge_loss = None
 
-        # OCR Embedding Loss (Fix for mode collapse - 2026-01-27)
-        # Uses frozen PARSeq embeddings instead of cross-entropy
-        # This rewards semantic correctness, not confidence
-        self.embedding_loss = None
-        self.ocr_model_for_embedding = None
-        self._embedding_loss_initialized = False
+        # Text Prior Loss - NEW Architecture (2026-01-27)
+        # Based on TPGSR: Uses frozen PARSeq for text prior guidance
+        # Prevents mode collapse by providing categorical constraints
+        self.text_prior_loss = None
+        self._text_prior_loss_initialized = False
 
-    def setup_embedding_loss(
+    def setup_text_prior_loss(
         self,
         ocr_model: nn.Module,
-        weight_embedding: float = 0.3,
-        loss_type: str = 'cosine',
-        char_pooling: str = 'spatial'
+        weight_tp_text_prior: float = 0.3
     ):
         """
-        Initialize OCR embedding loss.
+        Initialize text prior loss for TP-guided architecture.
 
-        Call this before training with embedding loss (Stage 3.5).
+        Call this before training with text prior (tp_generator, tp_full stages).
 
         Args:
-            ocr_model: PARSeq model (will be frozen inside embedding loss)
-            weight_embedding: Weight for embedding loss
-            loss_type: 'cosine', 'mse', or 'combined'
-            char_pooling: 'spatial' or 'adaptive'
+            ocr_model: PARSeq model (will be frozen inside text prior loss)
+            weight_tp_text_prior: Weight for text prior loss
         """
-        self.ocr_model_for_embedding = ocr_model
-        self.embedding_loss = OCREmbeddingLoss(
-            ocr_model=ocr_model,
-            char_pooling=char_pooling,
-            loss_type=loss_type
-        )
-        self.weights['embedding'] = weight_embedding
-        self._embedding_loss_initialized = True
+        from models.text_prior import TextPriorLoss
+
+        self.text_prior_loss = TextPriorLoss(ocr_model)
+        self.weights['tp_text_prior'] = weight_tp_text_prior
+        self._text_prior_loss_initialized = True
 
     def forward(
         self,
@@ -660,6 +645,16 @@ class CompositeLoss(nn.Module):
                 l_ocr = self._clamp_loss(l_ocr)
                 loss_dict['ocr'] = self._safe_loss_item(l_ocr)
                 weighted = self.weights['ocr'] * l_ocr
+                total_loss = weighted if total_loss is None else total_loss + weighted
+
+        # Text Prior Loss - NEW Architecture (2026-01-27)
+        # Encourages generated HR to produce correct character probabilities
+        if self.text_prior_loss is not None and 'hr_image' in outputs and 'text_indices' in targets:
+            if not (torch.isnan(outputs['hr_image']).any() or torch.isnan(targets['text_indices'].float()).any()):
+                l_tp = self.text_prior_loss(outputs['hr_image'], targets['text_indices'])
+                l_tp = self._clamp_loss(l_tp)
+                loss_dict['tp_text_prior'] = self._safe_loss_item(l_tp)
+                weighted = self.weights['tp_text_prior'] * l_tp
                 total_loss = weighted if total_loss is None else total_loss + weighted
         
         # Geometry loss
@@ -1005,141 +1000,7 @@ class CompositeLoss(nn.Module):
             loss_dict['total'] = self._safe_loss_item(total_loss)
             return total_loss, loss_dict
 
-        elif stage == 'refiner':
-            # Refiner Stage: Two-Stage Solution for Mode Collapse (2026-01-27)
-            # Only OCR loss on refined output - generator is frozen
-            # No pixel loss to prevent blurring
-            loss_dict = {}
-            total_loss = None
-
-            # Use refined output if available, otherwise fall back to regular hr_image
-            hr_output = outputs.get('hr_image_refined', outputs.get('hr_image'))
-
-            # OCR loss on refined output - primary loss for refiner
-            if 'masked_logits' in outputs and 'text_indices' in targets:
-                logits = outputs['masked_logits']
-                text_targets = targets['text_indices']
-
-                if not (torch.isnan(logits).any() or torch.isnan(text_targets.float()).any()):
-                    l_ocr = self.ocr_loss(logits, text_targets)
-                    l_ocr = self._clamp_loss(l_ocr)
-                    loss_dict['ocr'] = self._safe_loss_item(l_ocr)
-
-                    # Use refiner OCR weight (default: 1.0 - primary loss)
-                    refiner_ocr_weight = self.weights.get('refiner_ocr', 1.0)
-                    weighted = refiner_ocr_weight * l_ocr
-                    total_loss = weighted if total_loss is None else total_loss + weighted
-
-            # Optional: Minimal pixel loss to preserve Stage 2 structure
-            # Use refined output if available, otherwise fall back to regular hr_image
-            if hr_output is not None and 'hr_image' in targets:
-                refiner_pixel_weight = self.weights.get('refiner_pixel', 0.001)
-                if refiner_pixel_weight > 0:
-                    if not (torch.isnan(hr_output).any() or torch.isnan(targets['hr_image']).any()):
-                        l_pixel = self.pixel_loss(hr_output, targets['hr_image'])
-                        l_pixel = self._clamp_loss(l_pixel)
-                        loss_dict['pixel'] = self._safe_loss_item(l_pixel)
-                        weighted = refiner_pixel_weight * l_pixel
-                        total_loss = weighted if total_loss is None else total_loss + weighted
-
-            # Optional: Perceptual loss for structure preservation
-            if self.perceptual_loss is not None and hr_output is not None and 'hr_image' in targets:
-                refiner_perceptual_weight = self.weights.get('refiner_perceptual', 0.05)
-                if refiner_perceptual_weight > 0:
-                    if not (torch.isnan(hr_output).any() or torch.isnan(targets['hr_image']).any()):
-                        l_perceptual = self.perceptual_loss(hr_output, targets['hr_image'])
-                        l_perceptual = self._clamp_loss(l_perceptual)
-                        loss_dict['perceptual'] = self._safe_loss_item(l_perceptual)
-                        weighted = refiner_perceptual_weight * l_perceptual
-                        total_loss = weighted if total_loss is None else total_loss + weighted
-
-            # Ensure total_loss requires grad
-            if total_loss is not None and not total_loss.requires_grad:
-                if hr_output is not None:
-                    total_loss = total_loss + hr_output.sum() * 0.0
-                else:
-                    total_loss = total_loss.requires_grad_(True)
-
-            # Final clamp
-            total_loss = self._clamp_loss(total_loss, max_val=100.0)
-
-            loss_dict['total'] = self._safe_loss_item(total_loss)
-            return total_loss, loss_dict
-
-        elif stage == 'embedding_finetune':
-            # Stage 3.5: Embedding-based Fine-tuning (Fix for mode collapse - 2026-01-27)
-            #
-            # This stage replaces cross-entropy OCR loss with embedding similarity loss.
-            # Key differences from refiner approach:
-            # - Generator is trainable (not frozen)
-            # - Uses embedding similarity instead of cross-entropy
-            # - Embedding loss rewards semantic correctness, not confidence
-            #
-            # Loss = w_pixel * L_pixel + w_ssim * L_ssim + w_embedding * L_embedding
-            #
-            loss_dict = {}
-            total_loss = None
-
-            # Get generated HR image
-            hr_output = outputs.get('hr_image')
-
-            # 1. PIXEL LOSS (anchor visual quality)
-            if hr_output is not None and 'hr_image' in targets:
-                if not (torch.isnan(hr_output).any() or torch.isnan(targets['hr_image']).any()):
-                    l_pixel = self.pixel_loss(hr_output, targets['hr_image'])
-                    l_pixel = self._clamp_loss(l_pixel)
-                    loss_dict['pixel'] = self._safe_loss_item(l_pixel)
-                    weighted = self.weights.get('pixel', 0.5) * l_pixel
-                    total_loss = weighted if total_loss is None else total_loss + weighted
-
-            # 2. SSIM LOSS (structural similarity)
-            if self.ssim_loss is not None and hr_output is not None and 'hr_image' in targets:
-                if not (torch.isnan(hr_output).any() or torch.isnan(targets['hr_image']).any()):
-                    l_ssim = self.ssim_loss(hr_output, targets['hr_image'])
-                    l_ssim = self._clamp_loss(l_ssim)
-                    loss_dict['ssim'] = self._safe_loss_item(l_ssim)
-                    weighted = self.weights.get('ssim', 0.2) * l_ssim
-                    total_loss = weighted if total_loss is None else total_loss + weighted
-
-            # 3. EMBEDDING LOSS (primary - replaces cross-entropy OCR loss)
-            # This is the KEY innovation: embedding similarity instead of CE
-            if self.embedding_loss is not None and hr_output is not None and 'hr_image' in targets:
-                if not (torch.isnan(hr_output).any() or torch.isnan(targets['hr_image']).any()):
-                    l_embedding = self.embedding_loss(hr_output, targets['hr_image'])
-                    l_embedding = self._clamp_loss(l_embedding)
-                    loss_dict['embedding'] = self._safe_loss_item(l_embedding)
-                    weighted = self.weights.get('embedding', 0.3) * l_embedding
-                    total_loss = weighted if total_loss is None else total_loss + weighted
-            elif self.weights.get('embedding', 0) > 0:
-                # Embedding loss configured but not initialized
-                raise RuntimeError(
-                    "Embedding loss weight > 0 but embedding_loss not initialized. "
-                    "Call loss_fn.setup_embedding_loss(ocr_model) before training."
-                )
-
-            # 4. Optional: TV LOSS (suppress artifacts)
-            if self.tv_loss is not None and hr_output is not None:
-                if not torch.isnan(hr_output).any():
-                    l_tv = self.tv_loss(hr_output)
-                    l_tv = self._clamp_loss(l_tv)
-                    loss_dict['tv'] = self._safe_loss_item(l_tv)
-                    weighted = self.weights.get('tv', 0.0) * l_tv
-                    total_loss = weighted if total_loss is None else total_loss + weighted
-
-            # Ensure total_loss requires grad
-            if total_loss is not None and not total_loss.requires_grad:
-                if hr_output is not None:
-                    total_loss = total_loss + hr_output.sum() * 0.0
-                else:
-                    total_loss = total_loss.requires_grad_(True)
-
-            # Final clamp
-            total_loss = self._clamp_loss(total_loss, max_val=100.0)
-
-            loss_dict['total'] = self._safe_loss_item(total_loss)
-            return total_loss, loss_dict
-
-        else:  # 'full' - Stage 3 with anti-collapse mechanisms
+        else:  # 'full' or 'tp_full' - Stage 3 with anti-collapse mechanisms
             return self.get_stage3_loss(
                 outputs, targets, discriminator,
                 global_step=0,  # Default, should be passed from train.py
