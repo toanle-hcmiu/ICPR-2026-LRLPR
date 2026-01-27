@@ -258,29 +258,25 @@ def _clamp_loss(self, loss, max_val=100.0):
 - **Purpose**: Adaptive spatial sampling for character alignment
 - **Usage**: Set `config.training.use_deformable_conv = True` (requires `use_shared_attention = True`)
 
-### Stage 3 Mode Collapse Prevention
-- **File**: `train.py:train_stage()` (lines 1459-1477)
-- **Config**: `use_frozen_ocr_for_lcofl: True` (config.py line 206)
-- **Status**: ✅ Active by default for Stage 3 training
-- **Purpose**: Prevents generator from learning adversarial features that fool trainable OCR
-- **Mechanism**: 
-  1. Creates deep copy of recognizer at Stage 3 start
-  2. Freezes all parameters and sets `eval()` mode
-  3. Uses frozen copy for LCOFL classification loss computation
-- **Key Insight**: Generator cannot "cheat" by learning hidden features only trainable OCR detects
+### Stage 3 Mode Collapse Prevention (SUPERSEDED - See Section 14)
+> **NOTE**: This approach was superseded by the Two-Stage Refinement Solution (Section 14). Kept for historical context.
 
-**Stage 3 Anti-Collapse Configuration:**
+- **File**: `train.py:train_stage()` (lines 1459-1477)
+- **Config**: `use_frozen_ocr_for_lcofl: False` (currently DISABLED - see Section 14)
+- **Previous Status**: ✅ Was active, but did not fully prevent mode collapse
+- **Purpose**: Was intended to prevent generator from learning adversarial features that fool trainable OCR
+
+**Current Configuration (as of 2026-01-27):**
 ```python
 # In config.py - TrainingConfig
-use_frozen_ocr_for_lcofl: bool = True      # Enable frozen OCR copy
-stage3_sr_anchor_weight: float = 1.0       # Anchor to Stage 2 output
-stage3_ocr_warmup_steps: int = 6000        # Steps before OCR ramps up
-stage3_ocr_ramp_steps: int = 6000          # Steps to ramp to max weight
-stage3_ocr_max_weight: float = 0.5         # Max OCR loss weight
-weight_lcofl: float = 0.75                 # LCOFL weight (original paper)
+use_frozen_ocr_for_lcofl: bool = False     # DISABLED - use trainable OCR only
+use_refiner: bool = True                    # ENABLED - Two-Stage Solution instead
 ```
 
-### 11. Stage 3 Mode Collapse - CRITICAL FIX (2025-01-25 v2)
+---
+
+### 11. Stage 3 Mode Collapse - CRITICAL FIX v2 (2025-01-25) - SUPERSEDED
+> **NOTE**: This fix was necessary but not sufficient. See Section 14 for the final solution.
 
 **Problem:** Stage 3 training causes ALL plates to predict the same characters (e.g., "AEE-9333") despite having different ground truth texts. Loss increases over time instead of decreasing.
 
@@ -334,7 +330,8 @@ weight_lcofl: float = 0.75                 # LCOFL weight (original paper)
 - ✅ Visual quality preserved (sharp characters)
 - ✅ OCR accuracy improves gradually
 
-### 12. Stage 3 Mode Collapse - CRITICAL FIX v3 (2026-01-26)
+### 12. Stage 3 Mode Collapse - CRITICAL FIX v3 (2026-01-26) - SUPERSEDED
+> **NOTE**: This fix was also necessary but not sufficient. See Section 14 for the final solution.
 
 **Problem:** Stage 3 training still produces identical license plates (mode collapse). The v2 fix above was necessary but not sufficient.
 
@@ -394,7 +391,8 @@ ocr_weight: 0.0  (disabled - this was the problem)
 - ✅ Character accuracy improves from ~13% to >90%
 - ✅ Visual quality maintained (pixel loss still anchors)
 
-### 13. Stage 3 Mode Collapse - ROOT CAUSE FIX (2026-01-27)
+### 13. Stage 3 Mode Collapse - ROOT CAUSE FIX (2026-01-27) - SUPERSEDED
+> **NOTE**: This fix addressed the recognizer LR issue but OCR supervision on generator still caused collapse. See Section 14 for the final solution.
 
 **Problem:** After days of hyperparameter tuning, mode collapse persisted. Character accuracy stuck at ~13-14% regardless of loss weight adjustments.
 
@@ -460,7 +458,9 @@ Optimizer param groups:
 ```
 
 
-### 14. Two-Stage Refinement Solution (2026-01-27)
+### 14. Two-Stage Refinement Solution (2026-01-27) ✅ CURRENT SOLUTION
+
+> **This is the CURRENT solution for mode collapse.** Previous approaches (Sections 10-13) were necessary steps but did not fully solve the problem.
 
 **Problem:** Stage 3 training with any form of OCR supervision causes severe mode collapse (all plates identical).
 
@@ -625,6 +625,160 @@ The refiner training is automatically integrated into the training pipeline:
 4. **Modified**: `models/__init__.py` - Export refiner classes
 5. **Modified**: `train.py` - Training pipeline integration
 6. **Modified**: `losses/composite_loss.py` - Refiner loss computation
+
+
+### 15. OCR Embedding Similarity Loss (2026-01-27) ✅ CURRENT SOLUTION
+
+> **This is the FINAL solution for mode collapse.** The refiner approach (Section 14) was a step in the right direction but still used cross-entropy loss, which is the root cause of mode collapse.
+
+**Problem:** Cross-entropy loss rewards **confidence**, not **correctness**.
+
+**Key Insight from User:**
+> "pixel and perceptual was increasing, and only ocr decreasing, cause overal total loss decreasing, but it actually all collapse and the increasing ocr i think was more like random guessing, i seen this pattern many time when training stage 3 manytimes"
+
+This is the classic signature of cross-entropy mode collapse:
+- OCR loss decreases → model becomes more **confident**
+- Character accuracy decreases → model becomes more **wrong**
+- Model learns to be "confidently wrong"
+
+**Why Cross-Entropy Causes Mode Collapse:**
+
+```python
+# Cross-entropy loss: L = -log(p(correct_char))
+# When model predicts "AAAAAAA" with 99% confidence:
+# - If GT is "ABC1234": loss ≈ 4.6 (high)
+# - Model learns: predict same chars always → get confident → lower loss
+# - Result: mode collapse to single pattern (B→9→6)
+```
+
+**Solution: OCR Embedding Similarity Loss**
+
+Instead of cross-entropy on classification logits, use frozen PARSeq encoder embeddings with cosine similarity:
+
+```python
+# 1. Extract encoder features from frozen PARSeq
+gen_emb = ocr_model.encoder(generated)  # (B, C, H, W)
+real_emb = ocr_model.encoder(ground_truth)
+
+# 2. Pool to character-level (7 chars per plate)
+gen_chars = adaptive_avg_pool2d(gen_emb, (1, 1, 7))  # (B, C, 7)
+real_chars = adaptive_avg_pool2d(real_emb, (1, 1, 7))
+
+# 3. Compute cosine similarity per character
+similarity = cosine_similarity(gen_chars, real_chars)
+
+# 4. Loss = 1 - mean_similarity
+loss = 1.0 - similarity.mean()
+```
+
+**Why This Works:**
+- Embeddings capture **character semantics** (shape, structure)
+- Similarity loss rewards **semantic correctness**, not confidence
+- Frozen OCR → no gradient flow into OCR → no mode collapse
+- Can't "cheat" by being confidently wrong
+
+**Architecture Comparison:**
+
+| Aspect | Refiner (Stage 2.5) | Embedding Fine-tuning (Stage 3.5) |
+|--------|---------------------|----------------------------------|
+| Generator | Frozen | Trainable |
+| Loss type | Cross-entropy | Embedding similarity |
+| Capacity | 588 params (too small) | Full generator capacity |
+| Mode collapse | Still happens (CE) | Fixed (embeddings) |
+| Training stage | 2.5 | 3.5 |
+
+**Implementation:**
+
+**File**: `losses/embedding_loss.py` (NEW)
+
+- **OCREmbeddingLoss**: Frozen PARSeq encoder + cosine similarity loss
+- Supports character-level pooling (spatial or adaptive)
+- Multiple loss types: 'cosine', 'mse', 'combined'
+
+**File**: `losses/composite_loss.py` (MODIFIED)
+
+- Added `setup_embedding_loss()` method to initialize with OCR model
+- Added 'embedding_finetune' stage to `get_stage_loss()`
+- Stage 3.5 uses pixel + SSIM + embedding loss (no cross-entropy)
+
+**File**: `config.py` (MODIFIED)
+
+Added configuration (lines 269-288):
+```python
+# OCR Embedding Loss (Stage 3.5)
+use_embedding_loss: bool = True
+weight_embedding: float = 0.3
+embedding_loss_type: str = 'cosine'
+embedding_char_pooling: str = 'spatial'
+embedding_temperature: float = 1.0
+
+# Stage 3.5 Configuration
+embedding_finetune_epochs: int = 50
+embedding_finetune_lr: float = 1e-5
+weight_finetune_pixel: float = 0.5
+weight_finetune_ssim: float = 0.2
+weight_finetune_tv: float = 1e-5
+# DISABLE cross-entropy based losses
+weight_finetune_lcofl: float = 0.0
+weight_finetune_ocr: float = 0.0
+```
+
+**File**: `train.py` (MODIFIED)
+
+- Added '3.5' to argparse choices
+- Added '3.5' → ('embedding_finetune', epochs) to stage_map
+- Added embedding_finetune stage handling (freeze STN/OCR, unfreeze generator)
+- Setup embedding loss before training
+- Added to batch_size_map and lr_map
+
+**Training Procedure:**
+
+**Stage 2: Pixel-only Pre-training** (Already done)
+- Train generator with L1 + SSIM loss only
+- No OCR loss at all
+- Result: Good visual quality, blurry but diverse characters
+
+**Stage 3.5: Embedding Fine-tuning** (NEW)
+- Load Stage 2 checkpoint
+- Enable embedding loss only (disable LCOFL, OCR CE)
+- Keep generator trainable (unlike refiner approach)
+- Train until character accuracy >90%
+
+**Expected Results:**
+
+| Metric | Current (CE-based) | Target (Embedding-based) |
+|--------|-------------------|-------------------------|
+| Character Accuracy | 9-14% (collapsed) | >90% |
+| Plate Accuracy | 0% | >80% |
+| Mode Collapse | Severe (B→9→6) | None |
+| Visual Quality | Good | Good (preserved from Stage 2) |
+
+**Training Commands:**
+
+```bash
+# Train Stage 2 (pixel-only) - already done
+python train.py --stage 2 --config config.py
+
+# Train Stage 3.5 (embedding fine-tuning) - NEW
+python train.py --stage 3.5 --config config.py
+
+# Or train all stages (includes 3.5)
+python train.py --stage all --config config.py
+```
+
+**Key Research References:**
+
+- **LP-Diff (CVPR 2025)**: Multi-frame diffusion with frozen OCR supervision
+- **LPSRGAN / Embedding SR**: Frozen OCR + cosine similarity on embeddings
+- **LCOFL (SIBGRAPI 2024)**: Character confusion penalties (still uses CE)
+
+**Verification:**
+
+After training Stage 3.5, check:
+1. Character accuracy should reach >90%
+2. All characters should be represented (not just B, 9, 6)
+3. Embedding similarity should correlate with character correctness
+4. Visual quality should be preserved from Stage 2
 
 
 ## Reproducibility & Determinism

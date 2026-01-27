@@ -26,6 +26,12 @@ from .parseq_feature_loss import (
     PARSeqFeatureLoss,
     GatedPARSeqFeatureLoss,
 )
+# OCR Embedding Loss (Fix for mode collapse - 2026-01-27)
+from .embedding_loss import (
+    OCREmbeddingLoss,
+    OCREmbeddingLossWithBaseline,
+    create_embedding_loss,
+)
 
 __all__ = [
     'CornerLoss',
@@ -52,6 +58,10 @@ __all__ = [
     'PARSeqAdapter',
     'PARSeqFeatureLoss',
     'GatedPARSeqFeatureLoss',
+    # OCR Embedding Loss (Fix for mode collapse - 2026-01-27)
+    'OCREmbeddingLoss',
+    'OCREmbeddingLossWithBaseline',
+    'create_embedding_loss',
 ]
 
 

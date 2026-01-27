@@ -304,7 +304,8 @@ def create_optimizer(
         'parseq_warmup': config.training.lr_parseq_warmup,
         'restoration': config.training.lr_restoration,
         'refiner': config.training.refiner_lr,  # Two-Stage Solution: Refiner LR (2026-01-27)
-        'full': config.training.lr_finetune
+        'full': config.training.lr_finetune,
+        'embedding_finetune': config.training.embedding_finetune_lr,  # Embedding fine-tuning LR (2026-01-27)
     }.get(stage, 1e-4)
     
     for group in param_groups:
@@ -502,9 +503,9 @@ def train_epoch(
         # Also disable for parseq_warmup since pretrained PARSeq has FP32 weights
         use_amp_for_batch = use_amp and (stage not in ['stn', 'parseq_warmup'])
         scaler = scaler_g  # Use generator scaler for main forward pass
-        
+
         with autocast('cuda', enabled=use_amp_for_batch):
-            # DEBUG: Log OCR weight at first batch of each epoch to trace curriculum issues
+            # Log OCR weight at first batch of each epoch to trace curriculum
             if batch_idx == 0 and stage == 'full' and hasattr(criterion, 'weights'):
                 if logger:
                     logger.info(f"Epoch {epoch} Batch 0: criterion.weights['ocr'] = {criterion.weights.get('ocr', 'NOT SET')}")
@@ -580,6 +581,10 @@ def train_epoch(
                 # Refiner Stage: Two-Stage Solution for Mode Collapse (2026-01-27)
                 # Only OCR loss on refined output - generator is frozen
                 loss_g, loss_dict = criterion.get_stage_loss('refiner', outputs, targets, None)
+            elif stage == 'embedding_finetune':
+                # Stage 3.5: Embedding-based Fine-tuning (Fix for mode collapse - 2026-01-27)
+                # Uses embedding similarity loss instead of cross-entropy
+                loss_g, loss_dict = criterion.get_stage_loss('embedding_finetune', outputs, targets, None)
             else:
                 # Stage 3 ('full'): Use anti-collapse loss with OCR warmup
                 # Compute global_step for OCR warmup scheduling
@@ -1099,6 +1104,9 @@ def validate(
             elif stage == 'refiner':
                 # Refiner Stage: Two-Stage Solution for Mode Collapse (2026-01-27)
                 _, loss_dict = criterion.get_stage_loss('refiner', outputs, targets)
+            elif stage == 'embedding_finetune':
+                # Stage 3.5: Embedding-based Fine-tuning (Fix for mode collapse - 2026-01-27)
+                _, loss_dict = criterion.get_stage_loss('embedding_finetune', outputs, targets)
             else:
                 _, loss_dict = criterion(outputs, targets)
             
@@ -2010,8 +2018,8 @@ def main():
     parser = argparse.ArgumentParser(description='Train Neuro-Symbolic LPR System')
     parser.add_argument('--config', type=str, default=None, help='Path to config file')
     parser.add_argument('--stage', type=str, default='all',
-                        choices=['0', '1', '1.5', '2', '2.5', '3', 'all'],
-                        help='Training stage (0-3 or all, 1.5=parseq_warmup, 2.5=refiner)')
+                        choices=['0', '1', '1.5', '2', '2.5', '3', '3.5', 'all'],
+                        help='Training stage (0-3.5 or all, 1.5=parseq_warmup, 2.5=refiner, 3.5=embedding_finetune)')
     parser.add_argument('--resume', type=str, default=None, help='Resume from checkpoint')
     parser.add_argument('--data-dir', type=str, default='data', help='Data directory')
     parser.add_argument('--output-dir', type=str, default='outputs', help='Output directory')
@@ -2301,9 +2309,10 @@ def main():
             ('parseq_warmup', config.training.epochs_parseq_warmup),
             ('restoration', config.training.epochs_restoration),
             ('refiner', config.training.refiner_epochs) if config.training.use_refiner else (),
-            ('full', config.training.epochs_finetune)
+            ('full', config.training.epochs_finetune),
+            ('embedding_finetune', config.training.embedding_finetune_epochs) if config.training.use_embedding_loss else (),
         ]
-        # Filter out empty tuples if refiner is disabled
+        # Filter out empty tuples if refiner or embedding_finetune is disabled
         stages = [s for s in stages if s]
     else:
         stage_map = {
@@ -2312,11 +2321,14 @@ def main():
             '1.5': ('parseq_warmup', config.training.epochs_parseq_warmup),
             '2': ('restoration', config.training.epochs_restoration),
             '2.5': ('refiner', config.training.refiner_epochs) if config.training.use_refiner else None,
-            '3': ('full', config.training.epochs_finetune)
+            '3': ('full', config.training.epochs_finetune),
+            '3.5': ('embedding_finetune', config.training.embedding_finetune_epochs) if config.training.use_embedding_loss else None,
         }
-        # Handle case where refiner is disabled
+        # Handle case where refiner or embedding_finetune is disabled
         if args.stage == '2.5' and stage_map['2.5'] is None:
             raise ValueError("Refiner stage (2.5) requested but use_refiner=False in config")
+        if args.stage == '3.5' and stage_map['3.5'] is None:
+            raise ValueError("Embedding finetune stage (3.5) requested but use_embedding_loss=False in config")
         stages = [stage_map[args.stage]]
     
     # Train each stage
@@ -2342,6 +2354,25 @@ def main():
             model.freeze_generator()  # Freeze Stage 2 generator
             model.unfreeze_refiner()  # Only refiner is trainable
             logger.info("  Refiner Stage: Generator frozen, only refiner trainable")
+        elif stage_name == 'embedding_finetune':
+            # Stage 3.5: Embedding-based Fine-tuning (Fix for mode collapse - 2026-01-27)
+            # Key difference from refiner: Generator is trainable!
+            # Uses embedding similarity loss instead of cross-entropy
+            model.freeze_stn()
+            model.freeze_recognizer()
+            model.unfreeze_generator()  # Generator is trainable (unlike refiner)
+            # Don't unfreeze refiner - not needed for this stage
+            logger.info("  Embedding Fine-tuning Stage: Generator trainable, using embedding loss")
+
+            # Setup embedding loss if not already initialized
+            if not criterion._embedding_loss_initialized:
+                criterion.setup_embedding_loss(
+                    ocr_model=model.recognizer,
+                    weight_embedding=config.training.weight_embedding,
+                    loss_type=config.training.embedding_loss_type,
+                    char_pooling=config.training.embedding_char_pooling
+                )
+                logger.info(f"  Initialized embedding loss (type={config.training.embedding_loss_type})")
         else:  # full
             model.unfreeze_stn()
             # Stage 3: Train recognizer end-to-end with SR
@@ -2363,7 +2394,8 @@ def main():
             'parseq_warmup': config.training.batch_size_parseq_warmup,
             'restoration': config.training.batch_size_restoration,
             'refiner': config.training.batch_size_restoration,  # Use same batch size as restoration
-            'full': config.training.batch_size_finetune
+            'full': config.training.batch_size_finetune,
+            'embedding_finetune': config.training.batch_size_restoration,  # Use same batch size as restoration
         }
         batch_size = batch_size_map.get(stage_name, config.training.batch_size_finetune)
         

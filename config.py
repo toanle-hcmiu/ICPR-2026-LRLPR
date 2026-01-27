@@ -266,6 +266,27 @@ class TrainingConfig:
     # Generator is frozen during refiner training
     refiner_freeze_generator: bool = True     # Freeze Stage 2 generator (CRITICAL for no mode collapse)
 
+    # OCR Embedding Loss (Stage 3.5) - Fix for mode collapse (2026-01-27)
+    # Problem: Cross-entropy rewards confidence, not correctness → mode collapse
+    # Solution: Embedding similarity loss rewards semantic correctness
+    # Key insight: Can't "cheat" by being confidently wrong
+    use_embedding_loss: bool = True           # Enable embedding loss for Stage 3.5
+    weight_embedding: float = 0.3             # Weight for embedding similarity loss
+    embedding_loss_type: str = 'cosine'       # 'cosine', 'mse', or 'combined'
+    embedding_char_pooling: str = 'spatial'   # 'spatial' or 'adaptive'
+    embedding_temperature: float = 1.0        # Temperature for cosine similarity
+
+    # Stage 3.5: Embedding Fine-tuning Configuration
+    embedding_finetune_epochs: int = 50       # Epochs for embedding fine-tuning
+    embedding_finetune_lr: float = 1e-5       # Learning rate (conservative)
+    # Stage 3.5 loss weights (disables CE-based losses)
+    weight_finetune_pixel: float = 0.5        # Anchor visual quality
+    weight_finetune_ssim: float = 0.2         # Structural similarity
+    weight_finetune_tv: float = 1e-5          # Suppress artifacts
+    # Disable cross-entropy based losses during embedding fine-tuning
+    weight_finetune_lcofl: float = 0.0        # DISABLE - uses cross-entropy
+    weight_finetune_ocr: float = 0.0           # DISABLE - uses cross-entropy
+
     # Optimizer
     optimizer: str = 'adamw'
     weight_decay: float = 0.01

@@ -14,6 +14,7 @@ from typing import Dict, Optional, Tuple
 from .corner_loss import CornerLoss
 from .gan_loss import GANLoss, PixelLoss, PerceptualLoss
 from .lcofl_loss import LCOFLLoss, SSIMLoss, ConfusionMatrixTracker
+from .embedding_loss import OCREmbeddingLoss, create_embedding_loss
 
 
 class TotalVariationLoss(nn.Module):
@@ -567,7 +568,41 @@ class CompositeLoss(nn.Module):
             self.edge_loss = EdgeLoss(weight=1.0)  # Weight applied via self.weights
         else:
             self.edge_loss = None
-    
+
+        # OCR Embedding Loss (Fix for mode collapse - 2026-01-27)
+        # Uses frozen PARSeq embeddings instead of cross-entropy
+        # This rewards semantic correctness, not confidence
+        self.embedding_loss = None
+        self.ocr_model_for_embedding = None
+        self._embedding_loss_initialized = False
+
+    def setup_embedding_loss(
+        self,
+        ocr_model: nn.Module,
+        weight_embedding: float = 0.3,
+        loss_type: str = 'cosine',
+        char_pooling: str = 'spatial'
+    ):
+        """
+        Initialize OCR embedding loss.
+
+        Call this before training with embedding loss (Stage 3.5).
+
+        Args:
+            ocr_model: PARSeq model (will be frozen inside embedding loss)
+            weight_embedding: Weight for embedding loss
+            loss_type: 'cosine', 'mse', or 'combined'
+            char_pooling: 'spatial' or 'adaptive'
+        """
+        self.ocr_model_for_embedding = ocr_model
+        self.embedding_loss = OCREmbeddingLoss(
+            ocr_model=ocr_model,
+            char_pooling=char_pooling,
+            loss_type=loss_type
+        )
+        self.weights['embedding'] = weight_embedding
+        self._embedding_loss_initialized = True
+
     def forward(
         self,
         outputs: Dict[str, torch.Tensor],
@@ -1017,6 +1052,79 @@ class CompositeLoss(nn.Module):
                         loss_dict['perceptual'] = self._safe_loss_item(l_perceptual)
                         weighted = refiner_perceptual_weight * l_perceptual
                         total_loss = weighted if total_loss is None else total_loss + weighted
+
+            # Ensure total_loss requires grad
+            if total_loss is not None and not total_loss.requires_grad:
+                if hr_output is not None:
+                    total_loss = total_loss + hr_output.sum() * 0.0
+                else:
+                    total_loss = total_loss.requires_grad_(True)
+
+            # Final clamp
+            total_loss = self._clamp_loss(total_loss, max_val=100.0)
+
+            loss_dict['total'] = self._safe_loss_item(total_loss)
+            return total_loss, loss_dict
+
+        elif stage == 'embedding_finetune':
+            # Stage 3.5: Embedding-based Fine-tuning (Fix for mode collapse - 2026-01-27)
+            #
+            # This stage replaces cross-entropy OCR loss with embedding similarity loss.
+            # Key differences from refiner approach:
+            # - Generator is trainable (not frozen)
+            # - Uses embedding similarity instead of cross-entropy
+            # - Embedding loss rewards semantic correctness, not confidence
+            #
+            # Loss = w_pixel * L_pixel + w_ssim * L_ssim + w_embedding * L_embedding
+            #
+            loss_dict = {}
+            total_loss = None
+
+            # Get generated HR image
+            hr_output = outputs.get('hr_image')
+
+            # 1. PIXEL LOSS (anchor visual quality)
+            if hr_output is not None and 'hr_image' in targets:
+                if not (torch.isnan(hr_output).any() or torch.isnan(targets['hr_image']).any()):
+                    l_pixel = self.pixel_loss(hr_output, targets['hr_image'])
+                    l_pixel = self._clamp_loss(l_pixel)
+                    loss_dict['pixel'] = self._safe_loss_item(l_pixel)
+                    weighted = self.weights.get('pixel', 0.5) * l_pixel
+                    total_loss = weighted if total_loss is None else total_loss + weighted
+
+            # 2. SSIM LOSS (structural similarity)
+            if self.ssim_loss is not None and hr_output is not None and 'hr_image' in targets:
+                if not (torch.isnan(hr_output).any() or torch.isnan(targets['hr_image']).any()):
+                    l_ssim = self.ssim_loss(hr_output, targets['hr_image'])
+                    l_ssim = self._clamp_loss(l_ssim)
+                    loss_dict['ssim'] = self._safe_loss_item(l_ssim)
+                    weighted = self.weights.get('ssim', 0.2) * l_ssim
+                    total_loss = weighted if total_loss is None else total_loss + weighted
+
+            # 3. EMBEDDING LOSS (primary - replaces cross-entropy OCR loss)
+            # This is the KEY innovation: embedding similarity instead of CE
+            if self.embedding_loss is not None and hr_output is not None and 'hr_image' in targets:
+                if not (torch.isnan(hr_output).any() or torch.isnan(targets['hr_image']).any()):
+                    l_embedding = self.embedding_loss(hr_output, targets['hr_image'])
+                    l_embedding = self._clamp_loss(l_embedding)
+                    loss_dict['embedding'] = self._safe_loss_item(l_embedding)
+                    weighted = self.weights.get('embedding', 0.3) * l_embedding
+                    total_loss = weighted if total_loss is None else total_loss + weighted
+            elif self.weights.get('embedding', 0) > 0:
+                # Embedding loss configured but not initialized
+                raise RuntimeError(
+                    "Embedding loss weight > 0 but embedding_loss not initialized. "
+                    "Call loss_fn.setup_embedding_loss(ocr_model) before training."
+                )
+
+            # 4. Optional: TV LOSS (suppress artifacts)
+            if self.tv_loss is not None and hr_output is not None:
+                if not torch.isnan(hr_output).any():
+                    l_tv = self.tv_loss(hr_output)
+                    l_tv = self._clamp_loss(l_tv)
+                    loss_dict['tv'] = self._safe_loss_item(l_tv)
+                    weighted = self.weights.get('tv', 0.0) * l_tv
+                    total_loss = weighted if total_loss is None else total_loss + weighted
 
             # Ensure total_loss requires grad
             if total_loss is not None and not total_loss.requires_grad:
