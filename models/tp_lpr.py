@@ -137,12 +137,19 @@ class TextPriorGuidedLPR(nn.Module):
         Setup text prior extractor using the frozen PARSeq.
 
         Call this before training to enable text prior guidance.
+        Note: This must be called AFTER model.to(device) to ensure
+        the text prior modules are on the correct device.
         """
+        device = next(self.parameters()).device
+
         self.text_prior_extractor = TextPriorExtractor(self.recognizer)
+        self.text_prior_extractor = self.text_prior_extractor.to(device)
+
         self.generator.set_text_extractor(self.recognizer)
 
         # Create text prior loss
         self.text_prior_loss = TextPriorLoss(self.recognizer)
+        self.text_prior_loss = self.text_prior_loss.to(device)
 
     def forward(
         self,
