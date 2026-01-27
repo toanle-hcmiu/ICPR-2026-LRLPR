@@ -1906,8 +1906,8 @@ def main():
     parser = argparse.ArgumentParser(description='Train Neuro-Symbolic LPR System')
     parser.add_argument('--config', type=str, default=None, help='Path to config file')
     parser.add_argument('--stage', type=str, default='all',
-                        choices=['0', '1', '1.5', '2', '2.5', '3', '3.5', 'all'],
-                        help='Training stage (0-3.5 or all, 1.5=parseq_warmup, 2.5=refiner, 3.5=embedding_finetune)')
+                        choices=['1', '2', '3', 'tp_stn', 'tp_generator', 'tp_full', 'all'],
+                        help='Training stage (1=tp_stn, 2=tp_generator, 3=tp_full, or all)')
     parser.add_argument('--resume', type=str, default=None, help='Resume from checkpoint')
     parser.add_argument('--data-dir', type=str, default='data', help='Data directory')
     parser.add_argument('--output-dir', type=str, default='outputs', help='Output directory')

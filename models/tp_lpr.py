@@ -76,11 +76,14 @@ class TextPriorGuidedLPR(nn.Module):
         self.encoder = SharedCNNEncoder()
 
         # STN for geometric rectification
-        # Encoder outputs (B, T, 512, 4, 12), so STN expects these dimensions
+        # Encoder outputs (B, T, 512, 2, 6) after 3x stride-2 downsampling
+        # Use smaller hidden_channels to avoid over-pooling small inputs
         self.stn = SpatialTransformerNetwork(
             in_channels=512,
-            feature_height=4,
-            feature_width=12
+            feature_height=2,
+            feature_width=6,
+            hidden_channels=[32, 64],  # Fewer layers = less pooling
+            fc_dims=[128, 64]
         )
 
         # Layout classifier (Brazilian vs Mercosul)
@@ -179,7 +182,7 @@ class TextPriorGuidedLPR(nn.Module):
         stn_features = []
         thetas = []
         for t in range(T):
-            feat, theta = self.stn(lr_frames[:, t], frame_features[:, t])
+            feat, theta = self.stn(frame_features[:, t], return_theta=True)
             stn_features.append(feat)
             thetas.append(theta)
 
@@ -194,26 +197,24 @@ class TextPriorGuidedLPR(nn.Module):
         # 4. Quality-based fusion
         if self.quality_fusion is not None:
             fused_features, frame_weights = self.quality_fusion(
-                stn_features,
-                thetas,
-                layout_logits if self.use_layout else None
+                stn_features, return_scores=True
             )
             outputs['frame_weights'] = frame_weights
         else:
             fused_features = stn_features.mean(dim=1)  # Simple average
 
         # 5. Generate HR image using TP-Guided Generator
-        # The generator handles multi-frame fusion internally
+        # The generator expects raw RGB frames, not encoded features
         if use_text_prior:
             hr_image, text_prior = self.generator(
-                stn_features,
+                lr_frames,
                 use_text_prior=True,
                 return_text_prior=True
             )
             outputs['text_prior'] = text_prior
         else:
             hr_image = self.generator(
-                stn_features,
+                lr_frames,
                 use_text_prior=False
             )
 

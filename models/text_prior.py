@@ -108,7 +108,9 @@ class TextPriorExtractor(nn.Module):
         char_features = self.proj(probs)
 
         # Add positional encoding
-        char_features = char_features + self.pos_encoding.squeeze(0).permute(2, 0, 1)
+        # pos_encoding: (1, feature_dim, 1, num_chars) -> (num_chars, feature_dim)
+        pos_enc = self.pos_encoding.squeeze(0).squeeze(1).permute(1, 0)  # (num_chars, feature_dim)
+        char_features = char_features + pos_enc  # Broadcast to (B, 7, feature_dim)
 
         # Reshape to spatial format for cross-attention
         # (B, 7, feature_dim) -> (B, feature_dim, 1, 7)
@@ -116,7 +118,7 @@ class TextPriorExtractor(nn.Module):
 
         # Upsample to match input spatial dimensions
         # (B, feature_dim, 1, 7) -> (B, feature_dim, H, W)
-        B, F, _, C = text_features_1d.shape
+        B, feat_dim, _, C = text_features_1d.shape
         H, W = lr_input.shape[2], lr_input.shape[3]
 
         # First expand height: 1 -> H

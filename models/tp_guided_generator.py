@@ -101,8 +101,8 @@ class CrossAttentionBlock(nn.Module):
         attn = torch.bmm(q_flat, k_flat.transpose(1, 2)) * scale  # (B, H*W, H*W)
         attn = F.softmax(attn, dim=-1)
 
-        # Apply attention
-        out = torch.bmm(v_flat, attn)  # (B, C, H*W)
+        # Apply attention: (B, H*W, H*W) @ (B, H*W, C) -> (B, H*W, C)
+        out = torch.bmm(attn, v_flat)  # (B, H*W, C)
         out = out.permute(0, 2, 1).reshape(B, C, H, W)  # (B, C, H, W)
 
         # Output projection with residual
@@ -239,12 +239,19 @@ class TextPriorGuidedGenerator(nn.Module):
 
         B, T, C, H_in, W_in = lr_frames.shape
 
-        # Extract initial features from first frame
-        x = self.conv_in(lr_frames[:, 0])  # (B, channels, H, W)
+        # Encode all frames first (needed for multi-frame fusion)
+        encoded_frames = []
+        for t in range(T):
+            feat = self.conv_in(lr_frames[:, t])  # (B, channels, H, W)
+            encoded_frames.append(feat)
+        encoded_frames = torch.stack(encoded_frames, dim=1)  # (B, T, channels, H, W)
+
+        # Use first frame as base
+        x = encoded_frames[:, 0]  # (B, channels, H, W)
 
         # Multi-frame fusion (if multiple frames available)
         if T > 1:
-            fused = self.frame_fusion(lr_frames)
+            fused = self.frame_fusion(encoded_frames)
             x = x + fused  # Residual connection
 
         # Extract text prior (ONLY during training)

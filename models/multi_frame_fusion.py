@@ -54,9 +54,9 @@ class InterFrameCrossAttentionModule(nn.Module):
         self.norm = nn.LayerNorm(channels)
 
         # Fusion convolution
-        # After attention: (B, T, C) -> reshape to (B, T*C, H, W) -> (B, C, H, W)
+        # Input: concatenated frames (T*C) + attention output (T*C) = 2*T*C channels
         self.fusion_conv = nn.Sequential(
-            nn.Conv2d(channels * num_frames, channels * 2, 1),
+            nn.Conv2d(channels * num_frames * 2, channels * 2, 1),
             nn.ReLU(inplace=True),
             nn.Conv2d(channels * 2, channels, 1)
         )
@@ -104,9 +104,12 @@ class InterFrameCrossAttentionModule(nn.Module):
         attn_output = attn_output.reshape(B, H, W, T, C)
         attn_output = attn_output.permute(0, 3, 4, 1, 2)  # (B, T, C, H, W)
 
-        # Layer norm
-        attn_output = self.norm(attn_output.reshape(B, T, C * H * W))
-        attn_output = attn_output.reshape(B, T, C, H, W)
+        # Layer norm - reshape to (B*T*H*W, C) for proper normalization
+        attn_output = attn_output.permute(0, 1, 3, 4, 2)  # (B, T, H, W, C)
+        attn_output = attn_output.reshape(B * T * H * W, C)
+        attn_output = self.norm(attn_output)  # Normalize over C dimension
+        attn_output = attn_output.reshape(B, T, H, W, C)
+        attn_output = attn_output.permute(0, 1, 4, 2, 3)  # (B, T, C, H, W)
 
         # Reshape and concatenate
         attn_fused = attn_output.reshape(B, T * C, H, W)
