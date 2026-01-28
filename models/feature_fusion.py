@@ -242,35 +242,47 @@ class QualityScorerFusion(nn.Module):
         )
     
     def forward(
-        self, 
+        self,
         features: torch.Tensor,
         return_scores: bool = False
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
         Score and fuse multiple frame features.
-        
+
         Args:
             features: Feature tensor of shape (B, T, C, H, W).
             return_scores: Whether to return quality scores.
-            
+
         Returns:
             Tuple containing:
                 - Fused feature map of shape (B, C, H, W)
                 - (optional) Quality scores of shape (B, T, 1)
         """
         B, T, C, H, W = features.shape
-        
+
         # Compute quality scores for each frame
         features_flat = features.view(B * T, C, H, W)
         scores = self.quality_scorer(features_flat)  # (B*T, 1)
         scores = scores.view(B, T, 1)
-        
+
         # Fuse features using quality scores
         fused = self.feature_fusion(features, scores)
-        
+
         if return_scores:
             return fused, scores
         return fused, None
+
+    def init_weights(self) -> None:
+        """Initialize fusion weights with small values for stable training."""
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.xavier_normal_(m.weight, gain=0.02)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight, gain=0.02)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
 
 
 class TemporalFusion(nn.Module):

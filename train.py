@@ -1386,16 +1386,29 @@ def train_stage(
         logger.info(f"  {group_name}: lr={group['lr']:.2e}, params={num_params:,}")
 
     # CRITICAL FIX: Reset optimizer state for reinitialized weights
-    # If generator weights were reinitialized (e.g., transitioning from Stage 1),
+    # If weights were reinitialized (e.g., transitioning from Stage 1),
     # we need to clear the optimizer's momentum buffers and Adam moments.
-    if reset_optimizer_for == 'generator':
-        logger.info("  Resetting optimizer state for reinitialized generator weights")
+    if reset_optimizer_for in ['generator', 'stage2_components']:
+        logger.info(f"  Resetting optimizer state for: {reset_optimizer_for}")
         for group in optimizer_g.param_groups:
             group_name = group.get('name', '')
-            # Reset state for generator-related parameter groups
-            if any(name in group_name for name in ['conv_in', 'frame_fusion', 'srb_blocks',
-                                                      'text_cross_attn', 'upsample', 'conv_out',
-                                                      'text_proj', 'spatial_expand']):
+            # Check if this group belongs to reinitialized components
+            should_reset = False
+            if reset_optimizer_for == 'stage2_components':
+                # Reset encoder, quality_fusion, and all generator components
+                if any(name in group_name for name in ['encoder', 'conv_in', 'frame_fusion',
+                                                          'srb_blocks', 'text_cross_attn', 'upsample',
+                                                          'conv_out', 'text_proj', 'spatial_expand',
+                                                          'quality_fusion', 'quality_scorer']):
+                    should_reset = True
+            else:
+                # Reset only generator components
+                if any(name in group_name for name in ['conv_in', 'frame_fusion', 'srb_blocks',
+                                                          'text_cross_attn', 'upsample', 'conv_out',
+                                                          'text_proj', 'spatial_expand']):
+                    should_reset = True
+
+            if should_reset:
                 logger.info(f"    Clearing optimizer state for: {group_name}")
                 for param in group['params']:
                     if param in optimizer_g.state_dict()['state']:
@@ -2254,19 +2267,39 @@ def main():
             model.freeze_recognizer()
             model.unfreeze_generator()
 
-            # CRITICAL FIX: Reinitialize generator weights if coming from Stage 1 checkpoint
-            # Stage 1 (tp_stn) checkpoints contain generator weights with large random values
-            # that cause gradient explosion. We need to reinitialize with small weights.
+            # CRITICAL FIX: Reinitialize all components that feed into generator
+            # when transitioning from Stage 1. This prevents scale mismatch between:
+            # - encoder/stn/quality_fusion (trained with large weights in Stage 1)
+            # - generator (reinitialized with small weights)
             checkpoint_stage = checkpoint.get('stage', '') if 'checkpoint' in locals() else ''
+            reinit_components = []
+
             if checkpoint_stage == 'tp_stn' or (hasattr(args, 'resume') and args.resume and 'tp_stn' in args.resume):
-                logger.info("  Reinitializing generator weights (from Stage 1 checkpoint)")
-                logger.info("  This prevents gradient explosion from large random weights")
+                logger.info("  Reinitializing components for Stage 2 (prevents scale mismatch):")
+
+                # Reinitialize generator (super-resolution)
+                logger.info("    - Reinitializing generator...")
                 model.generator.init_weights()
-                # Debug: verify small weights
-                conv_std = model.generator.conv_in[0].weight.std().item()
-                logger.info(f"  Generator conv_in weight std after reinit: {conv_std:.6f} (should be ~0.02)")
-                # Signal to train_stage to reset optimizer state for generator
-                reset_optimizer = 'generator'
+                reinit_components.append('generator')
+
+                # Reinitialize encoder (feature extraction)
+                logger.info("    - Reinitializing encoder...")
+                model.encoder.init_weights()
+                reinit_components.append('encoder')
+
+                # Reinitialize quality_fusion (frame fusion)
+                if model.quality_fusion is not None:
+                    logger.info("    - Reinitializing quality_fusion...")
+                    model.quality_fusion.init_weights()
+                    reinit_components.append('quality_fusion')
+
+                # Keep STN - has valuable geometric transformations
+                logger.info("    - Preserving STN (geometric transformations)")
+
+                # Signal to train_stage to reset optimizer for reinitialized components
+                reset_optimizer = 'stage2_components'
+
+            logger.info(f"  Reinitialized components: {', '.join(reinit_components) if reinit_components else 'none'}")
         elif stage_name == 'tp_full':
             # TP Full Stage: End-to-end training
             # All components trainable, text prior still guides generation

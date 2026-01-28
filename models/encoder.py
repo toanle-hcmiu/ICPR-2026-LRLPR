@@ -178,11 +178,11 @@ class SharedCNNEncoder(nn.Module):
     def get_output_size(self, input_height: int, input_width: int) -> tuple:
         """
         Calculate output feature map size given input size.
-        
+
         Args:
             input_height: Input image height.
             input_width: Input image width.
-            
+
         Returns:
             Tuple of (out_channels, out_height, out_width).
         """
@@ -190,6 +190,14 @@ class SharedCNNEncoder(nn.Module):
         out_height = input_height // 8
         out_width = input_width // 8
         return self.out_channels, out_height, out_width
+
+    def init_weights(self) -> None:
+        """Initialize encoder weights with small values for stable training."""
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.xavier_normal_(m.weight, gain=0.02)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
 
 
 class ResidualBlock(nn.Module):
@@ -303,3 +311,15 @@ class ResidualCNNEncoder(nn.Module):
         _, F_out, H_out, W_out = features.shape
         features = features.view(B, T, F_out, H_out, W_out)
         return features
+
+    def init_weights(self) -> None:
+        """Initialize encoder weights with small values for stable training."""
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.xavier_normal_(m.weight, gain=0.02)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight, gain=0.02)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
