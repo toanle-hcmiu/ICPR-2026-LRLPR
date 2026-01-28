@@ -2228,6 +2228,18 @@ def main():
             model.freeze_stn()
             model.freeze_recognizer()
             model.unfreeze_generator()
+
+            # CRITICAL FIX: Reinitialize generator weights if coming from Stage 1 checkpoint
+            # Stage 1 (tp_stn) checkpoints contain generator weights with large random values
+            # that cause gradient explosion. We need to reinitialize with small weights.
+            checkpoint_stage = checkpoint.get('stage', '') if 'checkpoint' in locals() else ''
+            if checkpoint_stage == 'tp_stn' or (hasattr(args, 'resume') and args.resume and 'tp_stn' in args.resume):
+                logger.info("  Reinitializing generator weights (from Stage 1 checkpoint)")
+                logger.info("  This prevents gradient explosion from large random weights")
+                model.generator.init_weights()
+                # Debug: verify small weights
+                conv_std = model.generator.conv_in[0].weight.std().item()
+                logger.info(f"  Generator conv_in weight std after reinit: {conv_std:.6f} (should be ~0.02)")
         elif stage_name == 'tp_full':
             # TP Full Stage: End-to-end training
             # All components trainable, text prior still guides generation
