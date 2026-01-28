@@ -243,10 +243,27 @@ class TextPriorLoss(nn.Module):
         # logits: (B, 7, vocab_size)
         log_probs = F.log_softmax(logits, dim=-1)
 
+        # Validate and clamp text_indices to prevent nll_loss error
+        # nll_loss requires target indices in range [0, vocab_size-1] = [0, 38]
+        # Values outside this range will cause a RuntimeError
+        text_clamped = torch.clamp(text_indices, 0, self.vocab_size - 1)
+
+        # Check if any indices were out of bounds (for debugging)
+        if (text_clamped != text_indices).any():
+            num_invalid = (text_clamped != text_indices).sum().item()
+            min_idx = text_indices.min().item()
+            max_idx = text_indices.max().item()
+            # Only print once per module instance to avoid spamming logs
+            if not hasattr(self, '_invalid_logged'):
+                print(f"Warning: TextPriorLoss detected {num_invalid} text_indices out of bounds "
+                      f"(range: [{min_idx}, {max_idx}], valid: [0, {self.vocab_size-1}]). "
+                      f"Clamping to valid range.")
+                self._invalid_logged = True
+
         # Gather log probs for GT characters
         loss = F.nll_loss(
             log_probs.reshape(-1, self.vocab_size),
-            text_indices.reshape(-1),
+            text_clamped.reshape(-1),
             reduction='none'
         )  # (B * 7,)
 
