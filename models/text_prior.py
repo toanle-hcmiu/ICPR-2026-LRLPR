@@ -190,18 +190,21 @@ class TextPriorLoss(nn.Module):
 
     Args:
         parseq_model: Pretrained PARSeq model (will be frozen)
+        vocab_size: Size of the vocabulary (default: 39)
         reduction: Loss reduction method
     """
 
     def __init__(
         self,
         parseq_model: nn.Module,
+        vocab_size: int = 39,
         reduction: str = 'mean'
     ):
         super().__init__()
 
         # Store PARSeq for extracting logits from generated images
         self.parseq = parseq_model
+        self.vocab_size = vocab_size
 
         # Freeze PARSeq
         for param in self.parseq.parameters():
@@ -239,7 +242,7 @@ class TextPriorLoss(nn.Module):
 
         # Gather log probs for GT characters
         loss = F.nll_loss(
-            log_probs.reshape(-1, self.parseq.vocab_size),
+            log_probs.reshape(-1, self.vocab_size),
             text_indices.reshape(-1),
             reduction='none'
         )  # (B * 7,)

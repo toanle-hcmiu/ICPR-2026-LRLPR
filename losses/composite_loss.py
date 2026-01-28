@@ -584,7 +584,7 @@ class CompositeLoss(nn.Module):
         """
         from models.text_prior import TextPriorLoss
 
-        self.text_prior_loss = TextPriorLoss(ocr_model)
+        self.text_prior_loss = TextPriorLoss(ocr_model, vocab_size=39)
         self.weights['tp_text_prior'] = weight_tp_text_prior
         self._text_prior_loss_initialized = True
 
