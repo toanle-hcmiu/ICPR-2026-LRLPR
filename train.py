@@ -1305,7 +1305,8 @@ def train_stage(
     use_amp: bool = True,
     use_ema: bool = True,
     early_stopping_patience: int = 0,
-    stage2_anchor_path: Optional[str] = None
+    stage2_anchor_path: Optional[str] = None,
+    reset_optimizer_for: Optional[str] = None
 ):
     """
     Train for a specific stage with full feature support.
@@ -1383,6 +1384,29 @@ def train_stage(
         group_name = group.get('name', f'group_{i}')
         num_params = sum(p.numel() for p in group['params'])
         logger.info(f"  {group_name}: lr={group['lr']:.2e}, params={num_params:,}")
+
+    # CRITICAL FIX: Reset optimizer state for reinitialized weights
+    # If generator weights were reinitialized (e.g., transitioning from Stage 1),
+    # we need to clear the optimizer's momentum buffers and Adam moments.
+    if reset_optimizer_for == 'generator':
+        logger.info("  Resetting optimizer state for reinitialized generator weights")
+        for group in optimizer_g.param_groups:
+            group_name = group.get('name', '')
+            # Reset state for generator-related parameter groups
+            if any(name in group_name for name in ['conv_in', 'frame_fusion', 'srb_blocks',
+                                                      'text_cross_attn', 'upsample', 'conv_out',
+                                                      'text_proj', 'spatial_expand']):
+                logger.info(f"    Clearing optimizer state for: {group_name}")
+                for param in group['params']:
+                    if param in optimizer_g.state_dict()['state']:
+                        # Clear AdamW state: exp_avg, exp_avg_sq, step
+                        state = optimizer_g.state_dict()['state'][param]
+                        for key in list(state.keys()):
+                            if key == 'step':
+                                state[key] = 0  # Reset step counter
+                            else:
+                                # Clear momentum buffers
+                                state[key].zero_()
     
     # Stage 3: Log key hyperparameters for diagnosing OCR collapse
     if stage == 'full':
@@ -2214,6 +2238,7 @@ def main():
         # ============================================
         # Prepare model for TP architecture stage
         # ============================================
+        reset_optimizer = None  # Default: no optimizer reset needed
         if stage_name == 'tp_stn':
             # TP STN Stage: Train STN + Layout + Quality Fusion
             # Generator and recognizer are frozen during this stage
@@ -2240,6 +2265,8 @@ def main():
                 # Debug: verify small weights
                 conv_std = model.generator.conv_in[0].weight.std().item()
                 logger.info(f"  Generator conv_in weight std after reinit: {conv_std:.6f} (should be ~0.02)")
+                # Signal to train_stage to reset optimizer state for generator
+                reset_optimizer = 'generator'
         elif stage_name == 'tp_full':
             # TP Full Stage: End-to-end training
             # All components trainable, text prior still guides generation
@@ -2314,7 +2341,8 @@ def main():
             use_amp=not args.no_amp,
             use_ema=not args.no_ema,
             early_stopping_patience=args.early_stopping,
-            stage2_anchor_path=stage2_anchor_path
+            stage2_anchor_path=stage2_anchor_path,
+            reset_optimizer_for=reset_optimizer
         )
         
         logger.info(f"Stage {stage_name} completed with best accuracy: {best_acc:.4f}")
