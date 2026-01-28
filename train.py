@@ -33,6 +33,8 @@ from torch.utils.tensorboard import SummaryWriter
 from torch.amp import autocast, GradScaler
 from tqdm import tqdm
 import yaml
+import PIL
+import io
 
 from config import Config, get_default_config
 from models import TextPriorGuidedLPR
@@ -571,10 +573,15 @@ def train_epoch(
             # Compute generator loss
             if stage == 'pretrain' or stage == 'parseq_warmup':
                 loss_g, loss_dict = criterion.get_stage_loss('pretrain', outputs, targets)
-            elif stage == 'stn':
+            elif stage == 'stn' or stage == 'tp_stn':
+                # TP STN Stage: geometry + pixel loss (no text prior yet)
                 loss_g, loss_dict = criterion.get_stage_loss('stn', outputs, targets)
             elif stage == 'restoration':
                 loss_g, loss_dict = criterion.get_stage_loss('restoration', outputs, targets, current_discriminator)
+            elif stage == 'tp_generator':
+                # TP Generator Stage: Pixel + Text Prior + Perceptual + other configured losses
+                # Use standard criterion.forward() which respects all configured weights including tp_text_prior
+                loss_g, loss_dict = criterion(outputs, targets, current_discriminator)
             elif stage == 'refiner':
                 # Refiner Stage: Two-Stage Solution for Mode Collapse (2026-01-27)
                 # Only OCR loss on refined output - generator is frozen
@@ -583,6 +590,10 @@ def train_epoch(
                 # Stage 3.5: Embedding-based Fine-tuning (Fix for mode collapse - 2026-01-27)
                 # Uses embedding similarity loss instead of cross-entropy
                 loss_g, loss_dict = criterion.get_stage_loss('embedding_finetune', outputs, targets, None)
+            elif stage == 'tp_full':
+                # TP Full Stage: End-to-end training with all components trainable
+                # Use standard criterion.forward() which respects all configured weights
+                loss_g, loss_dict = criterion(outputs, targets, current_discriminator)
             else:
                 # Stage 3 ('full'): Use anti-collapse loss with OCR warmup
                 # Compute global_step for OCR warmup scheduling
@@ -1029,9 +1040,12 @@ def validate(
             elif stage == 'stn' or stage == 'tp_stn':
                 # tp_stn uses same loss as stn (geometry + pixel)
                 _, loss_dict = criterion.get_stage_loss('stn', outputs, targets)
-            elif stage == 'restoration' or stage == 'tp_generator':
-                # tp_generator uses same loss as restoration (pixel + perceptual + text prior)
+            elif stage == 'restoration':
                 _, loss_dict = criterion.get_stage_loss('restoration', outputs, targets)
+            elif stage == 'tp_generator':
+                # TP Generator Stage: Use standard criterion which includes tp_text_prior loss
+                # Validation doesn't use discriminator (None)
+                _, loss_dict = criterion(outputs, targets, None)
             elif stage == 'refiner':
                 # Refiner Stage: Two-Stage Solution for Mode Collapse (2026-01-27)
                 _, loss_dict = criterion.get_stage_loss('refiner', outputs, targets)
@@ -1501,7 +1515,7 @@ def train_stage(
     # Create separate GradScalers for G and D to prevent scale interference
     # CRITICAL: Use smaller initial scale for newly initialized weights (tp_generator stage)
     # Default 65536.0 can cause FP16 overflow with small gradients from fresh initialization
-    init_scale = 2.0 ** 10 if stage in ['tp_generator', 'generator', 'restoration'] else 2.0 ** 16  # 1024 vs 65536
+    init_scale = 2.0 ** 14 if stage in ['tp_generator', 'generator', 'restoration'] else 2.0 ** 16  # 16384 vs 65536 - middle ground prevents underflow/overflow
     scaler_g = GradScaler('cuda', init_scale=init_scale) if use_amp and device.type == 'cuda' else None
     scaler_d = GradScaler('cuda', init_scale=init_scale) if use_amp and device.type == 'cuda' and discriminator is not None else None
     
@@ -1683,7 +1697,7 @@ def train_stage(
             vis_interval = 5  # Visualize every 5 epochs
             num_vis_samples = 4  # Number of samples to visualize
             
-            if stage in ['restoration', 'full'] and ((epoch + 1) % vis_interval == 0 or epoch == 0):
+            if stage in ['restoration', 'full', 'tp_generator', 'tp_full'] and ((epoch + 1) % vis_interval == 0 or epoch == 0):
                 model.eval()
                 with torch.no_grad():
                     # Get a batch from validation loader
@@ -1693,9 +1707,54 @@ def train_stage(
                     vis_text = vis_batch['text'][:num_vis_samples]
                     vis_text_indices = vis_batch['text_indices'][:num_vis_samples].to(device)
                     
-                    # Get model outputs
-                    vis_outputs = model(vis_lr, vis_text_indices, return_intermediates=True)
+                    # Get model outputs - TP architecture uses different signature
+                    use_text_prior_vis = stage in ['tp_generator', 'tp_full']
+                    vis_outputs = model(vis_lr, return_intermediates=True, use_text_prior=use_text_prior_vis)
                     vis_hr_pred = vis_outputs['hr_image']
+
+                    # ============================================
+                    # Visualize Text Prior (TP stages only)
+                    # ============================================
+                    if use_text_prior_vis and 'text_prior' in vis_outputs:
+                        import matplotlib.pyplot as plt
+                        import matplotlib
+                        matplotlib.use('Agg')
+
+                        vis_text_prior = vis_outputs['text_prior'][:num_vis_samples]  # (B, 7, vocab_size)
+
+                        for i in range(min(num_vis_samples, vis_text_prior.size(0))):
+                            # Create heatmap for character probabilities
+                            fig, ax = plt.subplots(figsize=(10, 4))
+                            text_prior_np = vis_text_prior[i].detach().cpu().numpy()  # (7, vocab_size)
+
+                            # Get charset
+                            from config import CHARSET
+                            display_chars = list(CHARSET)  # 36 characters
+
+                            # Create heatmap
+                            im = ax.imshow(text_prior_np, cmap='viridis', aspect='auto')
+                            ax.set_yticks(range(7))
+                            ax.set_yticklabels([f'Pos {j}' for j in range(7)])
+                            ax.set_xticks(range(len(display_chars)))
+                            ax.set_xticklabels(display_chars, rotation=45, ha='right')
+                            ax.set_xlabel('Character')
+                            ax.set_ylabel('Position')
+                            ax.set_title(f'Text Prior Probabilities - GT: {vis_text[i]}')
+                            plt.colorbar(im, ax=ax, label='Probability')
+                            plt.tight_layout()
+
+                            # Save to buffer and log to TensorBoard
+                            buf = io.BytesIO()
+                            plt.savefig(buf, format='png', dpi=100)
+                            buf.seek(0)
+                            image = PIL.Image.open(buf)
+                            image = np.array(image)
+                            image = torch.from_numpy(image).permute(2, 0, 1) / 255.0
+                            writer.add_image(f'samples/text_prior_{vis_text[i]}', image, epoch)
+                            plt.close()
+                            buf.close()
+
+                        logger.info(f"Logged text prior visualization to TensorBoard")
                     
                     # Denormalize images from [-1, 1] to [0, 1] for visualization
                     vis_lr_first = (vis_lr[:, 0, :, :, :] + 1) / 2  # Take first frame

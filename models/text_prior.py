@@ -83,11 +83,11 @@ class TextPriorExtractor(nn.Module):
             nn.Conv2d(feature_dim, feature_dim, kernel_size=3, padding=1),
         ).to(device)
 
-        # Initialize with VERY small weights (gain=0.001) for smooth training
-        # This 1.18M param layer can cause instability if weights are too large
+        # Initialize with small weights (gain=0.01) for smooth training
+        # This 1.18M param layer needs larger initialization to prevent vanishing gradients
         for m in spatial_expand.modules():
             if isinstance(m, nn.Conv2d):
-                nn.init.xavier_normal_(m.weight, gain=0.001)
+                nn.init.xavier_normal_(m.weight, gain=0.01)
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
 
@@ -231,10 +231,12 @@ class TextPriorLoss(nn.Module):
         """
         B = hr_pred.shape[0]
 
-        # Get PARSeq logits from predicted HR (frozen)
-        with torch.no_grad():
-            self.parseq.eval()
-            logits = self.parseq.forward_parallel(hr_pred)  # (B, 7, vocab_size)
+        # CRITICAL: Do NOT use torch.no_grad() here!
+        # We need gradients to flow to hr_pred so the generator can learn.
+        # PARSeq parameters are frozen (requires_grad=False), so they won't be updated.
+        # But the computation graph must stay connected for backprop to the generator.
+        self.parseq.eval()  # Set to eval mode (affects dropout, batch norm)
+        logits = self.parseq.forward_parallel(hr_pred)  # (B, 7, vocab_size)
 
         # Compute cross-entropy loss
         # text_indices: (B, 7) - GT character indices

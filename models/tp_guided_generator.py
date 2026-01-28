@@ -279,8 +279,8 @@ class TextPriorGuidedGenerator(nn.Module):
         # Final output
         hr_image = self.conv_out(x)  # (B, 3, H*4, W*4)
 
-        # Apply tanh for [-1, 1] range
-        hr_image = torch.tanh(hr_image)
+        # No activation - let network learn output range naturally
+        # (tanh was causing gradient saturation during training)
 
         if return_text_prior and text_prior is not None:
             return hr_image, text_prior
@@ -426,7 +426,7 @@ class LightweightTPGenerator(nn.Module):
 
         x = self.upsample(x)
         x = self.conv_out(x)
-        return torch.tanh(x)
+        return x  # No tanh - let network learn output range naturally
 
 
 def create_tp_guided_generator(
