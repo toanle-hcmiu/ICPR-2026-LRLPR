@@ -201,11 +201,10 @@ class TextPriorGuidedGenerator(nn.Module):
         Set the frozen PARSeq for text prior extraction.
 
         Args:
-            parseq_model: Pretrained PARSeq model
+            parseq_model: Pretrained PARSeq model (already on correct device)
         """
-        device = next(self.parameters()).device
+        # TextPriorExtractor will create its trainable parameters on the same device as parseq
         self.text_extractor = TextPriorExtractor(parseq_model)
-        self.text_extractor = self.text_extractor.to(device)
 
     def set_text_guided_mode(self, use: bool = True) -> None:
         """
@@ -391,9 +390,8 @@ class LightweightTPGenerator(nn.Module):
     def set_text_extractor(self, parseq_model: nn.Module) -> None:
         """Set the frozen PARSeq for text prior extraction."""
         from .text_prior import TextPriorExtractor
-        device = next(self.parameters()).device
+        # TextPriorExtractor will create its trainable parameters on the same device as parseq
         self.text_extractor = TextPriorExtractor(parseq_model, feature_dim=128)
-        self.text_extractor = self.text_extractor.to(device)
 
     def forward(
         self,

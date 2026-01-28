@@ -140,16 +140,16 @@ class TextPriorGuidedLPR(nn.Module):
         Note: This must be called AFTER model.to(device) to ensure
         the text prior modules are on the correct device.
         """
-        device = next(self.parameters()).device
-
+        # Create text prior extractor
+        # The recognizer (PARSeq) is already on the correct device from model.to(device)
+        # TextPriorExtractor will create its trainable parameters on that device
         self.text_prior_extractor = TextPriorExtractor(self.recognizer)
-        self.text_prior_extractor = self.text_prior_extractor.to(device)
 
+        # Same for generator's text extractor
         self.generator.set_text_extractor(self.recognizer)
 
-        # Create text prior loss
+        # Create text prior loss (only contains frozen parseq)
         self.text_prior_loss = TextPriorLoss(self.recognizer)
-        self.text_prior_loss = self.text_prior_loss.to(device)
 
     def forward(
         self,

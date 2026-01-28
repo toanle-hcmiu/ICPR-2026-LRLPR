@@ -49,7 +49,11 @@ class TextPriorExtractor(nn.Module):
         self.num_chars = num_chars
         self.feature_dim = feature_dim
 
-        # Store PARSeq model (will be frozen)
+        # Get device from parseq model (already on correct device)
+        device = next(parseq_model.parameters()).device
+
+        # Store PARSeq model (will be frozen) - NOT registered as a submodule
+        # to avoid moving it to device incorrectly
         self.parseq = parseq_model
 
         # Freeze PARSeq completely
@@ -58,17 +62,25 @@ class TextPriorExtractor(nn.Module):
         self.parseq.eval()
 
         # Learnable projection from probability to feature space
-        # This converts (B, 7, 39) probs to (B, 256, 1, 7) spatial features
-        self.proj = nn.Linear(vocab_size, feature_dim)
+        # Create on correct device (with fallback for older PyTorch)
+        try:
+            self.proj = nn.Linear(vocab_size, feature_dim, device=device)
+        except TypeError:
+            # Fallback for older PyTorch versions that don't support device parameter
+            self.proj = nn.Linear(vocab_size, feature_dim).to(device)
 
         # Positional encoding for character positions
-        self.pos_encoding = nn.Parameter(torch.randn(1, feature_dim, 1, num_chars))
+        # Create directly on the correct device to avoid non-leaf tensor issues
+        self.pos_encoding = nn.Parameter(
+            torch.randn(1, feature_dim, 1, num_chars, device=device) * 0.1
+        )
 
         # Optional: Learnable upsampling to spatial dimensions
+        # Create conv layers on correct device
         self.spatial_expand = nn.Sequential(
-            nn.Conv2d(feature_dim, feature_dim, kernel_size=3, padding=1),
+            nn.Conv2d(feature_dim, feature_dim, kernel_size=3, padding=1).to(device),
             nn.ReLU(inplace=True),
-            nn.Conv2d(feature_dim, feature_dim, kernel_size=3, padding=1)
+            nn.Conv2d(feature_dim, feature_dim, kernel_size=3, padding=1).to(device),
         )
 
     def forward(
