@@ -196,6 +196,9 @@ class TextPriorGuidedGenerator(nn.Module):
         # For text-guided mode (alternative SRBs with text guidance)
         self.use_text_guided_srb = False
 
+        # Initialize weights for stable training
+        self.init_weights()
+
     def set_text_extractor(self, parseq_model: nn.Module) -> None:
         """
         Set the frozen PARSeq for text prior extraction.
@@ -256,10 +259,11 @@ class TextPriorGuidedGenerator(nn.Module):
             x = x + fused  # Residual connection
 
         # Extract text prior (ONLY during training)
+        # Note: TextPriorExtractor already uses torch.no_grad() around PARSeq internally,
+        # so gradients will flow to proj and spatial_expand but not to PARSeq
         text_prior, text_features = None, None
         if use_text_prior and self.text_extractor is not None:
-            with torch.no_grad():  # Don't backprop through PARSeq
-                text_prior, text_features = self.text_extractor(lr_frames)
+            text_prior, text_features = self.text_extractor(lr_frames)
 
         # Apply Sequential Residual Blocks
         for srb in self.srb_blocks:
@@ -410,8 +414,7 @@ class LightweightTPGenerator(nn.Module):
 
         text_features = None
         if use_text_prior and self.text_extractor is not None:
-            with torch.no_grad():
-                _, text_features = self.text_extractor(lr_frames)
+            _, text_features = self.text_extractor(lr_frames)
 
         for srb in self.srb_blocks:
             x = srb(x)

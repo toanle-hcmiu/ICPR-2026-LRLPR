@@ -61,19 +61,36 @@ class TextPriorExtractor(nn.Module):
         self.parseq.eval()
 
         # Learnable projection from probability to feature space
-        self.proj = nn.Linear(vocab_size, feature_dim).to(device)
+        # CRITICAL: Initialize with small weights to prevent gradient explosion
+        # This layer is newly initialized at Stage 2
+        proj = nn.Linear(vocab_size, feature_dim)
+        nn.init.xavier_normal_(proj.weight, gain=0.01)
+        nn.init.constant_(proj.bias, 0)
+        self.proj = proj.to(device)
 
         # Positional encoding - use fixed encoding (not trained) to avoid non-leaf issues
         # Register as buffer so it's moved with the module but not optimized
-        pos_enc = torch.randn(1, feature_dim, 1, num_chars) * 0.1
+        # Use VERY small std (0.01) to prevent adding noise to the features
+        pos_enc = torch.randn(1, feature_dim, 1, num_chars) * 0.01
         self.register_buffer('pos_encoding', pos_enc.to(device))
 
         # Learnable upsampling to spatial dimensions
-        self.spatial_expand = nn.Sequential(
+        # CRITICAL: Initialize with VERY small weights to prevent gradient explosion
+        # These weights are newly initialized at Stage 2 and can cause instability
+        spatial_expand = nn.Sequential(
             nn.Conv2d(feature_dim, feature_dim, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
             nn.Conv2d(feature_dim, feature_dim, kernel_size=3, padding=1),
         ).to(device)
+
+        # Initialize with near-zero weights (gain=0.01) for smooth training
+        for m in spatial_expand.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.xavier_normal_(m.weight, gain=0.01)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+
+        self.spatial_expand = spatial_expand
 
     def forward(
         self,
@@ -150,12 +167,17 @@ class TextPriorExtractor(nn.Module):
         """
         Get trainable parameters (only projection layers, not PARSeq or pos_encoding).
 
+        CRITICAL: Use much lower learning rate for spatial_expand (1.18M params)
+        to prevent gradient explosion when these newly initialized weights
+        are introduced in Stage 2.
+
         Returns:
-            List of parameter groups
+            List of parameter groups with learning rate scaling
         """
         return [
-            {'params': self.proj.parameters(), 'name': 'text_proj'},
-            {'params': self.spatial_expand.parameters(), 'name': 'spatial_expand'}
+            {'params': self.proj.parameters(), 'name': 'text_proj', 'lr_scale': 0.1},  # Small projection layer
+            # spatial_expand has 1.18M newly initialized params - use VERY small LR
+            {'params': self.spatial_expand.parameters(), 'name': 'spatial_expand', 'lr_scale': 0.01}
         ]
 
 
