@@ -83,10 +83,11 @@ class TextPriorExtractor(nn.Module):
             nn.Conv2d(feature_dim, feature_dim, kernel_size=3, padding=1),
         ).to(device)
 
-        # Initialize with near-zero weights (gain=0.01) for smooth training
+        # Initialize with VERY small weights (gain=0.001) for smooth training
+        # This 1.18M param layer can cause instability if weights are too large
         for m in spatial_expand.modules():
             if isinstance(m, nn.Conv2d):
-                nn.init.xavier_normal_(m.weight, gain=0.01)
+                nn.init.xavier_normal_(m.weight, gain=0.001)
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
 

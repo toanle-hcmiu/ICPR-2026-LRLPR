@@ -1499,8 +1499,11 @@ def train_stage(
     scheduler = create_scheduler(optimizer_g, num_epochs, config)
     
     # Create separate GradScalers for G and D to prevent scale interference
-    scaler_g = GradScaler('cuda') if use_amp and device.type == 'cuda' else None
-    scaler_d = GradScaler('cuda') if use_amp and device.type == 'cuda' and discriminator is not None else None
+    # CRITICAL: Use smaller initial scale for newly initialized weights (tp_generator stage)
+    # Default 65536.0 can cause FP16 overflow with small gradients from fresh initialization
+    init_scale = 2.0 ** 10 if stage in ['tp_generator', 'generator', 'restoration'] else 2.0 ** 16  # 1024 vs 65536
+    scaler_g = GradScaler('cuda', init_scale=init_scale) if use_amp and device.type == 'cuda' else None
+    scaler_d = GradScaler('cuda', init_scale=init_scale) if use_amp and device.type == 'cuda' and discriminator is not None else None
     
     # Create EMA model
     ema = EMA(model) if use_ema else None
