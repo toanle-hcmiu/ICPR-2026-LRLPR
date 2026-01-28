@@ -52,8 +52,7 @@ class TextPriorExtractor(nn.Module):
         # Get device from parseq model (already on correct device)
         device = next(parseq_model.parameters()).device
 
-        # Store PARSeq model (will be frozen) - NOT registered as a submodule
-        # to avoid moving it to device incorrectly
+        # Store PARSeq model reference - NOT registered as submodule
         self.parseq = parseq_model
 
         # Freeze PARSeq completely
@@ -62,26 +61,19 @@ class TextPriorExtractor(nn.Module):
         self.parseq.eval()
 
         # Learnable projection from probability to feature space
-        # Create on correct device (with fallback for older PyTorch)
-        try:
-            self.proj = nn.Linear(vocab_size, feature_dim, device=device)
-        except TypeError:
-            # Fallback for older PyTorch versions that don't support device parameter
-            self.proj = nn.Linear(vocab_size, feature_dim).to(device)
+        self.proj = nn.Linear(vocab_size, feature_dim).to(device)
 
-        # Positional encoding for character positions
-        # Create directly on the correct device to avoid non-leaf tensor issues
-        self.pos_encoding = nn.Parameter(
-            torch.randn(1, feature_dim, 1, num_chars, device=device) * 0.1
-        )
+        # Positional encoding - use fixed encoding (not trained) to avoid non-leaf issues
+        # Register as buffer so it's moved with the module but not optimized
+        pos_enc = torch.randn(1, feature_dim, 1, num_chars) * 0.1
+        self.register_buffer('pos_encoding', pos_enc.to(device))
 
-        # Optional: Learnable upsampling to spatial dimensions
-        # Create conv layers on correct device
+        # Learnable upsampling to spatial dimensions
         self.spatial_expand = nn.Sequential(
-            nn.Conv2d(feature_dim, feature_dim, kernel_size=3, padding=1).to(device),
+            nn.Conv2d(feature_dim, feature_dim, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(feature_dim, feature_dim, kernel_size=3, padding=1).to(device),
-        )
+            nn.Conv2d(feature_dim, feature_dim, kernel_size=3, padding=1),
+        ).to(device)
 
     def forward(
         self,
@@ -156,14 +148,13 @@ class TextPriorExtractor(nn.Module):
 
     def get_trainable_params(self) -> list:
         """
-        Get trainable parameters (only projection layers, not PARSeq).
+        Get trainable parameters (only projection layers, not PARSeq or pos_encoding).
 
         Returns:
             List of parameter groups
         """
         return [
             {'params': self.proj.parameters(), 'name': 'text_proj'},
-            {'params': self.pos_encoding, 'name': 'pos_encoding'},
             {'params': self.spatial_expand.parameters(), 'name': 'spatial_expand'}
         ]
 
